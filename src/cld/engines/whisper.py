@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import threading
@@ -13,10 +14,14 @@ import numpy as np
 _whisper_available = False
 _Model = None
 _import_error = None
+_cuda_supported = False
 
 try:
     from pywhispercpp.model import Model as _Model
     _whisper_available = True
+    # Check if Model accepts use_gpu parameter (CUDA build)
+    sig = inspect.signature(_Model.__init__)
+    _cuda_supported = "use_gpu" in sig.parameters
 except Exception as e:
     _import_error = f"{type(e).__name__}: {e}"
 
@@ -29,10 +34,16 @@ def get_models_dir() -> Path:
     return Path.home() / ".cld" / "models"
 
 
+def is_cuda_supported() -> bool:
+    """Check if pywhispercpp was built with CUDA support."""
+    return _cuda_supported
+
+
 class WhisperEngine:
     """Whisper speech-to-text engine backed by pywhispercpp (whisper.cpp).
 
-    Uses GGML model files for CPU-optimized inference.
+    Uses GGML model files. Supports GPU acceleration when pywhispercpp
+    is built with GGML_CUDA=1.
 
     Models (default: medium-q5_0):
         - small: ~488MB, fast, good accuracy
@@ -44,6 +55,7 @@ class WhisperEngine:
         self,
         model_name: str = "medium-q5_0",
         n_threads: Optional[int] = None,
+        use_gpu: Optional[bool] = None,
     ):
         self.model_name = model_name
         self.n_threads = n_threads or max(4, (os.cpu_count() or 8) - 2)
@@ -51,6 +63,19 @@ class WhisperEngine:
         self._model_lock = threading.Lock()
         self._logger = logging.getLogger(__name__)
         self._last_error: Optional[str] = None
+
+        # GPU support: auto-detect or use explicit setting
+        if use_gpu is None:
+            # Auto: use GPU if pywhispercpp supports it
+            self.use_gpu = _cuda_supported
+        elif use_gpu and not _cuda_supported:
+            self._logger.warning("GPU requested but pywhispercpp lacks CUDA support. Using CPU.")
+            self.use_gpu = False
+        else:
+            self.use_gpu = use_gpu
+
+        self._logger.info("WhisperEngine: model=%s, threads=%d, use_gpu=%s (cuda_supported=%s)",
+                         model_name, self.n_threads, self.use_gpu, _cuda_supported)
 
     def is_available(self) -> bool:
         return _whisper_available
@@ -90,13 +115,17 @@ class WhisperEngine:
                 return False
 
             try:
-                self._model = _Model(
-                    str(model_path),
-                    n_threads=self.n_threads,
-                )
+                # Build kwargs based on what pywhispercpp supports
+                kwargs = {"n_threads": self.n_threads}
+                if _cuda_supported and self.use_gpu:
+                    kwargs["use_gpu"] = True
+
+                self._model = _Model(str(model_path), **kwargs)
                 self._last_error = None
+
+                device_str = "GPU" if (self.use_gpu and _cuda_supported) else "CPU"
                 self._logger.info(
-                    f"Loaded {self.model_name} model with {self.n_threads} threads"
+                    f"Loaded {self.model_name} model on {device_str} with {self.n_threads} threads"
                 )
                 return True
 

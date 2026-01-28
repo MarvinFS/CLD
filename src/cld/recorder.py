@@ -2,13 +2,16 @@
 
 import logging
 import math
-import queue
 import threading
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Generator, Optional
+from typing import Deque, Optional
 
 import numpy as np
+
+# Thread-safe atomic float for audio level visualization
+_current_level: float = 0.0
+_level_lock = threading.Lock()
 
 _SOUNDDEVICE_IMPORT_ERROR: Exception | None = None
 try:
@@ -26,7 +29,6 @@ class RecorderConfig:
     channels: int = 1
     blocksize: int = 1024  # ~64ms at 16kHz
     dtype: str = "float32"
-    queue_maxsize: int = 32
     max_recording_seconds: Optional[int] = None
 
 
@@ -53,7 +55,6 @@ class AudioRecorder:
         """
         self.config = config or RecorderConfig()
         self._recording = False
-        self._audio_queue: queue.Queue[np.ndarray] = queue.Queue()
         self._stream: Optional["sd.InputStream"] = None
         self._recorded_chunks: Deque[np.ndarray] = deque()
         self._max_chunks = self._compute_max_chunks()
@@ -110,19 +111,22 @@ class AudioRecorder:
             return True
 
         try:
-            self._audio_queue = queue.Queue(maxsize=self.config.queue_maxsize)
             if self._max_chunks:
                 self._recorded_chunks = deque(maxlen=self._max_chunks)
             else:
                 self._recorded_chunks = deque()
 
             def callback(indata, frames, time_info, status):
+                global _current_level
                 if status:
                     self._logger.debug("Audio callback status: %s", status)
-                try:
-                    self._audio_queue.put_nowait(indata.copy())
-                except queue.Full:
-                    self._logger.debug("Audio queue full; dropping chunk")
+                # Calculate audio level for visualization (atomic update)
+                rms = np.sqrt(np.mean(indata ** 2))
+                # Normalize: typical speech ~0.01-0.1 RMS, scale to 0-1
+                level = min(1.0, rms * 10)
+                with _level_lock:
+                    _current_level = level
+                # Store all chunks for transcription (never drops)
                 with self._lock:
                     self._recorded_chunks.append(indata.copy())
 
@@ -168,36 +172,19 @@ class AudioRecorder:
             self._recorded_chunks = deque()
             return np.squeeze(audio)
 
-    def get_chunk(self, timeout: float = 0.1) -> Optional[np.ndarray]:
-        """Get the next audio chunk from the recording stream.
-
-        Args:
-            timeout: How long to wait for a chunk.
-
-        Returns:
-            Audio chunk as numpy array, or None if timeout.
-        """
-        try:
-            chunk = self._audio_queue.get(timeout=timeout)
-            return np.squeeze(chunk)
-        except queue.Empty:
-            return None
-
-    def iter_chunks(self) -> Generator[np.ndarray, None, None]:
-        """Iterate over audio chunks while recording.
-
-        Yields:
-            Audio chunks as numpy arrays.
-        """
-        while self._recording:
-            chunk = self.get_chunk()
-            if chunk is not None:
-                yield chunk
-
     @property
     def is_recording(self) -> bool:
         """Check if currently recording."""
         return self._recording
+
+    def get_current_level(self) -> float:
+        """Get current audio level (0.0-1.0) for visualization.
+
+        Thread-safe method to get the most recent audio level
+        calculated from microphone input during recording.
+        """
+        with _level_lock:
+            return _current_level
 
     def get_volume_level(self, chunk: np.ndarray) -> float:
         """Calculate volume level (0-1) for a chunk.

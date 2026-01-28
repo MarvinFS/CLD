@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import logging
-import os
 import queue
 import threading
 import time
-from pathlib import Path
 from typing import Callable, Optional
 
 from cld.config import Config
@@ -140,6 +138,12 @@ class STTDaemon:
                 self._overlay.set_state(state)
             except Exception:
                 self._logger.debug("Failed to update overlay state", exc_info=True)
+
+    def get_audio_level(self) -> float:
+        """Get current audio level (0.0-1.0) for visualization."""
+        if self._recorder and self._recording:
+            return self._recorder.get_current_level()
+        return 0.0
 
     def _update_tray(self, state: str) -> None:
         """Update the tray icon state."""
@@ -700,6 +704,7 @@ class STTDaemon:
                 self._overlay = STTOverlay(
                     on_close=self._on_overlay_close,
                     on_settings=self._on_settings_click,
+                    get_audio_level=self.get_audio_level,
                 )
                 self._overlay.show()
             except Exception as e:

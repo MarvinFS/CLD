@@ -64,15 +64,18 @@ class STTOverlay:
         self,
         on_close: Optional[Callable] = None,
         on_settings: Optional[Callable] = None,
+        get_audio_level: Optional[Callable[[], float]] = None,
     ):
         """Initialize the overlay.
 
         Args:
             on_close: Callback when overlay is closed.
             on_settings: Callback when gear button is clicked.
+            get_audio_level: Callback to get current audio level (0.0-1.0).
         """
         self.on_close = on_close
         self.on_settings = on_settings
+        self._get_audio_level = get_audio_level
 
         self._root: Optional[tk.Tk] = None
         self._canvas: Optional[tk.Canvas] = None
@@ -734,14 +737,26 @@ class STTOverlay:
             return
 
         if self._state == "recording":
-            # macOS-style bouncing bars - each bar has its own phase
+            # Get real audio level from microphone
+            level = 0.0
+            if self._get_audio_level:
+                try:
+                    level = self._get_audio_level()
+                except Exception:
+                    pass
+
+            # Update bars with real audio level, adding variation per bar
             t = time.time()
-            # Different frequencies for each bar to create organic movement
-            freqs = [2.1, 2.5, 1.8, 2.3, 2.7, 1.9, 2.4, 2.0, 2.6, 1.7, 2.2, 2.8]
             phases = [0, 0.5, 1.2, 0.3, 0.8, 1.5, 0.1, 0.9, 1.3, 0.6, 1.0, 0.4]
-            self._audio_levels = [
-                0.35 + 0.55 * abs(math.sin(t * freqs[i] + phases[i])) for i in range(12)
-            ]
+            for i in range(12):
+                # Each bar varies slightly around the main level for visual interest
+                variation = 0.3 * abs(math.sin(t * 3 + phases[i]))
+                bar_level = level * (0.7 + variation)
+                # Smooth transition (exponential moving average)
+                self._audio_levels[i] = 0.3 * bar_level + 0.7 * self._audio_levels[i]
+                # Clamp to valid range
+                self._audio_levels[i] = max(0.1, min(1.0, self._audio_levels[i]))
+
             self._draw_waveform(idle=False)
             self._update_timer()
             self._animation_id = self._root.after(33, self._animate)  # ~30fps
