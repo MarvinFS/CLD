@@ -1,10 +1,10 @@
-# CLD2: pywhispercpp Migration Plan
+# CLD: pywhispercpp Migration Plan
 
-Fork ClaudeCli-Dictate to CLD2 with pywhispercpp backend, reducing ML pipeline from ~170MB to ~3MB.
+Fork ClaudeCli-Dictate to CLD with pywhispercpp backend, reducing ML pipeline from ~170MB to ~3MB.
 
 ## Phase 1: Project Fork and Setup
 
-**Create CLD2 project at D:\claudecli-dictate2:**
+**Create CLD project at D:\claudecli-dictate2:**
 ```powershell
 xcopy /E /I "D:\OneDrive - NoWay Inc\APPS\claudecli-dictate" "D:\claudecli-dictate2"
 cd D:\claudecli-dictate2
@@ -18,8 +18,8 @@ Copy-Item "C:\Users\test\.claude\plans\deep-booping-pony.md" "D:\claudecli-dicta
 ```
 
 **Update pyproject.toml:**
-- name: `cld2`
-- entry point: `cld2 = "cld.cli:main"`
+- name: `cld`
+- entry point: `cld = "cld.cli:main"`
 - Replace `faster-whisper>=1.0` with `pywhispercpp>=1.4`
 - Add `nuitka>=2.0` to dev dependencies
 
@@ -40,7 +40,7 @@ https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{model}.bin
 
 **Model storage (flat):**
 ```
-%LOCALAPPDATA%\CLD2\models\ggml-medium-q5_0.bin
+%LOCALAPPDATA%\CLD\models\ggml-medium-q5_0.bin
 ```
 
 **Manual download for development:** Download model file and place in models folder before running.
@@ -88,7 +88,7 @@ class WhisperEngine:
 
 **Simplify model_manager.py:**
 1. Replace WHISPER_MODELS with GGML metadata
-2. Config dir: `CLD` → `CLD2`
+2. Config dir: `CLD` → `CLD`
 3. `is_model_available()`: Single file check `ggml-{model}.bin`
 4. `download_model()`: Direct HTTP with urllib.request.urlretrieve
 5. `validate_model()`: Check .bin file size only
@@ -109,14 +109,14 @@ class WhisperEngine:
 
 **config.py:**
 - Default model: `medium-q5_0`
-- Config dir: `CLD2`
+- Config dir: `CLD`
 
 ## Phase 6: Build System (Three Options)
 
 ### Option A: PyInstaller (Primary - Proven, Folder Output)
 
 ```powershell
-uv run pyinstaller -y --onedir --windowed --name CLD2 `
+uv run pyinstaller -y --onedir --windowed --name CLD `
     --icon cld_icon.ico `
     --add-data "sounds;sounds" `
     --add-data "cld_icon.png;." `
@@ -130,7 +130,7 @@ uv run pyinstaller -y --onedir --windowed --name CLD2 `
     src/cld/cli.py
 ```
 
-Output: `dist/CLD2/` folder (~270MB estimated)
+Output: `dist/CLD/` folder (~270MB estimated)
 
 ### Option B: PyInstaller + UPX Compression (Smaller Output)
 
@@ -143,7 +143,7 @@ winget install upx.upx
 
 **Build with UPX compression:**
 ```powershell
-uv run pyinstaller -y --onedir --windowed --name CLD2 `
+uv run pyinstaller -y --onedir --windowed --name CLD `
     --icon cld_icon.ico `
     --add-data "sounds;sounds" `
     --add-data "cld_icon.png;." `
@@ -161,14 +161,14 @@ uv run pyinstaller -y --onedir --windowed --name CLD2 `
 **Or compress after build:**
 ```powershell
 # Compress all DLLs and PYDs in dist folder (30-50% size reduction)
-Get-ChildItem -Path "dist/CLD2/_internal" -Recurse -Include "*.dll","*.pyd" | ForEach-Object {
+Get-ChildItem -Path "dist/CLD/_internal" -Recurse -Include "*.dll","*.pyd" | ForEach-Object {
     upx --best $_.FullName
 }
 # Also compress main exe
-upx --best "dist/CLD2/CLD2.exe"
+upx --best "dist/CLD/CLD.exe"
 ```
 
-Output: `dist/CLD2/` folder (~150-180MB estimated with UPX)
+Output: `dist/CLD/` folder (~150-180MB estimated with UPX)
 
 **UPX Notes:**
 - Compresses executables/DLLs by 30-50%
@@ -179,7 +179,7 @@ Output: `dist/CLD2/` folder (~150-180MB estimated with UPX)
 **Exclude problematic DLLs from UPX:**
 ```powershell
 # Compress everything except numpy/scipy
-Get-ChildItem -Path "dist/CLD2/_internal" -Recurse -Include "*.dll","*.pyd" |
+Get-ChildItem -Path "dist/CLD/_internal" -Recurse -Include "*.dll","*.pyd" |
     Where-Object { $_.FullName -notmatch "numpy|scipy|mkl" } |
     ForEach-Object { upx --best $_.FullName }
 ```
@@ -199,11 +199,11 @@ uv run python -m nuitka `
     --include-data-files=mic_256.png=. `
     --include-package-data=_sounddevice_data `
     --output-dir=dist-nuitka `
-    --output-filename=CLD2.exe `
+    --output-filename=CLD.exe `
     src/cld/cli.py
 ```
 
-Output: Single `CLD2.exe` (~600-900MB, 30-60 min build)
+Output: Single `CLD.exe` (~600-900MB, 30-60 min build)
 
 **Known Nuitka issues to solve:**
 - sounddevice DLL bundling (may need explicit --include-data-dir for _sounddevice_data)
@@ -231,7 +231,7 @@ else:
 ## Phase 7: Documentation
 
 **Update CLAUDE.md:**
-- Project name: CLD2
+- Project name: CLD
 - Model table: GGML models
 - Remove faster-whisper references
 - Add all three build commands
@@ -255,9 +255,9 @@ else:
 2. Download ggml-medium-q5_0.bin manually to models folder
 3. `uv run python -m cld.daemon run --overlay` - App runs
 4. Record and transcribe - Text output works
-5. PyInstaller build - Creates dist/CLD2/
-6. PyInstaller+UPX build - Smaller dist/CLD2/
-7. Nuitka build - Creates dist-nuitka/CLD2.exe
+5. PyInstaller build - Creates dist/CLD/
+6. PyInstaller+UPX build - Smaller dist/CLD/
+7. Nuitka build - Creates dist-nuitka/CLD.exe
 8. Test all executables standalone
 
 ## Implementation Order

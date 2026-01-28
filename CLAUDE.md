@@ -4,7 +4,7 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## Project Overview
 
-CLD2 is a Windows GUI speech-to-text application forked from claude-stt. Features:
+CLD is a Windows GUI speech-to-text application forked from claude-stt. Features:
 - Enhanced overlay UI with multi-mode states (tiny, recording, processing)
 - System tray integration via pystray
 - Push-to-talk and toggle mode voice dictation
@@ -19,7 +19,7 @@ CLD2 is a Windows GUI speech-to-text application forked from claude-stt. Feature
 # Install dependencies (uv preferred)
 uv sync --python 3.12 --extra dev
 
-# Run CLD2 in foreground with overlay
+# Run CLD in foreground with overlay
 uv run python -m cld.daemon run --overlay
 
 # Run tests
@@ -33,7 +33,7 @@ uv run ruff check src/
 
 # Build standalone exe with PyInstaller
 # CRITICAL: Must use "uv run" to use Python 3.12 from venv - system Python won't work!
-uv run pyinstaller -y --onedir --windowed --name CLD2 ^
+uv run pyinstaller -y --onedir --windowed --name CLD ^
     --icon cld_icon.ico ^
     --add-data "sounds;sounds" ^
     --add-data "cld_icon.png;." ^
@@ -47,7 +47,7 @@ uv run pyinstaller -y --onedir --windowed --name CLD2 ^
     src/cld/cli.py
 
 # Run exe with --debug flag to show console window for troubleshooting
-dist/CLD2/CLD2.exe --debug daemon run --overlay
+dist/CLD/CLD.exe --debug daemon run --overlay
 ```
 
 ## PyInstaller Build
@@ -70,7 +70,7 @@ Key considerations:
 - --debug flag: allocate console with AllocConsole() BEFORE imports, redirect stdout to CONOUT$
 - --debug mode forces foreground execution so console stays open
 
-Output: `dist/CLD2/` folder (~80MB with UPX compression) with `CLD2.exe` and `_internal/` directory
+Output: `dist/CLD/` folder (~80MB with UPX compression) with `CLD.exe` and `_internal/` directory
 
 ### PyInstaller pywhispercpp Requirements
 
@@ -156,7 +156,7 @@ Settings stored in JSON format at `%LOCALAPPDATA%\CLD\settings.json`:
 
 ### Whisper Models (GGML, CPU-only)
 
-CLD2 uses pywhispercpp for speech recognition with full multilingual support. All models run on CPU using GGML format for efficient inference.
+CLD uses pywhispercpp for speech recognition with full multilingual support. All models run on CPU using GGML format for efficient inference.
 
 CRITICAL: When calling transcribe(), always set `translate=False` and `language="auto"` to keep original language:
 ```python
@@ -183,7 +183,7 @@ GGML model download URLs:
 
 ### Model Installation System
 
-On first run or when the configured model is missing, CLD2 shows a model setup dialog. Models are stored in `%LOCALAPPDATA%\CLD\models\` as single GGML .bin files.
+On first run or when the configured model is missing, CLD shows a model setup dialog. Models are stored in `%LOCALAPPDATA%\CLD\models\` as single GGML .bin files.
 
 Startup flow:
 1. Check if configured model exists in `%LOCALAPPDATA%\CLD\models\`
@@ -294,7 +294,7 @@ D:\claudecli-dictate2\
 ├── pyi_rth_numpy.py           # PyInstaller runtime hook for numpy
 ├── pyi_rth_tcltk.py           # PyInstaller runtime hook for Tcl/Tk
 ├── sounds/                    # Sound effects
-├── dist/                      # PyInstaller output (CLD2.exe)
+├── dist/                      # PyInstaller output (CLD.exe)
 ├── docs/
 │   ├── original-plugin-analysis.md
 │   ├── phase2-implementation-plan.md

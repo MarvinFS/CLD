@@ -1,4 +1,4 @@
-# CLD2 Migration Lessons Learned
+# CLD Migration Lessons Learned
 
 ## pywhispercpp API
 

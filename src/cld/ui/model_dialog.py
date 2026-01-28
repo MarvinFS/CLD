@@ -127,7 +127,7 @@ class ModelSetupDialog:
             self._window = tk.Toplevel(self._parent)
             self._window.transient(self._parent)
 
-        self._window.title("CLD2 - Model Setup")
+        self._window.title("CLD - Model Setup")
         self._window.configure(bg=self._bg)
         self._window.resizable(False, False)
         self._window.attributes("-toolwindow", True)
@@ -230,7 +230,7 @@ class ModelSetupDialog:
         # Title
         tk.Label(
             self._container,
-            text="Welcome to CLD2",
+            text="Welcome to CLD",
             font=("Segoe UI Semibold", 16),
             fg=self._text,
             bg=self._bg,

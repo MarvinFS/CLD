@@ -1,8 +1,8 @@
-# CLD2 Audio Visualization & GPU Support Implementation
+# CLD Audio Visualization & GPU Support Implementation
 
 ## Summary
 
-This document describes the implementation of real audio visualization and GPU support for CLD2, completed on 2026-01-28.
+This document describes the implementation of real audio visualization and GPU support for CLD, completed on 2026-01-28.
 
 ## What Was Implemented
 
@@ -179,14 +179,14 @@ Values:
 
 ### Audio Visualization
 
-1. Run CLD2 with overlay: `uv run python -m cld.daemon run --overlay`
+1. Run CLD with overlay: `uv run python -m cld.daemon run --overlay`
 2. Press hotkey to start recording
 3. Speak at varying volumes
 4. Waveform bars should respond to voice (louder = taller)
 
 ### GPU Support (after installing CUDA Toolkit and rebuilding)
 
-1. Run CLD2 with `--debug` flag
+1. Run CLD with `--debug` flag
 2. Check startup log for: `WhisperEngine: model=..., use_gpu=True`
 3. Run `nvidia-smi -l 1` in separate terminal
 4. Record and transcribe

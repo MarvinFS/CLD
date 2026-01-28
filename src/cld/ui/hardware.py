@@ -1,4 +1,4 @@
-"""Hardware detection for STT model recommendations (CLD2)."""
+"""Hardware detection for STT model recommendations."""
 
 import logging
 import subprocess
@@ -149,7 +149,7 @@ def detect_hardware() -> HardwareInfo:
 def _get_recommendations(info: HardwareInfo) -> tuple[str, str]:
     """Determine recommended GGML Whisper model based on hardware.
 
-    CLD2 uses pywhispercpp with GGML models:
+    CLD uses pywhispercpp with GGML models:
     - With GPU (CUDA): medium or larger for fast inference
     - CPU 8+ cores: medium (full precision)
     - CPU 4+ cores: medium-q5_0 (quantized, default)

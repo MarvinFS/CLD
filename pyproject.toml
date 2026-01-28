@@ -1,7 +1,7 @@
 [project]
-name = "cld2"
-version = "0.1.0"
-description = "CLD2 - Windows GUI speech-to-text with pywhispercpp backend, overlay UI and system tray integration"
+name = "claudecli-dictate"
+version = "0.5.1"
+description = "ClaudeCli-Dictate (CLD) - Windows GUI speech-to-text with pywhispercpp backend, overlay UI and system tray integration"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
 license = "MIT"
@@ -26,7 +26,7 @@ windows = ["pywin32"]
 dev = ["pytest", "ruff", "nuitka>=2.0", "pyinstaller>=6.0"]
 
 [project.scripts]
-cld2 = "cld.cli:main"
+cld = "cld.cli:main"
 
 [build-system]
 requires = ["hatchling"]

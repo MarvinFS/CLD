@@ -1,4 +1,4 @@
-"""Model management for CLD2 - download, validation, and caching of GGML models."""
+"""Model management for CLD - download, validation, and caching of GGML models."""
 
 import logging
 import os
