@@ -31,7 +31,8 @@ uv run python -m unittest tests.test_config
 # Lint (ruff) - ALWAYS run after code changes
 uv run ruff check src/
 
-# Build standalone exe with PyInstaller (MUST use uv run for venv dependencies)
+# Build standalone exe with PyInstaller
+# CRITICAL: Must use "uv run" to use Python 3.12 from venv - system Python won't work!
 uv run pyinstaller -y --onedir --windowed --name CLD2 ^
     --icon cld_icon.ico ^
     --add-data "sounds;sounds" ^
@@ -58,7 +59,7 @@ The project includes runtime hooks for PyInstaller compilation:
 
 Key considerations:
 - Use `--onedir` not `--onefile` to avoid _MEI temp directory cleanup conflicts with daemon spawning
-- MUST use `uv run pyinstaller` so venv dependencies (sounddevice, pywhispercpp) are bundled
+- MUST use `uv run pyinstaller` to use Python 3.12 from venv - pywhispercpp pyd is compiled for 3.12, system Python 3.14 won't work!
 - CRITICAL: Build in D:\claudecli-dictate2 (not OneDrive folder) to avoid file locking during compilation
 - Tcl/Tk data must be bundled separately with `--add-data`
 - sounddevice requires `--add-data ".venv/Lib/site-packages/_sounddevice_data;_sounddevice_data"`
@@ -261,7 +262,7 @@ Critical patterns from docs/windows-tray-app-patterns.md:
 15. PyInstaller: fix numpy circular import with runtime hook pre-importing numpy.fft._pocketfft_umath
 16. PyInstaller: pystray callbacks run in background thread; queue tkinter operations via queue.Queue
 17. PyInstaller: use --onedir not --onefile to avoid _MEI temp cleanup conflicts with daemon spawn
-18. PyInstaller: MUST use "uv run pyinstaller" when dependencies are only in .venv
+18. PyInstaller: MUST use "uv run pyinstaller" - venv is Python 3.12, pywhispercpp pyd won't load with system Python 3.14
 19. PyInstaller: build on local drive (not OneDrive/synced folders) to avoid file locking
 20. PyInstaller: sound/data files use Path(sys.executable).parent / "_internal" / "folder" for onedir
 21. PyInstaller --debug: allocate console with AllocConsole() BEFORE imports, redirect stdout to CONOUT$
