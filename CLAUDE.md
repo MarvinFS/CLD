@@ -62,6 +62,54 @@ powershell.exe -ExecutionPolicy Bypass -File compress_upx.ps1
 dist/CLD/CLD.exe --debug daemon run --overlay
 ```
 
+## CLI Reference
+
+### Global Options
+
+- `--version`, `-V` - Print version and exit (works in windowed exe via console allocation)
+- `--debug` - Show console window for debugging (Windows only, forces foreground mode)
+
+### Commands
+
+#### `cld` (no arguments)
+
+Starts daemon in background with overlay. This is the default behavior when double-clicking the exe.
+
+#### `cld daemon run [--overlay] [--log-level LEVEL]`
+
+Run daemon in foreground (blocking). Useful for development and debugging.
+
+Options:
+- `--overlay` - Show floating overlay UI
+- `--log-level` - Set log level (DEBUG, INFO, WARNING, ERROR)
+
+#### `cld daemon start [--background] [--overlay] [--log-level LEVEL]`
+
+Start daemon.
+
+Options:
+- `--background` - Run in background (detached process)
+- `--overlay` - Show floating overlay UI
+- `--log-level` - Set log level
+
+#### `cld daemon stop`
+
+Stop running daemon by killing the process referenced in the PID file.
+
+#### `cld daemon status`
+
+Show daemon status (running/stopped, PID).
+
+#### `cld setup [options]`
+
+Run first-time setup wizard.
+
+Options:
+- `--skip-model-download` - Skip model download step
+- `--skip-audio-test` - Skip microphone test
+- `--skip-hotkey-test` - Skip hotkey test
+- `--no-start` - Don't start daemon after setup completes
+
 ## PyInstaller Build
 
 The project includes runtime hooks for PyInstaller compilation:
@@ -83,6 +131,8 @@ Key considerations:
 - --debug mode forces foreground execution so console stays open
 
 Output: `dist/CLD/` folder (~67MB with UPX compression, ~429MB uncompressed) with `CLD.exe` and `_internal/` directory containing Vulkan DLLs (ggml-vulkan.dll is 55MB)
+
+Note: The `api-ms-win-crt-*.dll` files in the output are Windows Universal C Runtime (UCRT) libraries included by PyInstaller. These are already present on Windows 10+ and can be safely ignored during UPX compression (they're skipped anyway). Including them doesn't cause harm but adds ~2MB.
 
 ### PyInstaller pywhispercpp Requirements
 
@@ -224,12 +274,8 @@ Settings stored in JSON format at `%LOCALAPPDATA%\CLD\settings.json`:
   "engine": {
     "type": "whisper",
     "whisper_model": "medium-q5_0",
-    "device": "cpu"
-  },
-  "features": {
-    "auto_punctuation": true,
-    "filter_profanity": false,
-    "voice_typing_launcher": true
+    "force_cpu": false,
+    "gpu_device": -1
   },
   "output": {
     "mode": "auto",
@@ -245,6 +291,10 @@ Settings stored in JSON format at `%LOCALAPPDATA%\CLD\settings.json`:
   }
 }
 ```
+
+Engine settings:
+- `force_cpu`: Set to `true` to disable GPU acceleration and use CPU only
+- `gpu_device`: GPU index to use (-1 = auto-select first discrete GPU, 0/1/2 = specific GPU)
 
 ### Whisper Models (GGML, CPU-only)
 
@@ -287,8 +337,13 @@ Model manager features:
 - CPU capability detection (SSE4.1, AVX, AVX2) for compatibility warnings
 - Hardware compatibility checks (RAM, CPU cores) with warnings for larger models
 - Download progress tracking
-- Model validation after download
+- MD5 hash verification for file integrity (stored in `models.json`)
 - Manual download URLs if automatic download fails
+
+Model integrity verification:
+- On download: MD5 hash computed and stored in `%LOCALAPPDATA%\CLD\models\models.json`
+- On startup: File hash verified against stored hash to detect corruption
+- No hardcoded hashes - works with any model version from HuggingFace
 
 The dialog shows:
 - Model dropdown with size and requirements for each model

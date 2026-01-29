@@ -274,6 +274,8 @@ class STTDaemon:
                 if not output_text(text, window_info, self.config):
                     self._logger.warning("Failed to output transcription")
                     self._print_status("✗ Output failed")
+                    if self.config.sound_effects:
+                        play_sound("error")
                 else:
                     self._print_status("✓ Ready")
             else:
@@ -506,7 +508,7 @@ class STTDaemon:
                     logo_img = icon_img.resize((64, 64), Image.Resampling.LANCZOS)
                     logo_photo = ImageTk.PhotoImage(logo_img)
                 except Exception as e:
-                    self._logger.debug("Failed to load icon: %s", e)
+                    self._logger.warning("Failed to load icon: %s", e)
 
             # Content
             content = tk.Frame(dialog, bg=bg)

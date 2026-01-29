@@ -109,7 +109,7 @@ class SettingsDialog:
         self._gpu_combo: Optional[ttk.Combobox] = None
         self._gpu_devices: list[GPUDeviceInfo] = []
         self._restart_label: Optional[tk.Label] = None
-        self._original_device: str = ""
+        self._original_force_cpu: bool = False
         self._original_gpu_device: int = -1
 
     def show(self):
@@ -571,7 +571,7 @@ class SettingsDialog:
         self._gpu_devices = enumerate_gpus()
 
         # Store originals for restart detection
-        self._original_device = self._config.engine.device
+        self._original_force_cpu = self._config.engine.force_cpu
         self._original_gpu_device = self._config.engine.gpu_device
 
         # Force CPU Only checkbox
@@ -586,7 +586,7 @@ class SettingsDialog:
             bg=self._surface,
         ).pack(side=tk.LEFT)
 
-        self._force_cpu_var = tk.BooleanVar(value=self._config.engine.device == "cpu")
+        self._force_cpu_var = tk.BooleanVar(value=self._config.engine.force_cpu)
         cpu_cb = tk.Checkbutton(
             cpu_row,
             variable=self._force_cpu_var,
@@ -614,17 +614,19 @@ class SettingsDialog:
                 bg=self._surface,
             ).pack(side=tk.LEFT)
 
-            # Build dropdown values
+            # Build dropdown values with shortened GPU names
             values = ["Auto-select"]
             for dev in self._gpu_devices:
-                values.append(dev.display_name)
+                short_name = self._shorten_gpu_name(dev.name)
+                values.append(short_name)
 
             self._gpu_device_var = tk.StringVar()
             # Set current value
             if self._config.engine.gpu_device == -1:
                 self._gpu_device_var.set("Auto-select")
             elif self._gpu_devices and 0 <= self._config.engine.gpu_device < len(self._gpu_devices):
-                self._gpu_device_var.set(self._gpu_devices[self._config.engine.gpu_device].display_name)
+                dev = self._gpu_devices[self._config.engine.gpu_device]
+                self._gpu_device_var.set(self._shorten_gpu_name(dev.name))
             else:
                 self._gpu_device_var.set("Auto-select")
 
@@ -633,7 +635,7 @@ class SettingsDialog:
                 textvariable=self._gpu_device_var,
                 values=values,
                 state="readonly",
-                width=25,
+                width=30,  # Wider to fit GPU names better
                 style="Dark.TCombobox",
             )
             self._gpu_combo.pack(side=tk.RIGHT)
@@ -643,49 +645,100 @@ class SettingsDialog:
             if self._force_cpu_var.get():
                 self._gpu_combo.config(state="disabled")
 
-        # GPU backend info display
-        if hw_info.has_gpu:
-            info_row = tk.Frame(section, bg=self._surface)
-            info_row.pack(fill=tk.X, padx=12, pady=(0, 8))
-            backend = hw_info.gpu_backend or "Unknown"
-            info_text = f"Backend: {backend}"
-            if hw_info.gpu_name:
-                info_text += f" | {hw_info.gpu_name}"
-            tk.Label(
-                info_row,
-                text=info_text,
-                font=("Segoe UI", 9),
-                fg=self._text_dim,
-                bg=self._surface,
-            ).pack(side=tk.LEFT)
+        # GPU backend info display - shows currently SELECTED GPU
+        backend = hw_info.gpu_backend or "CPU"
+        info_row = tk.Frame(section, bg=self._surface)
+        info_row.pack(fill=tk.X, padx=12, pady=(0, 8))
+        self._backend_info_label = tk.Label(
+            info_row,
+            text=self._get_backend_info_text(backend),
+            font=("Segoe UI", 9),
+            fg=self._text_dim,
+            bg=self._surface,
+        )
+        self._backend_info_label.pack(side=tk.LEFT)
 
         # Restart warning (hidden initially)
         self._restart_label = tk.Label(
             section,
-            text="⚠ Restart required for GPU changes",
+            text="Restart required for GPU changes",
             font=("Segoe UI", 9),
             fg="#ffcc00",
             bg=self._surface,
         )
         # Don't pack initially - will be shown when settings change
 
+    def _shorten_gpu_name(self, name: str) -> str:
+        """Create a shortened GPU name for dropdown display.
+
+        Args:
+            name: Full GPU name from WMI.
+
+        Returns:
+            Shortened name like "RTX 4090" or "Radeon RX 7900".
+        """
+        short = name
+        prefixes_to_remove = [
+            "NVIDIA GeForce ", "NVIDIA ", "GeForce ",
+            "AMD Radeon ", "AMD ", "Radeon ",
+            "Intel(R) ", "Intel ",
+            "(TM)", "(R)", " Graphics",
+        ]
+        for prefix in prefixes_to_remove:
+            short = short.replace(prefix, "")
+        return short.strip()
+
+    def _get_backend_info_text(self, backend: str) -> str:
+        """Get the backend info text based on current selection.
+
+        Args:
+            backend: The GPU backend name (Vulkan, CUDA, or CPU).
+
+        Returns:
+            Info text showing backend and selected GPU.
+        """
+        if self._force_cpu_var and self._force_cpu_var.get():
+            return "Backend: CPU (forced)"
+
+        gpu_idx = self._get_selected_gpu_index()
+        if gpu_idx == -1:
+            # Auto-select - show first discrete GPU if available
+            if self._gpu_devices:
+                gpu_name = self._gpu_devices[0].name
+                return f"Backend: {backend} | {gpu_name} (auto)"
+            return f"Backend: {backend}"
+        elif 0 <= gpu_idx < len(self._gpu_devices):
+            gpu_name = self._gpu_devices[gpu_idx].name
+            return f"Backend: {backend} | {gpu_name}"
+        return f"Backend: {backend}"
+
     def _on_force_cpu_change(self):
         """Handle Force CPU checkbox change."""
         if self._gpu_combo:
             state = "disabled" if self._force_cpu_var.get() else "readonly"
             self._gpu_combo.config(state=state)
+        self._update_backend_info()
         self._check_restart_needed()
 
     def _on_gpu_change(self, event=None):
         """Handle GPU device dropdown change."""
+        self._update_backend_info()
         self._check_restart_needed()
+
+    def _update_backend_info(self):
+        """Update the backend info label based on current selection."""
+        if not hasattr(self, '_backend_info_label') or not self._backend_info_label:
+            return
+        hw_info = detect_hardware()
+        backend = hw_info.gpu_backend or "CPU"
+        self._backend_info_label.config(text=self._get_backend_info_text(backend))
 
     def _check_restart_needed(self):
         """Check if GPU settings changed and show/hide restart warning."""
-        new_device = "cpu" if self._force_cpu_var.get() else "auto"
+        new_force_cpu = self._force_cpu_var.get()
         new_gpu_device = self._get_selected_gpu_index()
 
-        changed = (new_device != self._original_device or
+        changed = (new_force_cpu != self._original_force_cpu or
                    new_gpu_device != self._original_gpu_device)
 
         if changed and self._restart_label:
@@ -700,9 +753,9 @@ class SettingsDialog:
         val = self._gpu_device_var.get()
         if val == "Auto-select":
             return -1
-        # Find index by matching display name
+        # Find index by matching shortened display name
         for i, dev in enumerate(self._gpu_devices):
-            if dev.display_name == val:
+            if self._shorten_gpu_name(dev.name) == val:
                 return i
         return -1
 
@@ -896,9 +949,9 @@ class SettingsDialog:
 
         # Save GPU settings
         if self._force_cpu_var and self._force_cpu_var.get():
-            self._config.engine.device = "cpu"
+            self._config.engine.force_cpu = True
         else:
-            self._config.engine.device = "auto"
+            self._config.engine.force_cpu = False
         self._config.engine.gpu_device = self._get_selected_gpu_index()
 
         self._config.output.mode = self._output_mode_var.get()

@@ -10,14 +10,8 @@ def build_engine(config: Config) -> STTEngine:
     """Create an engine instance for the configured engine."""
     engine_type = config.engine.type
     if engine_type == "whisper":
-        # Resolve device setting: "auto", "gpu"/"cuda", or "cpu"
-        device = config.engine.device.lower()
-        if device == "auto":
-            use_gpu = None  # Let WhisperEngine auto-detect
-        elif device in ("gpu", "cuda"):
-            use_gpu = True
-        else:
-            use_gpu = False
+        # force_cpu=True -> use_gpu=False, otherwise let engine auto-detect
+        use_gpu = False if config.engine.force_cpu else None
 
         return WhisperEngine(
             model_name=config.engine.whisper_model,

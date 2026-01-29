@@ -14,12 +14,11 @@ class GPUDeviceInfo:
 
     index: int
     name: str
-    vram_gb: float
 
     @property
     def display_name(self) -> str:
         """User-friendly display name for dropdown."""
-        return f"{self.name} ({self.vram_gb:.1f}GB VRAM)"
+        return self.name
 
 
 @dataclass
@@ -29,7 +28,6 @@ class HardwareInfo:
     has_cuda: bool = False
     has_vulkan: bool = False
     gpu_name: Optional[str] = None
-    vram_gb: Optional[float] = None
     cpu_cores: int = 1
     ram_gb: Optional[float] = None
     recommended_engine: str = "whisper"
@@ -53,19 +51,16 @@ class HardwareInfo:
     def summary(self) -> str:
         """Human-readable hardware summary."""
         if self.has_gpu and self.gpu_name:
-            vram_str = f", {self.vram_gb:.1f}GB VRAM" if self.vram_gb else ""
             backend = f" ({self.gpu_backend})" if self.gpu_backend else ""
-            return f"{self.gpu_name}{vram_str}{backend}"
+            return f"{self.gpu_name}{backend}"
         return f"CPU ({self.cpu_cores} cores)"
 
 
-def _detect_gpu_wmi() -> tuple[bool, Optional[str], Optional[float]]:
-    """Detect GPU via Windows WMI (vendor-agnostic).
-
-    Works with NVIDIA, AMD, and Intel GPUs (discrete and integrated).
+def _detect_gpu_wmi() -> tuple[bool, Optional[str]]:
+    """Detect GPU via Windows WMI.
 
     Returns:
-        Tuple of (has_gpu, gpu_name, vram_gb).
+        Tuple of (has_gpu, gpu_name).
     """
     try:
         creationflags = 0
@@ -73,47 +68,29 @@ def _detect_gpu_wmi() -> tuple[bool, Optional[str], Optional[float]]:
             creationflags = subprocess.CREATE_NO_WINDOW
 
         result = subprocess.run(
-            ["wmic", "path", "win32_VideoController", "get",
-             "Name,AdapterRAM", "/format:csv"],
+            ["wmic", "path", "win32_VideoController", "get", "Name"],
             capture_output=True,
             text=True,
             timeout=5,
             creationflags=creationflags,
         )
         if result.returncode == 0 and result.stdout.strip():
-            # Parse CSV: Node,AdapterRAM,Name
-            # Skip header line, find first discrete GPU (> 512MB VRAM)
             lines = [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
-            for line in lines[1:]:  # Skip header
-                parts = line.split(",")
-                if len(parts) >= 3:
-                    adapter_ram = parts[1].strip()
-                    name = parts[2].strip()
-                    # Skip integrated GPUs with minimal VRAM (< 512MB)
-                    if adapter_ram and int(adapter_ram) > 512 * 1024 * 1024:
-                        vram_gb = int(adapter_ram) / (1024**3)
-                        return True, name, vram_gb
-            # Fallback: return first GPU even if low VRAM
-            if len(lines) > 1:
-                parts = lines[1].split(",")
-                if len(parts) >= 3:
-                    name = parts[2].strip()
-                    adapter_ram = parts[1].strip() if parts[1].strip() else "0"
-                    vram_gb = int(adapter_ram) / (1024**3) if adapter_ram != "0" else None
-                    return True, name, vram_gb
+            # Skip header "Name", return first real GPU
+            for line in lines[1:]:
+                if line and line != "Name":
+                    return True, line
     except FileNotFoundError:
         pass
     except subprocess.TimeoutExpired:
         logger.debug("wmic timed out")
     except Exception as e:
         logger.debug("wmic failed: %s", e)
-    return False, None, None
+    return False, None
 
 
 def enumerate_gpus() -> List[GPUDeviceInfo]:
-    """Enumerate all GPUs via Windows WMI (vendor-agnostic).
-
-    Works with NVIDIA, AMD, and Intel GPUs (discrete and integrated).
+    """Enumerate all GPUs via Windows WMI.
 
     Returns:
         List of GPUDeviceInfo for each detected GPU.
@@ -125,8 +102,7 @@ def enumerate_gpus() -> List[GPUDeviceInfo]:
             creationflags = subprocess.CREATE_NO_WINDOW
 
         result = subprocess.run(
-            ["wmic", "path", "win32_VideoController", "get",
-             "Name,AdapterRAM", "/format:csv"],
+            ["wmic", "path", "win32_VideoController", "get", "Name"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -135,19 +111,10 @@ def enumerate_gpus() -> List[GPUDeviceInfo]:
         if result.returncode == 0 and result.stdout.strip():
             lines = [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
             index = 0
-            for line in lines[1:]:  # Skip header
-                parts = line.split(",")
-                if len(parts) >= 3:
-                    adapter_ram = parts[1].strip()
-                    name = parts[2].strip()
-                    if name:  # Valid GPU entry
-                        vram_gb = int(adapter_ram) / (1024**3) if adapter_ram else 0.0
-                        devices.append(GPUDeviceInfo(
-                            index=index,
-                            name=name,
-                            vram_gb=vram_gb,
-                        ))
-                        index += 1
+            for line in lines[1:]:  # Skip header "Name"
+                if line and line != "Name":
+                    devices.append(GPUDeviceInfo(index=index, name=line))
+                    index += 1
     except FileNotFoundError:
         pass
     except subprocess.TimeoutExpired:
@@ -260,10 +227,9 @@ def detect_hardware() -> HardwareInfo:
         pass
 
     # Detect GPU via WMI (works with NVIDIA, AMD, Intel)
-    has_gpu, gpu_name, vram_gb = _detect_gpu_wmi()
+    has_gpu, gpu_name = _detect_gpu_wmi()
     if has_gpu:
         info.gpu_name = gpu_name
-        info.vram_gb = vram_gb
 
     # Check GPU backends in pywhispercpp
     # Vulkan is preferred (universal support: NVIDIA, AMD, Intel discrete and integrated)
@@ -289,7 +255,7 @@ def _get_recommendations(info: HardwareInfo) -> tuple[str, str]:
     """Determine recommended GGML Whisper model based on hardware.
 
     CLD uses pywhispercpp with GGML models:
-    - With GPU (Vulkan/CUDA): medium or larger for fast inference
+    - With GPU (Vulkan/CUDA): medium-q5_0 for fast inference
     - CPU 8+ cores: medium (full precision)
     - CPU 4+ cores: medium-q5_0 (quantized, default)
     - CPU 2-3 cores: small
@@ -300,19 +266,9 @@ def _get_recommendations(info: HardwareInfo) -> tuple[str, str]:
     Returns:
         Tuple of (engine, model) recommendations.
     """
-    # GPU recommendations (based on VRAM if known, otherwise assume capable)
+    # GPU available - recommend medium-q5_0 as good balance
     if info.has_gpu:
-        if info.vram_gb is not None:
-            if info.vram_gb >= 6:
-                return ("whisper", "medium")
-            elif info.vram_gb >= 3:
-                return ("whisper", "medium-q5_0")
-            else:
-                return ("whisper", "small")
-        else:
-            # Vulkan with unknown VRAM (e.g., iGPU without nvidia-smi)
-            # Default to medium-q5_0 as safe choice
-            return ("whisper", "medium-q5_0")
+        return ("whisper", "medium-q5_0")
 
     # CPU-only recommendations based on core count
     if info.cpu_cores < 2:

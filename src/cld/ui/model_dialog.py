@@ -185,7 +185,6 @@ class ModelSetupDialog:
             self._hw_info = {
                 "has_cuda": hw.has_cuda,
                 "gpu_name": hw.gpu_name,
-                "vram_gb": hw.vram_gb,
                 "ram_gb": hw.ram_gb,
                 "cpu_cores": hw.cpu_cores,
                 "recommended": hw.recommended_model,
@@ -198,7 +197,6 @@ class ModelSetupDialog:
             self._hw_info = {
                 "has_cuda": False,
                 "gpu_name": None,
-                "vram_gb": None,
                 "ram_gb": None,
                 "cpu_cores": os.cpu_count() or 1,
                 "recommended": "medium-q5_0",

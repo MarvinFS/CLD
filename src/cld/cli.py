@@ -10,31 +10,44 @@ import sys
 os.environ.setdefault("FOR_DISABLE_CONSOLE_CTRL_HANDLER", "1")
 
 
-def _hide_console_window():
-    """Hide console window on Windows for non-debug mode.
+def _needs_console() -> bool:
+    """Check if we need a visible console (--version or --debug flags)."""
+    return "--version" in sys.argv or "-V" in sys.argv or "--debug" in sys.argv
 
-    This prevents the brief console flash when launching from Explorer.
-    Only hides if not in debug mode.
+
+# Check for --version BEFORE other imports (needs console in windowed mode)
+def _early_version_check():
+    """Check for --version flag early and print version before imports.
+
+    In PyInstaller windowed mode, there's no console to print to.
+    Allocate a console, print version, wait for keypress, then exit.
     """
-    if sys.platform != "win32":
-        return
-    if "--debug" in sys.argv:
-        return  # Keep console visible in debug mode
+    if "--version" in sys.argv or "-V" in sys.argv:
+        if getattr(sys, 'frozen', False) and sys.platform == 'win32':
+            try:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                # Allocate console for windowed exe
+                kernel32.AllocConsole()
+                # Redirect stdout/stderr to the new console
+                sys.stdout = open('CONOUT$', 'w', encoding='utf-8')
+                sys.stderr = open('CONOUT$', 'w', encoding='utf-8')
+            except Exception:
+                pass
+        # Import version here to avoid circular imports
+        from cld import __version__
+        print(f"CLD version {__version__}")
+        # In frozen exe, wait for keypress so user can see output
+        if getattr(sys, 'frozen', False) and sys.platform == 'win32':
+            print("\nPress Enter to exit...")
+            try:
+                input()
+            except Exception:
+                pass
+        sys.exit(0)
 
-    try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        hwnd = kernel32.GetConsoleWindow()
-        if hwnd:
-            user32 = ctypes.windll.user32
-            SW_HIDE = 0
-            user32.ShowWindow(hwnd, SW_HIDE)
-    except Exception:
-        pass
 
-
-# Hide console immediately for non-debug mode to prevent blink
-_hide_console_window()
+_early_version_check()
 
 
 # Check for --debug BEFORE other imports to enable console early
@@ -51,46 +64,66 @@ def _early_debug_check():
 
             kernel32 = ctypes.windll.kernel32
 
-            # Allocate console if none exists
-            hwnd = kernel32.GetConsoleWindow()
-            if not hwnd:
-                kernel32.AllocConsole()
-                hwnd = kernel32.GetConsoleWindow()
+            # Always allocate a new console for debug mode
+            # This ensures we get a visible console even for windowed exe
+            kernel32.AllocConsole()
 
-            if hwnd:
-                # Show the console window
-                user32 = ctypes.windll.user32
-                SW_SHOW = 5
-                user32.ShowWindow(hwnd, SW_SHOW)
+            # Redirect stdout/stderr to the new console
+            # Critical: must happen before any print statements
+            sys.stdout = open('CONOUT$', 'w', encoding='utf-8')
+            sys.stderr = open('CONOUT$', 'w', encoding='utf-8')
 
-                # Redirect stdout/stderr to the new console
-                # Critical: must happen before any print statements
-                sys.stdout = open('CONOUT$', 'w', encoding='utf-8')
-                sys.stderr = open('CONOUT$', 'w', encoding='utf-8')
+            # Install console control handler to prevent MKL crash on console close
+            # Intel MKL's Fortran runtime crashes with error 200 when console closes
+            # We intercept CTRL_CLOSE_EVENT (2), detach from console, and exit cleanly
+            @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+            def console_handler(event):
+                if event == 2:  # CTRL_CLOSE_EVENT
+                    # Detach from console FIRST to prevent MKL from seeing the close
+                    kernel32.FreeConsole()
+                    # Now exit cleanly - MKL won't crash because we're detached
+                    import os
+                    os._exit(0)
+                return False  # Let other handlers process other events
 
-                # Install console control handler to prevent MKL crash on console close
-                # Intel MKL's Fortran runtime crashes with error 200 when console closes
-                # We intercept CTRL_CLOSE_EVENT (2), detach from console, and exit cleanly
-                @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
-                def console_handler(event):
-                    if event == 2:  # CTRL_CLOSE_EVENT
-                        # Detach from console FIRST to prevent MKL from seeing the close
-                        kernel32.FreeConsole()
-                        # Now exit cleanly - MKL won't crash because we're detached
-                        import os
-                        os._exit(0)
-                    return False  # Let other handlers process other events
+            # Keep reference to prevent garbage collection
+            global _console_handler_ref
+            _console_handler_ref = console_handler
+            kernel32.SetConsoleCtrlHandler(console_handler, True)
 
-                # Keep reference to prevent garbage collection
-                global _console_handler_ref
-                _console_handler_ref = console_handler
-                kernel32.SetConsoleCtrlHandler(console_handler, True)
-
-                print("=== CLD Debug Console ===", flush=True)
+            print("=== CLD Debug Console ===", flush=True)
         except Exception:
+            # If console allocation fails, silently continue
             pass
 
 _early_debug_check()
+
+
+def _hide_console_window():
+    """Hide console window on Windows for non-debug mode.
+
+    This prevents the brief console flash when launching from Explorer.
+    Only hides if not in debug/version mode (those need the console visible).
+    """
+    if sys.platform != "win32":
+        return
+    if _needs_console():
+        return  # Keep console visible for --debug and --version
+
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        hwnd = kernel32.GetConsoleWindow()
+        if hwnd:
+            user32 = ctypes.windll.user32
+            SW_HIDE = 0
+            user32.ShowWindow(hwnd, SW_HIDE)
+    except Exception:
+        pass
+
+
+# Hide console AFTER version/debug checks for non-debug mode
+_hide_console_window()
 
 import argparse
 from typing import Sequence

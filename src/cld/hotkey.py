@@ -17,6 +17,9 @@ except Exception as exc:
 
 from cld.errors import HotkeyError
 
+# Toggle mode debounce time in seconds (prevents rapid key presses from triggering multiple start/stop cycles)
+TOGGLE_DEBOUNCE_SECONDS = 0.3
+
 
 class HotkeyListener:
     """Listens for global hotkey events.
@@ -355,7 +358,7 @@ class HotkeyListener:
                 if self.mode == "toggle":
                     # Toggle mode: press to start/stop with debounce
                     current = time.time()
-                    if current - self._last_toggle_time < 0.3:
+                    if current - self._last_toggle_time < TOGGLE_DEBOUNCE_SECONDS:
                         return
                     self._last_toggle_time = current
 

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Literal, Optional
@@ -29,16 +30,8 @@ class EngineConfig:
     """STT engine settings."""
     type: Literal["whisper"] = "whisper"  # Whisper for multilingual support
     whisper_model: str = "medium-q5_0"  # ~1.5GB, good accuracy
-    device: str = "auto"  # "auto", "cpu", or "gpu"
-    gpu_device: int = -1  # -1=auto-select, 0=first GPU, 1=second GPU
-
-
-@dataclass
-class FeaturesConfig:
-    """Feature toggles."""
-    auto_punctuation: bool = True
-    filter_profanity: bool = False
-    voice_typing_launcher: bool = True
+    force_cpu: bool = False  # Force CPU-only mode (ignore GPU)
+    gpu_device: int = -1  # -1=auto-select, 0=first GPU, 1=second GPU, etc.
 
 
 @dataclass
@@ -69,7 +62,6 @@ class Config:
     version: int = CONFIG_VERSION
     activation: ActivationConfig = field(default_factory=ActivationConfig)
     engine: EngineConfig = field(default_factory=EngineConfig)
-    features: FeaturesConfig = field(default_factory=FeaturesConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     recording: RecordingConfig = field(default_factory=RecordingConfig)
     ui: UIConfig = field(default_factory=UIConfig)
@@ -278,22 +270,15 @@ class Config:
         # Load engine settings
         if "engine" in data:
             eng = data["engine"]
+            # Handle backwards compatibility: old "device": "cpu" -> new "force_cpu": true
+            force_cpu = eng.get("force_cpu", False)
+            if not force_cpu and eng.get("device") == "cpu":
+                force_cpu = True
             config.engine = EngineConfig(
                 type="whisper",  # Only whisper supported
                 whisper_model=eng.get("whisper_model", config.engine.whisper_model),
-                device=eng.get("device", config.engine.device),
+                force_cpu=force_cpu,
                 gpu_device=eng.get("gpu_device", config.engine.gpu_device),
-            )
-
-        # Load features settings
-        if "features" in data:
-            feat = data["features"]
-            config.features = FeaturesConfig(
-                auto_punctuation=feat.get("auto_punctuation", config.features.auto_punctuation),
-                filter_profanity=feat.get("filter_profanity", config.features.filter_profanity),
-                voice_typing_launcher=feat.get(
-                    "voice_typing_launcher", config.features.voice_typing_launcher
-                ),
             )
 
         # Load output settings
@@ -328,14 +313,13 @@ class Config:
             "version": self.version,
             "activation": asdict(self.activation),
             "engine": asdict(self.engine),
-            "features": asdict(self.features),
             "output": asdict(self.output),
             "recording": asdict(self.recording),
             "ui": asdict(self.ui),
         }
 
     def save(self) -> bool:
-        """Save configuration to file."""
+        """Save configuration to file with retry logic for Windows file locking."""
         config_path = self.get_config_path()
         config_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -350,8 +334,29 @@ class Config:
             ) as handle:
                 temp_file = Path(handle.name)
                 json.dump(self.to_dict(), handle, indent=2)
-            os.replace(temp_file, config_path)
-            return True
+
+            # Retry os.replace() with exponential backoff to handle file locking
+            max_attempts = 3
+            delays = [0.1, 0.2, 0.4]  # Exponential backoff delays in seconds
+
+            for attempt in range(max_attempts):
+                try:
+                    os.replace(temp_file, config_path)
+                    return True
+                except (PermissionError, OSError) as e:
+                    if attempt < max_attempts - 1:
+                        logger.debug(
+                            "Config save attempt %d failed with %s, retrying in %.1fs",
+                            attempt + 1,
+                            type(e).__name__,
+                            delays[attempt],
+                        )
+                        time.sleep(delays[attempt])
+                    else:
+                        # Final attempt failed, re-raise
+                        raise
+
+            return False  # Should never reach here
         except Exception:
             logger.exception("Failed to save config")
             return False

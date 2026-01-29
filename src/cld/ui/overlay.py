@@ -13,6 +13,9 @@ from PIL import Image, ImageTk
 
 logger = logging.getLogger(__name__)
 
+# Animation frame interval in milliseconds (approximately 30 FPS)
+ANIMATION_FRAME_MS = 33
+
 
 def _is_frozen() -> bool:
     """Check if running as frozen exe (PyInstaller or Nuitka)."""
@@ -729,6 +732,10 @@ class STTOverlay:
         if not self._running:
             return
 
+        # Skip animation when idle - save CPU
+        if self._state not in ("recording", "transcribing"):
+            return
+
         if self._mode == self.MODE_TINY:
             # Tiny mode animation (redraw mic for pulse effect)
             if self._state in ("recording", "transcribing"):
@@ -759,7 +766,7 @@ class STTOverlay:
 
             self._draw_waveform(idle=False)
             self._update_timer()
-            self._animation_id = self._root.after(33, self._animate)  # ~30fps
+            self._animation_id = self._root.after(ANIMATION_FRAME_MS, self._animate)
 
         elif self._state == "transcribing":
             # Gentle pulsing for transcribing state

@@ -1,5 +1,7 @@
 """Model management for CLD - download, validation, and caching of GGML models."""
 
+import hashlib
+import json
 import logging
 import os
 import urllib.request
@@ -40,6 +42,10 @@ WHISPER_MODELS = {
 # Base URL for GGML model downloads
 GGML_BASE_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
 
+# Local metadata file stores MD5 hashes of downloaded models
+# This allows integrity verification without hardcoded hashes that break on updates
+METADATA_FILE = "models.json"
+
 
 def get_models_dir() -> Path:
     """Get CLD models directory in LOCALAPPDATA."""
@@ -63,6 +69,34 @@ class ModelManager:
         """Initialize model manager."""
         setup_model_cache()
         self._models_dir = get_models_dir()
+        self._metadata_path = self._models_dir / METADATA_FILE
+        self._metadata = self._load_metadata()
+
+    def _load_metadata(self) -> dict:
+        """Load model metadata (hashes, sizes) from local file."""
+        if self._metadata_path.exists():
+            try:
+                with open(self._metadata_path, "r") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning("Failed to load model metadata: %s", e)
+        return {}
+
+    def _save_metadata(self) -> None:
+        """Save model metadata to local file."""
+        try:
+            with open(self._metadata_path, "w") as f:
+                json.dump(self._metadata, f, indent=2)
+        except Exception as e:
+            logger.warning("Failed to save model metadata: %s", e)
+
+    def _compute_md5(self, file_path: Path) -> str:
+        """Compute MD5 hash of a file."""
+        md5_hash = hashlib.md5()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                md5_hash.update(chunk)
+        return md5_hash.hexdigest()
 
     def _get_model_path(self, model_name: str) -> Path:
         """Get path to GGML model file."""
@@ -70,21 +104,101 @@ class ModelManager:
             return self._models_dir / f"ggml-{model_name}.bin"
         return self._models_dir / WHISPER_MODELS[model_name]["file"]
 
-    def is_model_available(self, model_name: str) -> bool:
+    def _verify_hash(self, file_path: Path, model_name: str) -> tuple[bool, str]:
+        """Verify MD5 hash of model file against stored hash.
+
+        Args:
+            file_path: Path to model file to verify.
+            model_name: Model name for hash lookup.
+
+        Returns:
+            Tuple of (valid, error_message).
+            - If no stored hash, computes and stores it (first run).
+            - If stored hash exists, verifies file matches.
+        """
+        try:
+            logger.info("Verifying %s...", model_name)
+            actual_hash = self._compute_md5(file_path)
+            actual_size = file_path.stat().st_size
+
+            # Check if we have stored metadata for this model
+            stored = self._metadata.get(model_name)
+            if stored is None:
+                # First time - store the hash
+                self._metadata[model_name] = {
+                    "md5": actual_hash,
+                    "size": actual_size,
+                }
+                self._save_metadata()
+                logger.info("Stored hash for %s: %s", model_name, actual_hash)
+                return True, ""
+
+            expected_hash = stored.get("md5")
+            if expected_hash and actual_hash != expected_hash:
+                error_msg = f"File corrupted or modified: {model_name}"
+                logger.error("%s (expected %s, got %s)", error_msg, expected_hash, actual_hash)
+                return False, error_msg
+
+            logger.info("Hash OK for %s", model_name)
+            return True, ""
+
+        except OSError as e:
+            error_msg = f"Failed to read file: {e}"
+            logger.error(error_msg)
+            return False, error_msg
+
+        except Exception as e:
+            error_msg = f"Verification failed: {e}"
+            logger.exception("Unexpected error during verification")
+            return False, error_msg
+
+    def is_model_available(self, model_name: str, verify_hash: bool = False) -> bool:
         """Check if a model is downloaded and ready.
 
         Args:
             model_name: Model name (e.g., 'medium-q5_0', 'small').
+            verify_hash: If True, also verify SHA256 hash matches expected.
 
         Returns:
-            True if model file exists.
+            True if model file exists (and hash matches if verify_hash=True).
         """
         if model_name not in WHISPER_MODELS:
             logger.warning("Unknown model: %s", model_name)
             return False
 
         model_path = self._get_model_path(model_name)
-        return model_path.exists()
+        if not model_path.exists():
+            return False
+
+        if verify_hash:
+            is_valid, _ = self._verify_hash(model_path, model_name)
+            return is_valid
+
+        return True
+
+    def is_model_up_to_date(self, model_name: str) -> tuple[bool, str]:
+        """Check if a model exists and has the correct hash.
+
+        Args:
+            model_name: Model name to check.
+
+        Returns:
+            Tuple of (up_to_date, message).
+            - (True, "Model is up to date") if hash matches
+            - (False, "Model not found") if file doesn't exist
+            - (False, "Hash mismatch...") if hash doesn't match
+        """
+        if model_name not in WHISPER_MODELS:
+            return False, f"Unknown model: {model_name}"
+
+        model_path = self._get_model_path(model_name)
+        if not model_path.exists():
+            return False, "Model not found"
+
+        is_valid, error_msg = self._verify_hash(model_path, model_name)
+        if is_valid:
+            return True, "Model is up to date"
+        return False, error_msg
 
     def get_model_path(self, model_name: str) -> Optional[Path]:
         """Get path to downloaded model.
@@ -154,7 +268,21 @@ class ModelManager:
             temp_path = target_path.with_suffix(".tmp")
             urllib.request.urlretrieve(url, temp_path, reporthook)
 
+            # Move to final location
             temp_path.rename(target_path)
+
+            # Store hash of downloaded file
+            try:
+                file_hash = self._compute_md5(target_path)
+                file_size = target_path.stat().st_size
+                self._metadata[model_name] = {
+                    "md5": file_hash,
+                    "size": file_size,
+                }
+                self._save_metadata()
+                logger.info("Stored hash for %s: %s", model_name, file_hash)
+            except Exception as e:
+                logger.warning("Failed to store hash: %s", e)
 
             logger.info("Model download complete: %s", model_name)
             return True, ""
