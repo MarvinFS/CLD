@@ -3,9 +3,23 @@
 import logging
 import subprocess
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class GPUDeviceInfo:
+    """Information about a single GPU device."""
+
+    index: int
+    name: str
+    vram_gb: float
+
+    @property
+    def display_name(self) -> str:
+        """User-friendly display name for dropdown."""
+        return f"{self.name} ({self.vram_gb:.1f}GB VRAM)"
 
 
 @dataclass
@@ -45,41 +59,102 @@ class HardwareInfo:
         return f"CPU ({self.cpu_cores} cores)"
 
 
-def _detect_nvidia_gpu() -> tuple[bool, Optional[str], Optional[float]]:
-    """Detect NVIDIA GPU via nvidia-smi.
+def _detect_gpu_wmi() -> tuple[bool, Optional[str], Optional[float]]:
+    """Detect GPU via Windows WMI (vendor-agnostic).
+
+    Works with NVIDIA, AMD, and Intel GPUs (discrete and integrated).
 
     Returns:
         Tuple of (has_gpu, gpu_name, vram_gb).
     """
     try:
-        # Hide console window on Windows
         creationflags = 0
         if hasattr(subprocess, "CREATE_NO_WINDOW"):
             creationflags = subprocess.CREATE_NO_WINDOW
 
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+            ["wmic", "path", "win32_VideoController", "get",
+             "Name,AdapterRAM", "/format:csv"],
             capture_output=True,
             text=True,
             timeout=5,
             creationflags=creationflags,
         )
         if result.returncode == 0 and result.stdout.strip():
-            # Parse: "NVIDIA GeForce RTX 4090, 24564"
-            line = result.stdout.strip().split("\n")[0]  # First GPU only
-            parts = line.split(", ")
-            if len(parts) >= 2:
-                name = parts[0].strip()
-                vram_mb = float(parts[1].strip())
-                return True, name, vram_mb / 1024
+            # Parse CSV: Node,AdapterRAM,Name
+            # Skip header line, find first discrete GPU (> 512MB VRAM)
+            lines = [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
+            for line in lines[1:]:  # Skip header
+                parts = line.split(",")
+                if len(parts) >= 3:
+                    adapter_ram = parts[1].strip()
+                    name = parts[2].strip()
+                    # Skip integrated GPUs with minimal VRAM (< 512MB)
+                    if adapter_ram and int(adapter_ram) > 512 * 1024 * 1024:
+                        vram_gb = int(adapter_ram) / (1024**3)
+                        return True, name, vram_gb
+            # Fallback: return first GPU even if low VRAM
+            if len(lines) > 1:
+                parts = lines[1].split(",")
+                if len(parts) >= 3:
+                    name = parts[2].strip()
+                    adapter_ram = parts[1].strip() if parts[1].strip() else "0"
+                    vram_gb = int(adapter_ram) / (1024**3) if adapter_ram != "0" else None
+                    return True, name, vram_gb
     except FileNotFoundError:
-        # nvidia-smi not found - no NVIDIA driver
         pass
     except subprocess.TimeoutExpired:
-        logger.debug("nvidia-smi timed out")
+        logger.debug("wmic timed out")
     except Exception as e:
-        logger.debug("nvidia-smi failed: %s", e)
+        logger.debug("wmic failed: %s", e)
     return False, None, None
+
+
+def enumerate_gpus() -> List[GPUDeviceInfo]:
+    """Enumerate all GPUs via Windows WMI (vendor-agnostic).
+
+    Works with NVIDIA, AMD, and Intel GPUs (discrete and integrated).
+
+    Returns:
+        List of GPUDeviceInfo for each detected GPU.
+    """
+    devices = []
+    try:
+        creationflags = 0
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            creationflags = subprocess.CREATE_NO_WINDOW
+
+        result = subprocess.run(
+            ["wmic", "path", "win32_VideoController", "get",
+             "Name,AdapterRAM", "/format:csv"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=creationflags,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            lines = [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
+            index = 0
+            for line in lines[1:]:  # Skip header
+                parts = line.split(",")
+                if len(parts) >= 3:
+                    adapter_ram = parts[1].strip()
+                    name = parts[2].strip()
+                    if name:  # Valid GPU entry
+                        vram_gb = int(adapter_ram) / (1024**3) if adapter_ram else 0.0
+                        devices.append(GPUDeviceInfo(
+                            index=index,
+                            name=name,
+                            vram_gb=vram_gb,
+                        ))
+                        index += 1
+    except FileNotFoundError:
+        pass
+    except subprocess.TimeoutExpired:
+        logger.debug("wmic timed out during GPU enumeration")
+    except Exception as e:
+        logger.debug("GPU enumeration failed: %s", e)
+    return devices
 
 
 def _check_pywhispercpp_cuda() -> bool:
@@ -184,9 +259,9 @@ def detect_hardware() -> HardwareInfo:
     except Exception:
         pass
 
-    # Detect NVIDIA GPU (for display purposes and CUDA fallback)
-    has_nvidia, gpu_name, vram_gb = _detect_nvidia_gpu()
-    if has_nvidia:
+    # Detect GPU via WMI (works with NVIDIA, AMD, Intel)
+    has_gpu, gpu_name, vram_gb = _detect_gpu_wmi()
+    if has_gpu:
         info.gpu_name = gpu_name
         info.vram_gb = vram_gb
 
@@ -200,8 +275,8 @@ def detect_hardware() -> HardwareInfo:
         logger.info("Vulkan GPU backend available (universal GPU support)")
     elif info.has_cuda:
         logger.info("CUDA GPU backend available (NVIDIA-only)")
-    elif has_nvidia:
-        logger.info("NVIDIA GPU detected but pywhispercpp has no GPU backend. "
+    elif has_gpu:
+        logger.info("GPU detected but pywhispercpp has no GPU backend. "
                    "Rebuild with GGML_VULKAN=1 for universal GPU acceleration.")
 
     # Determine recommendations based on hardware

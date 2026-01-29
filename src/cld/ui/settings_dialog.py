@@ -8,7 +8,7 @@ from tkinter import ttk
 from typing import Callable, Optional
 
 from cld.config import Config
-from cld.ui.hardware import get_available_models, detect_hardware
+from cld.ui.hardware import get_available_models, detect_hardware, enumerate_gpus, GPUDeviceInfo
 from cld.ui.key_scanner import KeyScanner, KeyCapture, KEY_DISPLAY_NAMES
 
 logger = logging.getLogger(__name__)
@@ -103,6 +103,15 @@ class SettingsDialog:
         self._engine_var: Optional[tk.StringVar] = None
         self._model_combo: Optional[ttk.Combobox] = None
 
+        # Hardware section state
+        self._force_cpu_var: Optional[tk.BooleanVar] = None
+        self._gpu_device_var: Optional[tk.StringVar] = None
+        self._gpu_combo: Optional[ttk.Combobox] = None
+        self._gpu_devices: list[GPUDeviceInfo] = []
+        self._restart_label: Optional[tk.Label] = None
+        self._original_device: str = ""
+        self._original_gpu_device: int = -1
+
     def show(self):
         """Show the settings dialog."""
         if self._window:
@@ -180,6 +189,7 @@ class SettingsDialog:
         # Build sections
         self._build_activation_section(content)
         self._build_engine_section(content)
+        self._build_hardware_section(content)
         self._build_output_section(content)
         self._build_recording_section(content)
 
@@ -552,6 +562,150 @@ class SettingsDialog:
         )
         self._hw_info_label.pack(side=tk.LEFT)
 
+    def _build_hardware_section(self, parent: tk.Frame):
+        """Build the hardware/GPU settings section."""
+        section = self._build_section(parent, "Hardware")
+
+        # Detect hardware and GPUs
+        hw_info = detect_hardware()
+        self._gpu_devices = enumerate_gpus()
+
+        # Store originals for restart detection
+        self._original_device = self._config.engine.device
+        self._original_gpu_device = self._config.engine.gpu_device
+
+        # Force CPU Only checkbox
+        cpu_row = tk.Frame(section, bg=self._surface)
+        cpu_row.pack(fill=tk.X, padx=12, pady=8)
+
+        tk.Label(
+            cpu_row,
+            text="Force CPU Only",
+            font=("Segoe UI", 10),
+            fg=self._text,
+            bg=self._surface,
+        ).pack(side=tk.LEFT)
+
+        self._force_cpu_var = tk.BooleanVar(value=self._config.engine.device == "cpu")
+        cpu_cb = tk.Checkbutton(
+            cpu_row,
+            variable=self._force_cpu_var,
+            command=self._on_force_cpu_change,
+            bg=self._surface,
+            fg=self._text,
+            activebackground=self._surface,
+            activeforeground=self._text,
+            selectcolor=self._accent,
+            highlightthickness=0,
+            bd=0,
+        )
+        cpu_cb.pack(side=tk.RIGHT)
+
+        # GPU Device dropdown (if GPUs detected or GPU backend available)
+        if self._gpu_devices or hw_info.has_gpu:
+            gpu_row = tk.Frame(section, bg=self._surface)
+            gpu_row.pack(fill=tk.X, padx=12, pady=8)
+
+            tk.Label(
+                gpu_row,
+                text="GPU Device",
+                font=("Segoe UI", 10),
+                fg=self._text,
+                bg=self._surface,
+            ).pack(side=tk.LEFT)
+
+            # Build dropdown values
+            values = ["Auto-select"]
+            for dev in self._gpu_devices:
+                values.append(dev.display_name)
+
+            self._gpu_device_var = tk.StringVar()
+            # Set current value
+            if self._config.engine.gpu_device == -1:
+                self._gpu_device_var.set("Auto-select")
+            elif self._gpu_devices and 0 <= self._config.engine.gpu_device < len(self._gpu_devices):
+                self._gpu_device_var.set(self._gpu_devices[self._config.engine.gpu_device].display_name)
+            else:
+                self._gpu_device_var.set("Auto-select")
+
+            self._gpu_combo = ttk.Combobox(
+                gpu_row,
+                textvariable=self._gpu_device_var,
+                values=values,
+                state="readonly",
+                width=25,
+                style="Dark.TCombobox",
+            )
+            self._gpu_combo.pack(side=tk.RIGHT)
+            self._gpu_combo.bind("<<ComboboxSelected>>", self._on_gpu_change)
+
+            # Disable if force CPU checked
+            if self._force_cpu_var.get():
+                self._gpu_combo.config(state="disabled")
+
+        # GPU backend info display
+        if hw_info.has_gpu:
+            info_row = tk.Frame(section, bg=self._surface)
+            info_row.pack(fill=tk.X, padx=12, pady=(0, 8))
+            backend = hw_info.gpu_backend or "Unknown"
+            info_text = f"Backend: {backend}"
+            if hw_info.gpu_name:
+                info_text += f" | {hw_info.gpu_name}"
+            tk.Label(
+                info_row,
+                text=info_text,
+                font=("Segoe UI", 9),
+                fg=self._text_dim,
+                bg=self._surface,
+            ).pack(side=tk.LEFT)
+
+        # Restart warning (hidden initially)
+        self._restart_label = tk.Label(
+            section,
+            text="⚠ Restart required for GPU changes",
+            font=("Segoe UI", 9),
+            fg="#ffcc00",
+            bg=self._surface,
+        )
+        # Don't pack initially - will be shown when settings change
+
+    def _on_force_cpu_change(self):
+        """Handle Force CPU checkbox change."""
+        if self._gpu_combo:
+            state = "disabled" if self._force_cpu_var.get() else "readonly"
+            self._gpu_combo.config(state=state)
+        self._check_restart_needed()
+
+    def _on_gpu_change(self, event=None):
+        """Handle GPU device dropdown change."""
+        self._check_restart_needed()
+
+    def _check_restart_needed(self):
+        """Check if GPU settings changed and show/hide restart warning."""
+        new_device = "cpu" if self._force_cpu_var.get() else "auto"
+        new_gpu_device = self._get_selected_gpu_index()
+
+        changed = (new_device != self._original_device or
+                   new_gpu_device != self._original_gpu_device)
+
+        if changed and self._restart_label:
+            self._restart_label.pack(fill=tk.X, padx=12, pady=(0, 8))
+        elif self._restart_label:
+            self._restart_label.pack_forget()
+
+    def _get_selected_gpu_index(self) -> int:
+        """Get the selected GPU index from dropdown (-1 for auto)."""
+        if not self._gpu_device_var:
+            return -1
+        val = self._gpu_device_var.get()
+        if val == "Auto-select":
+            return -1
+        # Find index by matching display name
+        for i, dev in enumerate(self._gpu_devices):
+            if dev.display_name == val:
+                return i
+        return -1
+
     def _build_output_section(self, parent: tk.Frame):
         """Build the output settings section."""
         section = self._build_section(parent, "Output")
@@ -739,6 +893,13 @@ class SettingsDialog:
         # Always use Whisper (multilingual)
         self._config.engine.type = "whisper"
         self._config.engine.whisper_model = self._model_var.get()
+
+        # Save GPU settings
+        if self._force_cpu_var and self._force_cpu_var.get():
+            self._config.engine.device = "cpu"
+        else:
+            self._config.engine.device = "auto"
+        self._config.engine.gpu_device = self._get_selected_gpu_index()
 
         self._config.output.mode = self._output_mode_var.get()
         self._config.output.sound_effects = self._sound_var.get()

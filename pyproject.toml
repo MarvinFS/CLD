@@ -19,11 +19,11 @@ dependencies = [
     "pystray>=0.19",
     "pillow>=9.0",
     "pywhispercpp>=1.4",
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
-windows = ["pywin32"]
-dev = ["pytest", "ruff", "nuitka>=2.0", "pyinstaller>=6.0"]
+dev = ["pytest", "ruff", "pyinstaller>=6.0"]
 
 [project.scripts]
 cld = "cld.cli:main"

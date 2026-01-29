@@ -66,12 +66,12 @@ Build pywhispercpp (NO Vulkan SDK needed - using pre-built DLLs):
 cd /d D:\TMP\pywhispercpp
 rmdir /s /q build 2>nul
 set CMAKE_ARGS=-DPython_FIND_REGISTRY=NEVER
-"D:\OneDrive - NoWay Inc\APPS\claudecli-dictate\.venv\Scripts\python.exe" -m pip install --no-cache-dir . --force-reinstall
+"D:\claudecli-dictate2\.venv\Scripts\python.exe" -m pip install --no-cache-dir . --force-reinstall
 ```
 
 Then copy Vulkan DLLs to venv site-packages:
 ```batch
-copy D:\TMP\whisper-vulkan-prebuilt\*.dll "D:\OneDrive - NoWay Inc\APPS\claudecli-dictate\.venv\Lib\site-packages\"
+copy D:\TMP\whisper-vulkan-prebuilt\*.dll "D:\claudecli-dictate2\.venv\Lib\site-packages\"
 ```
 
 ### Step 3: Update CLD config

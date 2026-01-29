@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 
@@ -82,6 +83,11 @@ def get_system_info() -> str:
     return _system_info
 
 
+# Audio chunking constants for long recordings
+CHUNK_DURATION_SECONDS = 60  # Transcribe in 60-second chunks
+CHUNK_OVERLAP_SECONDS = 5    # 5-second overlap to preserve context at boundaries
+
+
 class WhisperEngine:
     """Whisper speech-to-text engine backed by pywhispercpp (whisper.cpp).
 
@@ -103,10 +109,12 @@ class WhisperEngine:
         n_threads: Optional[int] = None,
         use_gpu: Optional[bool] = None,
         gpu_device: int = -1,
+        transcription_timeout: int = 120,
     ):
         self.model_name = model_name
         self.n_threads = n_threads or max(4, (os.cpu_count() or 8) - 2)
         self.gpu_device = gpu_device
+        self.transcription_timeout = transcription_timeout
         self._model: Optional[object] = None
         self._model_lock = threading.Lock()
         self._logger = logging.getLogger(__name__)
@@ -210,27 +218,157 @@ class WhisperEngine:
                 self._logger.exception("Failed to load Whisper model")
                 return False
 
+    def _transcribe_internal(self, audio: np.ndarray) -> str:
+        """Internal transcription worker (runs in thread pool).
+
+        Args:
+            audio: Audio samples as numpy array (mono, float32, 16kHz expected)
+
+        Returns:
+            Transcribed text.
+        """
+        segments = self._model.transcribe(audio, translate=False, language="auto")
+        text = " ".join(s.text.strip() for s in segments)
+        return text.strip()
+
+    def _chunk_audio(self, audio: np.ndarray, sample_rate: int = 16000) -> List[np.ndarray]:
+        """Split audio into overlapping chunks for long recordings.
+
+        Args:
+            audio: Full audio array
+            sample_rate: Sample rate (default 16kHz)
+
+        Returns:
+            List of audio chunks (each ~60 seconds with 5s overlap)
+        """
+        total_samples = len(audio)
+        chunk_samples = CHUNK_DURATION_SECONDS * sample_rate
+        overlap_samples = CHUNK_OVERLAP_SECONDS * sample_rate
+
+        # If audio fits in one chunk, return as-is
+        if total_samples <= chunk_samples:
+            return [audio]
+
+        chunks = []
+        start = 0
+        while start < total_samples:
+            end = min(start + chunk_samples, total_samples)
+            chunks.append(audio[start:end])
+
+            # Move start forward by chunk size minus overlap
+            start += chunk_samples - overlap_samples
+
+            # Don't create tiny final chunks (< 10 seconds)
+            if total_samples - start < sample_rate * 10 and start < total_samples:
+                # Extend last chunk to include remaining audio
+                if chunks:
+                    chunks[-1] = audio[start - (chunk_samples - overlap_samples):]
+                break
+
+        return chunks
+
+    def _transcribe_with_timeout(self, audio: np.ndarray) -> str:
+        """Transcribe a single audio chunk with timeout protection.
+
+        Args:
+            audio: Audio samples as numpy array (mono, float32, 16kHz expected)
+
+        Returns:
+            Transcribed text or empty string on timeout.
+        """
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self._transcribe_internal, audio)
+            try:
+                return future.result(timeout=self.transcription_timeout)
+            except FuturesTimeoutError:
+                self._logger.warning(
+                    "Chunk transcription timed out after %d seconds.",
+                    self.transcription_timeout
+                )
+                self._last_error = f"Transcription timed out after {self.transcription_timeout}s"
+                return ""
+
+    def _join_chunks(self, results: List[str]) -> str:
+        """Join chunk transcriptions, handling overlap artifacts.
+
+        The 5-second overlap may cause some words to be duplicated at boundaries.
+        This method attempts basic deduplication by detecting repeated word sequences.
+
+        Args:
+            results: List of transcribed text from each chunk
+
+        Returns:
+            Joined text with overlap deduplication.
+        """
+        if not results:
+            return ""
+        if len(results) == 1:
+            return results[0]
+
+        joined = results[0]
+        for i in range(1, len(results)):
+            next_text = results[i]
+            if not next_text:
+                continue
+
+            joined_words = joined.split()
+            next_words = next_text.split()
+
+            # Check for 1-5 word overlap at boundary
+            overlap_found = False
+            if len(joined_words) >= 3 and len(next_words) >= 3:
+                for overlap_len in range(5, 0, -1):
+                    if len(joined_words) >= overlap_len and len(next_words) >= overlap_len:
+                        if joined_words[-overlap_len:] == next_words[:overlap_len]:
+                            # Found overlap, skip duplicate words
+                            joined = joined + " " + " ".join(next_words[overlap_len:])
+                            overlap_found = True
+                            break
+            if not overlap_found:
+                joined = joined + " " + next_text
+
+        return joined.strip()
+
     def transcribe(self, audio: np.ndarray, sample_rate: int = 16000) -> str:
-        """Transcribe audio to text.
+        """Transcribe audio to text with chunking for long recordings.
+
+        Audio longer than 60 seconds is split into overlapping chunks, transcribed
+        independently, then joined with deduplication at boundaries.
 
         Args:
             audio: Audio samples as numpy array (mono, 16kHz expected)
             sample_rate: Sample rate (should be 16000 for Whisper)
 
         Returns:
-            Transcribed text or empty string on error.
+            Transcribed text or empty string on error/timeout.
         """
         if not self.load_model():
             return ""
+
         try:
             if audio.dtype != np.float32:
                 audio = audio.astype(np.float32)
 
-            # translate=False keeps original language (no English translation)
-            # language="auto" enables automatic language detection
-            segments = self._model.transcribe(audio, translate=False, language="auto")
-            text = " ".join(s.text.strip() for s in segments)
-            return text.strip()
+            # Split into chunks for long recordings
+            chunks = self._chunk_audio(audio, sample_rate)
+
+            if len(chunks) == 1:
+                # Single chunk - use existing timeout logic
+                return self._transcribe_with_timeout(chunks[0])
+
+            # Multiple chunks - transcribe each and join
+            duration_seconds = len(audio) // sample_rate
+            self._logger.info("Transcribing %d chunks (%d seconds total)",
+                              len(chunks), duration_seconds)
+
+            results = []
+            for i, chunk in enumerate(chunks):
+                self._logger.debug("Transcribing chunk %d/%d", i + 1, len(chunks))
+                text = self._transcribe_with_timeout(chunk)
+                if text:
+                    results.append(text)
+
+            return self._join_chunks(results)
 
         except Exception:
             self._logger.exception("Whisper transcription failed")

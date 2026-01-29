@@ -7,7 +7,6 @@ import os
 import subprocess
 import sys
 import time
-import webbrowser
 from pathlib import Path
 from typing import Optional
 
@@ -20,47 +19,6 @@ from cld.daemon_service import STTDaemon
 
 # Windows mutex name for single instance
 MUTEX_NAME = "CLD_SingleInstance_Mutex"
-
-# VC++ Redistributable download URL
-VCREDIST_URL = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
-
-
-def check_vcruntime() -> bool:
-    """Check if Visual C++ Runtime is installed.
-
-    Returns:
-        True if installed, False otherwise.
-    """
-    system32 = Path(os.environ.get("SYSTEMROOT", "C:\\Windows")) / "System32"
-    required_dlls = ["msvcp140.dll", "vcruntime140.dll"]
-
-    for dll in required_dlls:
-        if not (system32 / dll).exists():
-            return False
-    return True
-
-
-def show_vcruntime_error() -> None:
-    """Show error dialog and open download page for VC++ Runtime."""
-    import tkinter as tk
-    from tkinter import messagebox
-
-    root = tk.Tk()
-    root.withdraw()
-
-    messagebox.showerror(
-        "Visual C++ Runtime Required",
-        "CLD requires Microsoft Visual C++ Redistributable to run.\n\n"
-        "Click OK to open the download page.\n"
-        "After installing, restart CLD.",
-        type=messagebox.OK
-    )
-
-    root.destroy()
-
-    # Open download page
-    webbrowser.open(VCREDIST_URL)
-    sys.exit(1)
 
 # Global mutex handle (kept alive while running)
 _mutex_handle = None
@@ -393,11 +351,6 @@ def setup_logging(level: str) -> None:
 
 def main(argv: Optional[list[str]] = None) -> int:
     """Main entry point for the daemon."""
-    # Check VC++ runtime before anything else
-    if not check_vcruntime():
-        show_vcruntime_error()
-        return 1
-
     default_log_level = os.environ.get("CLD_LOG_LEVEL", "INFO")
     parser = argparse.ArgumentParser(description="CLD daemon")
     parser.add_argument(
