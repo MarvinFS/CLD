@@ -11,7 +11,7 @@ CLD is a Windows GUI speech-to-text application forked from claude-stt. Features
 - Local transcription via pywhispercpp with multilingual support
 - Configurable activation key with scancode detection
 - Privacy: All processing is local, audio never sent to cloud
-- CPU-only inference using GGML models
+- GPU acceleration via CUDA (RTX 4090 tested) or CPU fallback using GGML models
 
 ## Commands
 
@@ -90,6 +90,29 @@ CRITICAL: Python version must match between venv and PyInstaller. The pyd file i
 
 Runtime hook `pyi_rth_pywhispercpp.py` adds DLL search directories so the native extension can find whisper.dll at runtime
 
+## GPU/CUDA Support
+
+pywhispercpp can be built with CUDA support for GPU acceleration. See `docs/audio-gpu-implementation-plan.md` for full details.
+
+Build requirements:
+- CUDA Toolkit 13.x installed
+- Visual Studio 2022 Build Tools
+- Python 3.12 (must exclude Python 3.14 from PATH during build)
+
+Build script location: `D:\TMP\build_cuda_py312.bat`
+
+Key build insights:
+- Use 8.3 short paths (PROGRA~1\NVIDIA~2) to avoid space issues in CMAKE_ARGS
+- Add `-DPython_FIND_REGISTRY=NEVER` to prevent cmake finding wrong Python
+- CUDA DLLs are in `bin/x64/` not `bin/` - add both to PATH for delvewheel
+- Use pip directly (not uv) to avoid temp directory issues with cmake cache
+
+CUDA detection (pywhispercpp uses GPU automatically when available):
+```python
+import _pywhispercpp as pw
+has_cuda = "CUDA" in pw.whisper_print_system_info()
+```
+
 ## Architecture
 
 Daemon-based design: A background process (STTDaemon) runs continuously, listening for hotkey events and coordinating audio capture, transcription, and text output.
@@ -113,7 +136,7 @@ Daemon-based design: A background process (STTDaemon) runs continuously, listeni
 - `settings_popup.py` - Quick settings popup from overlay gear button
 - `settings_dialog.py` - Full settings dialog from tray menu
 - `key_scanner.py` - Activation key capture using keyboard library
-- `hardware.py` - CPU detection for model recommendations
+- `hardware.py` - CPU/GPU detection for model recommendations and CUDA support
 - `model_dialog.py` - Model download/setup dialog shown when model is missing
 
 ### Configuration

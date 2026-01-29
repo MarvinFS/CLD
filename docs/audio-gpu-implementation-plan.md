@@ -200,11 +200,47 @@ Values:
 | Real audio visualization | Complete, working |
 | GPU detection (nvidia-smi) | Complete, working |
 | pywhispercpp CUDA check | Complete, working |
-| GPU inference | Blocked - requires CUDA Toolkit installation |
+| GPU inference | Complete, working (2026-01-29) |
 
-## Next Steps
+## Completed Steps (2026-01-29)
 
-1. Install CUDA Toolkit 12.x or 13.x
-2. Rebuild pywhispercpp with CUDA support
-3. Verify GPU acceleration with nvidia-smi monitoring
-4. Benchmark transcription speed (expect 3-5x improvement)
+1. Installed CUDA Toolkit 13.1
+2. Rebuilt pywhispercpp with CUDA support (arch 89 for RTX 4090)
+3. Verified GPU acceleration - model loads in 0.6s vs ~2-3s on CPU
+4. Updated hardware.py and whisper.py CUDA detection to use whisper_print_system_info()
+
+## Build Notes
+
+Key challenges and solutions for building pywhispercpp with CUDA on Windows:
+
+1. PATH must exclude Python 3.14 (cmake/pybind11 picks up from registry)
+2. Use 8.3 short paths (PROGRA~1\NVIDIA~2) to avoid space issues in CMAKE_ARGS
+3. Add `-DPython_FIND_REGISTRY=NEVER` to prevent cmake finding wrong Python
+4. CUDA DLLs are in `bin/x64/` not `bin/` - add both to PATH for delvewheel
+5. Use pip directly (not uv) to avoid temp directory issues with cmake cache
+
+Final build command:
+```batch
+set PATH=%VENV%\Scripts;%CUDA%\bin\x64;%CUDA%\bin;C:\Program Files\Python312;...
+set CMAKE_ARGS=-DGGML_CUDA=1 -DCMAKE_CUDA_ARCHITECTURES=89 -DCUDAToolkit_ROOT=%CUDA% -DPython_FIND_REGISTRY=NEVER
+python -m pip install --no-cache-dir . --force-reinstall
+```
+
+## CUDA Detection
+
+pywhispercpp CUDA builds automatically use GPU when available (no `use_gpu` parameter).
+Detection is done via:
+```python
+import _pywhispercpp as pw
+has_cuda = "CUDA" in pw.whisper_print_system_info()
+```
+
+## Verification
+
+Run `uv run python -m cld.daemon run --overlay --debug` and check for:
+```
+whisper_init_with_params_no_state: use gpu    = 1
+ggml_cuda_init: found 1 CUDA devices:
+  Device 0: NVIDIA GeForce RTX 4090, compute capability 8.9
+whisper_backend_init_gpu: using CUDA0 backend
+```

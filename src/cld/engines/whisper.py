@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
 import os
 import threading
@@ -19,9 +18,13 @@ _cuda_supported = False
 try:
     from pywhispercpp.model import Model as _Model
     _whisper_available = True
-    # Check if Model accepts use_gpu parameter (CUDA build)
-    sig = inspect.signature(_Model.__init__)
-    _cuda_supported = "use_gpu" in sig.parameters
+    # Check if CUDA backend is available via system info
+    # CUDA builds use GPU automatically - no use_gpu parameter needed
+    try:
+        import _pywhispercpp as _pw
+        _cuda_supported = "CUDA" in _pw.whisper_print_system_info()
+    except Exception:
+        _cuda_supported = False
 except Exception as e:
     _import_error = f"{type(e).__name__}: {e}"
 
@@ -115,12 +118,9 @@ class WhisperEngine:
                 return False
 
             try:
-                # Build kwargs based on what pywhispercpp supports
-                kwargs = {"n_threads": self.n_threads}
-                if _cuda_supported and self.use_gpu:
-                    kwargs["use_gpu"] = True
-
-                self._model = _Model(str(model_path), **kwargs)
+                # CUDA is used automatically when available - no explicit flag needed
+                # pywhispercpp will use ggml-cuda backend if built with CUDA support
+                self._model = _Model(str(model_path))
                 self._last_error = None
 
                 device_str = "GPU" if (self.use_gpu and _cuda_supported) else "CPU"

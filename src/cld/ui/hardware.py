@@ -67,14 +67,16 @@ def _detect_nvidia_gpu() -> tuple[bool, Optional[str], Optional[float]]:
 
 
 def _check_pywhispercpp_cuda() -> bool:
-    """Check if pywhispercpp was built with CUDA support."""
+    """Check if pywhispercpp was built with CUDA support.
+
+    CUDA builds include ggml-cuda backend which is used automatically.
+    Detection via whisper_print_system_info() which shows "CUDA" if available.
+    """
     try:
-        from pywhispercpp.model import Model
-        # Try to detect CUDA support by checking model parameters
-        # pywhispercpp built with GGML_CUDA=1 accepts use_gpu parameter
-        import inspect
-        sig = inspect.signature(Model.__init__)
-        return "use_gpu" in sig.parameters
+        import _pywhispercpp as pw
+        info = pw.whisper_print_system_info()
+        # System info contains "CUDA" if built with CUDA support
+        return "CUDA" in info
     except Exception:
         pass
     return False
