@@ -1,0 +1,139 @@
+name: Wheels
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+     - release
+  release:
+    types:
+      - published
+
+jobs:
+  build_sdist:
+    name: Build SDist
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+
+    - name: Build SDist
+      run: pipx run build --sdist
+
+    - name: Check metadata
+      run: pipx run twine check dist/*
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: artifact-sdist
+        path: dist/*.tar.gz
+
+
+  build_wheels:
+    name: Wheels on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, ubuntu-latest, windows-2022, macos-14]
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+
+    # Used to host cibuildwheel
+    - uses: actions/setup-python@v5
+
+    - name: Install cibuildwheel
+      run: python -m pip install cibuildwheel
+
+    - name: Build wheels
+      run: python -m cibuildwheel --output-dir wheelhouse
+      env:
+        CIBW_ARCHS: auto
+         # for windows setup.py repairwheel step should solve it
+        CIBW_SKIP: pp* cp38-*
+        # Whisper.cpp tries to use BMI2 on 32 bit Windows, so disable BMI2 when building on Windows to avoid that bug. See https://github.com/ggml-org/whisper.cpp/pull/3543
+        CIBW_ENVIRONMENT: CMAKE_ARGS="${{ contains(matrix.os, 'arm') && '-DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8-a' || ''}} ${{ contains(matrix.os, 'windows') && '-DGGML_BMI2=OFF' || '' }}"
+
+    - name: Verify clean directory
+      run: git diff --exit-code
+      shell: bash
+
+    - name: List files
+      run: ls wheelhouse
+
+    - name: Upload wheels
+      uses: actions/upload-artifact@v4
+      with:
+        name: artifact-${{ matrix.os }}
+        path: wheelhouse/*.whl
+
+  test_wheels:
+    name: Test wheels on ${{ matrix.os }} (Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    needs: build_wheels
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2022, macos-latest, ubuntu-24.04-arm]
+        python-version: [3.11, 3.12, 3.13]
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: artifact-*
+        merge-multiple: true
+        path: wheelhouse
+
+    - name: Verify artifact download
+      run: |
+        ls -l wheelhouse
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+        pip install pytest
+
+    - name: Install Wheel
+      run: |
+        pip install --no-index --find-links=./wheelhouse pywhispercpp
+
+    - name: Run tests
+      run: |
+        pytest tests/
+        
+
+  upload_all:
+    name: Upload if release
+    needs: [build_wheels, build_sdist]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release' && github.event.action == 'published'
+
+    steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.x"
+
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: artifact-*
+        merge-multiple: true
+        path: dist
+
+    - uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        verbose: true
+        password: ${{ secrets.PYPI_API_TOKEN }}
