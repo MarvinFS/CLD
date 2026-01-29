@@ -83,3 +83,6 @@ docs/*-options.md
 
 # Public sync folder (for GitHub releases)
 public/
+
+# Temporary backup files
+compiled_backup/
