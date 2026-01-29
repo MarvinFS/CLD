@@ -302,6 +302,15 @@ if gpu_device == -1 and is_gpu_supported():
     gpu_device = 0  # First discrete GPU in Vulkan order
 ```
 
+CRITICAL: Always pass `n_threads` to pywhispercpp Model constructor! Without it, whisper.cpp uses a default thread count instead of the optimized value, causing 2x slower CPU transcription:
+```python
+# BAD - n_threads calculated but not passed
+self._model = _Model(str(model_path), use_gpu=self.use_gpu, gpu_device=self.gpu_device)
+
+# GOOD - n_threads explicitly passed
+self._model = _Model(str(model_path), n_threads=self.n_threads, use_gpu=self.use_gpu, gpu_device=self.gpu_device)
+```
+
 ### Whisper Models (GGML, CPU-only)
 
 CLD uses pywhispercpp for speech recognition with full multilingual support. All models run on CPU using GGML format for efficient inference.

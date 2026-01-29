@@ -1530,6 +1530,21 @@ class SettingsDialog:
 
 Calling `detect_hardware()` on every dropdown change causes UI freeze and duplicate log lines.
 
+### pywhispercpp Thread Count Bug
+
+CRITICAL: Always pass `n_threads` to pywhispercpp Model constructor. Without it, whisper.cpp uses a default thread count, causing 2x slower CPU inference:
+
+```python
+# BAD - n_threads calculated but NOT passed (2x slower!)
+self.n_threads = max(4, os.cpu_count() - 2)  # 14 threads calculated
+self._model = _Model(str(path), use_gpu=False)  # Default ~4 threads used
+
+# GOOD - explicitly pass n_threads (2x faster)
+self._model = _Model(str(path), n_threads=self.n_threads, use_gpu=False)
+```
+
+On an 8-core Ryzen 7800X3D, this fix reduced CPU inference from ~23s to ~11s.
+
 ## Summary Checklist
 
 When building a Windows tray app with tkinter and pystray, verify:

@@ -17,6 +17,7 @@ _import_error = None
 _cuda_supported = False
 _vulkan_supported = False
 _system_info = ""
+_has_gpu_init_params = False  # Whether whisper_init_from_file_with_params exists
 
 try:
     from pywhispercpp.model import Model as _Model
@@ -36,6 +37,8 @@ try:
             if spec and spec.origin:
                 vulkan_dll = Path(spec.origin).parent / "ggml-vulkan.dll"
                 _vulkan_supported = vulkan_dll.exists()
+        # Check if GPU device selection function exists (custom build)
+        _has_gpu_init_params = hasattr(_pw, 'whisper_init_from_file_with_params')
     except Exception:
         pass
 except Exception as e:
@@ -83,6 +86,16 @@ def get_system_info() -> str:
     return _system_info
 
 
+def has_gpu_device_selection() -> bool:
+    """Check if pywhispercpp supports GPU device selection.
+
+    Returns True if whisper_init_from_file_with_params function exists,
+    which is required for use_gpu and gpu_device parameters to work.
+    Standard pywhispercpp silently falls back to CPU if this is missing.
+    """
+    return _has_gpu_init_params
+
+
 # Audio chunking constants for long recordings
 CHUNK_DURATION_SECONDS = 60  # Transcribe in 60-second chunks
 CHUNK_OVERLAP_SECONDS = 5    # 5-second overlap to preserve context at boundaries
@@ -112,8 +125,11 @@ class WhisperEngine:
         transcription_timeout: int = 120,
     ):
         self.model_name = model_name
-        self.n_threads = n_threads or max(4, (os.cpu_count() or 8) - 2)
+        # Use all cores except core 0 (leaves core 0 for system responsiveness)
+        cpu_count = os.cpu_count() or 8
+        self.n_threads = n_threads or max(4, cpu_count - 2)
         self.gpu_device = gpu_device
+        self._cpu_count = cpu_count
         self.transcription_timeout = transcription_timeout
         self._model: Optional[object] = None
         self._model_lock = threading.Lock()
@@ -131,9 +147,18 @@ class WhisperEngine:
         else:
             self.use_gpu = use_gpu
 
+        # Warn if GPU requested but device selection not available
+        if self.use_gpu and not has_gpu_device_selection():
+            self._logger.warning(
+                "GPU requested but whisper_init_from_file_with_params not found. "
+                "GPU device selection (use_gpu/gpu_device params) will be ignored. "
+                "Rebuild pywhispercpp with GPU support to enable this feature."
+            )
+
         backend = get_gpu_backend() or "CPU"
         self._logger.info("WhisperEngine: model=%s, threads=%d, backend=%s (use_gpu=%s, gpu_device=%d)",
                          model_name, self.n_threads, backend, self.use_gpu, self.gpu_device)
+        self._logger.info("System info: %s", _system_info if _system_info else "(not available)")
 
     def is_available(self) -> bool:
         return _whisper_available
@@ -141,6 +166,34 @@ class WhisperEngine:
     def get_last_error(self) -> Optional[str]:
         """Get the last error message."""
         return self._last_error
+
+    def _set_cpu_affinity_exclude_core0(self) -> None:
+        """Set CPU affinity to all cores except core 0 for system responsiveness.
+
+        On systems with SMT/HyperThreading, core 0 has logical processors 0 and 1.
+        We exclude both to leave the first physical core free.
+        """
+        try:
+            import psutil
+            process = psutil.Process()
+            # Get all available CPUs
+            all_cpus = list(range(self._cpu_count))
+            # Exclude logical processors 0 and 1 (physical core 0 on SMT systems)
+            # On non-SMT systems, just exclude CPU 0
+            if self._cpu_count > 4:
+                # SMT system: exclude CPUs 0 and 1 (first physical core)
+                allowed_cpus = [cpu for cpu in all_cpus if cpu >= 2]
+            else:
+                # Small system: just exclude CPU 0
+                allowed_cpus = [cpu for cpu in all_cpus if cpu >= 1]
+
+            if allowed_cpus:
+                process.cpu_affinity(allowed_cpus)
+                self._logger.debug("CPU affinity set to cores: %s (excluded core 0)", allowed_cpus)
+        except ImportError:
+            self._logger.debug("psutil not available, skipping CPU affinity")
+        except Exception as e:
+            self._logger.debug("Failed to set CPU affinity: %s", e)
 
     def _get_model_path(self) -> Path:
         """Get path to GGML model file."""
@@ -178,18 +231,36 @@ class WhisperEngine:
                 # gpu_device: -1 = auto, 0 = first GPU (usually discrete), 1 = second GPU
                 self._model = _Model(
                     str(model_path),
+                    n_threads=self.n_threads,
                     use_gpu=self.use_gpu,
                     gpu_device=self.gpu_device,
                 )
                 self._last_error = None
 
-                backend = get_gpu_backend()
-                if self.use_gpu and backend:
-                    device_str = f"GPU ({backend}, device={self.gpu_device})"
+                # Verify actual backend from system_info (not just config)
+                backend_in_system_info = get_gpu_backend()
+                has_device_selection = has_gpu_device_selection()
+
+                if self.use_gpu:
+                    if backend_in_system_info and has_device_selection:
+                        device_str = f"GPU ({backend_in_system_info}, device={self.gpu_device})"
+                    elif backend_in_system_info:
+                        # GPU backend available but no device selection
+                        device_str = f"GPU ({backend_in_system_info}, auto-selected - device param ignored)"
+                    else:
+                        # Requested GPU but system_info shows no GPU backend
+                        device_str = "CPU (GPU requested but not detected in system_info)"
+                        self._logger.warning(
+                            "use_gpu=True but no GPU backend in system_info. "
+                            "Actual inference will use CPU. System info: %s",
+                            _system_info
+                        )
                 else:
                     device_str = "CPU"
+
                 self._logger.info(
-                    f"Loaded {self.model_name} model on {device_str} with {self.n_threads} threads"
+                    "Loaded %s model on %s with %d threads",
+                    self.model_name, device_str, self.n_threads
                 )
                 return True
 
@@ -344,6 +415,11 @@ class WhisperEngine:
         """
         if not self.load_model():
             return ""
+
+        # Set CPU affinity to exclude core 0 for system responsiveness
+        # Only relevant for CPU mode - GPU inference doesn't benefit from this
+        if not self.use_gpu:
+            self._set_cpu_affinity_exclude_core0()
 
         try:
             if audio.dtype != np.float32:
