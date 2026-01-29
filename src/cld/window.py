@@ -7,8 +7,9 @@ from typing import Optional
 
 _logger = logging.getLogger(__name__)
 
-# Desktop window class names that don't accept text input
-_DESKTOP_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd"}
+# Window class names that should be excluded from capture
+# (desktop/shell windows that can't accept text, or our own overlay)
+_EXCLUDED_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "TkTopLevel"}
 
 
 @dataclass
@@ -33,11 +34,11 @@ def _get_window_class(hwnd: int) -> Optional[str]:
     return None
 
 
-def _is_desktop_window(hwnd: int) -> bool:
-    """Check if the window is the desktop or shell (can't accept text)."""
+def _is_excluded_window(hwnd: int) -> bool:
+    """Check if the window should be excluded from capture."""
     class_name = _get_window_class(hwnd)
-    if class_name in _DESKTOP_CLASSES:
-        _logger.debug("Window class '%s' is a desktop/shell window", class_name)
+    if class_name in _EXCLUDED_CLASSES:
+        _logger.debug("Window class '%s' is excluded from capture", class_name)
         return True
     return False
 
@@ -52,9 +53,9 @@ def get_active_window() -> Optional[WindowInfo]:
         user32 = ctypes.windll.user32
         hwnd = user32.GetForegroundWindow()
         if hwnd:
-            # Don't capture desktop or shell windows - they can't receive text
-            if _is_desktop_window(hwnd):
-                _logger.debug("Desktop/shell is active, returning None")
+            # Don't capture excluded windows (desktop, shell, or our overlay)
+            if _is_excluded_window(hwnd):
+                _logger.debug("Excluded window active, returning None")
                 return None
             return WindowInfo(window_id=str(hwnd))
     except Exception:

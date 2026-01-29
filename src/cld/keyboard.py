@@ -192,8 +192,15 @@ def _output_via_injection(
             _logger.warning("Focus restore failed; falling back to clipboard")
             return _output_via_clipboard(text, config)
 
-        # Type the text
         kb = get_keyboard()
+
+        # Dismiss any menus that may have opened due to Alt key release
+        # (Alt Gr releases as Ctrl+Alt, which can activate menu bars in some apps)
+        kb.press(Key.esc)
+        kb.release(Key.esc)
+        time.sleep(0.05)
+
+        # Type the text
         kb.type(text)
 
         if config.sound_effects:
