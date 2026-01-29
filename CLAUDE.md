@@ -150,19 +150,28 @@ Note: The `api-ms-win-crt-*.dll` files in the output are Windows Universal C Run
 
 pywhispercpp has native C++ extensions that must be bundled:
 - `_pywhispercpp.cp312-win_amd64.pyd` - Python extension module
-- `whisper-*.dll` - whisper.cpp native library
+- `whisper-*.dll`, `ggml-*.dll`, `vulkan-1-*.dll`, etc. - Native libraries (with hash suffixes from delvewheel)
 
-These are in `.venv/Lib/site-packages/` and must be added to the spec file:
+Use the `CLD.spec` file which handles DLL collection via glob patterns:
 ```python
-binaries=[
-    ('.venv/Lib/site-packages/_pywhispercpp.cp312-win_amd64.pyd', '.'),
-    ('.venv/Lib/site-packages/whisper-*.dll', '.'),
-],
+import glob
+site_packages = '.venv/Lib/site-packages'
+pywhispercpp_binaries = []
+for f in glob.glob(f'{site_packages}/_pywhispercpp*.pyd'):
+    pywhispercpp_binaries.append((f, '.'))
+for pattern in ['whisper*.dll', 'ggml*.dll', 'vulkan*.dll', 'msvcp*.dll', 'vcomp*.dll']:
+    for f in glob.glob(f'{site_packages}/{pattern}'):
+        pywhispercpp_binaries.append((f, '.'))
 ```
 
-CRITICAL: Python version must match between venv and PyInstaller. The pyd file is compiled for a specific Python version (e.g., cp312 = Python 3.12). If your venv uses Python 3.12 but system Python is 3.14, the exe will crash silently. Always run `uv run pyinstaller` to use the venv's Python.
+Build with spec file:
+```batch
+.venv\Scripts\python.exe -m PyInstaller -y CLD.spec
+```
 
-Runtime hook `pyi_rth_pywhispercpp.py` adds DLL search directories so the native extension can find whisper.dll at runtime
+CRITICAL: Python version must match between venv and PyInstaller. The pyd file is compiled for a specific Python version (e.g., cp312 = Python 3.12). If your venv uses Python 3.12 but system Python is 3.14, the exe will crash silently.
+
+Runtime hook `pyi_rth_pywhispercpp.py` adds DLL search directories so the native extension can find DLLs at runtime
 
 ## GPU Acceleration
 
@@ -185,13 +194,15 @@ While CUDA may be slightly faster on NVIDIA GPUs, Vulkan provides 80-95% of that
 
 ### Building pywhispercpp with Vulkan
 
+See `docs/build.md` for comprehensive build documentation including prerequisites, troubleshooting, and detailed explanations.
+
 All build files are consolidated in `D:\claudecli-dictate2\`:
 
 | Folder | Contents |
 |--------|----------|
 | `pywhispercpp-src/` | pywhispercpp source code with modified main.cpp for GPU device selection |
-| `build-scripts/` | Build scripts (`build_vulkan_py312.bat`) |
-| `whisper-vulkan-prebuilt/` | Backup pre-built Vulkan DLLs from jerryshell/whisper.cpp-windows-vulkan-bin |
+| `build-scripts/` | Build scripts (`build_vulkan_short_path.bat` recommended) |
+| `compiled_backup/` | Backup of pre-built DLLs (without hash suffixes) |
 | `.venv/` | Python 3.12 venv with Vulkan-enabled pywhispercpp installed |
 
 Build requirements:
@@ -200,33 +211,21 @@ Build requirements:
 - Vulkan SDK (C:\VulkanSDK\1.4.x) - Required for compiling ggml-vulkan.dll with Vulkan shaders
 - GPU drivers with Vulkan support (standard on all modern drivers)
 
-Why Vulkan SDK is needed: The SDK provides the Vulkan headers and libraries needed to compile the ggml-vulkan.dll (55MB) which contains the GPU compute shaders. Without the SDK, you cannot build from source - you would need pre-built binaries.
-
-Build script location: `D:\claudecli-dictate2\build-scripts\build_vulkan_py312.bat`
-
+Build command (from regular Command Prompt):
 ```batch
-@echo off
-REM Build pywhispercpp with Vulkan backend
-REM Run from Developer Command Prompt with Visual Studio Build Tools
-
-set VENV=D:\claudecli-dictate2\.venv
-set PYWHISPERCPP_SRC=D:\claudecli-dictate2\pywhispercpp-src
-set PATH=%VENV%\Scripts;C:\Program Files\Python312;%PATH%
-
-cd /d %PYWHISPERCPP_SRC%
-rmdir /s /q build 2>nul
-
-set CMAKE_ARGS=-DGGML_VULKAN=1 -DPython_FIND_REGISTRY=NEVER
-python -m pip install --no-cache-dir . --force-reinstall
-
-REM Copy Vulkan DLLs to venv
-copy "%PYWHISPERCPP_SRC%\whisper.cpp\*.dll" "%VENV%\Lib\site-packages\"
+cd D:\claudecli-dictate2
+build-scripts\build_vulkan_short_path.bat
 ```
 
-Key files produced by the build:
-- `_pywhispercpp.cp312-win_amd64.pyd` (330KB) - Python extension with GPU device selection
-- `ggml-vulkan.dll` (55MB) - Vulkan compute backend with shaders
-- `whisper.dll`, `ggml.dll`, `ggml-base.dll`, `ggml-cpu.dll` - Core whisper.cpp libraries
+The script uses `subst X:` to create a short path mapping, avoiding Windows MAX_PATH issues with deeply nested Vulkan shader compilation paths.
+
+Key files produced by the build (with delvewheel hash suffixes):
+- `_pywhispercpp.cp312-win_amd64.pyd` (~330KB) - Python extension with GPU device selection
+- `ggml-vulkan-*.dll` (~55MB) - Vulkan compute backend with shaders
+- `whisper-*.dll`, `ggml-*.dll`, `ggml-base-*.dll`, `ggml-cpu-*.dll` - Core whisper.cpp libraries
+- `vulkan-1-*.dll`, `msvcp140-*.dll`, `vcomp140-*.dll` - Runtime dependencies bundled by delvewheel
+
+Note: The build uses `repairwheel` which invokes `delvewheel` on Windows, adding SHA256 hash suffixes to DLL names to prevent DLL conflicts between packages.
 
 The pywhispercpp source at `pywhispercpp-src/` includes a modified `src/main.cpp` that adds `whisper_init_from_file_with_params` function to expose GPU device selection via `use_gpu` and `gpu_device` parameters
 

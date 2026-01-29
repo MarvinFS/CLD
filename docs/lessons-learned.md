@@ -379,6 +379,176 @@ Add checkbox in Settings dialog STT Engine section. Save to config on dialog clo
 
 **CRITICAL**: All code changes must be made in `D:\claudecli-dictate2` ONLY. The OneDrive folder (`D:\OneDrive - NoWay Inc\APPS\claudecli-dictate\`) is a stale copy that causes confusion. Never modify code there.
 
+## pywhispercpp Vulkan Build Infrastructure
+
+### Source Location
+All build files consolidated in `D:\claudecli-dictate2\`:
+- `pywhispercpp-src/` - pywhispercpp source with GPU device selection modifications
+- `build-scripts/build_vulkan_py312.bat` - Main Vulkan build script
+- `build-scripts/patches/` - Documentation of source modifications
+
+### Build Requirements
+- Visual Studio 2022 Build Tools (C++ compiler and CMake)
+- Python 3.12 (CRITICAL: exclude Python 3.14 from PATH - CMake finds wrong Python otherwise)
+- Vulkan SDK (C:\VulkanSDK\1.4.x) - Required for compiling ggml-vulkan.dll with GPU shaders
+- GPU drivers with Vulkan support
+
+### Critical Build Lessons
+
+**Python Version Mismatch**: CMake/pybind11 pick Python from Windows registry. If system has Python 3.14 but venv uses 3.12, build succeeds but runtime crashes silently. Solution:
+```batch
+set PATH=%VENV%\Scripts;C:\Program Files\Python312;%PATH%
+set CMAKE_ARGS=-DGGML_VULKAN=1 -DPython_FIND_REGISTRY=NEVER
+```
+
+**Vulkan SDK is Required for Build**: Cannot build ggml-vulkan.dll without the SDK. CMake error: "Could NOT find Vulkan (missing: Vulkan_LIBRARY Vulkan_INCLUDE_DIR glslc)". The glslc shader compiler only comes from the SDK (~2GB from vulkan.lunarg.com).
+
+**No Vulkan SDK for Runtime**: Once built, the DLLs only need standard GPU drivers with Vulkan support. Users don't need the SDK installed.
+
+**GPU Device Selection Not in Upstream**: Standard pywhispercpp uses `whisper_init_from_file()` which doesn't expose GPU parameters. CLD modifications add `whisper_init_from_file_with_params_wrapper()` in `src/main.cpp` exposing `use_gpu` and `gpu_device`.
+
+### Source Modifications (from upstream pywhispercpp)
+
+**src/main.cpp** - Added after line 80:
+```cpp
+struct whisper_context_wrapper whisper_init_from_file_with_params_wrapper(
+    const char * path_model,
+    bool use_gpu,
+    int gpu_device
+){
+    whisper_context_params params = whisper_context_default_params();
+    params.use_gpu = use_gpu;
+    params.gpu_device = gpu_device;
+    struct whisper_context * ctx = whisper_init_from_file_with_params(path_model, params);
+    struct whisper_context_wrapper ctw_w;
+    ctw_w.ptr = ctx;
+    return ctw_w;
+}
+```
+
+**pywhispercpp/model.py** - Added parameters to `__init__`:
+```python
+def __init__(self, ..., use_gpu: bool = True, gpu_device: int = 0, ...):
+    self.use_gpu = use_gpu
+    self.gpu_device = gpu_device
+```
+
+Modified `_init_model()` to use new function:
+```python
+if hasattr(pw, 'whisper_init_from_file_with_params'):
+    self._ctx = pw.whisper_init_from_file_with_params(
+        self.model_path, self.use_gpu, self.gpu_device
+    )
+else:
+    self._ctx = pw.whisper_init_from_file(self.model_path)
+```
+
+### Build Output Files
+Key files in `.venv/Lib/site-packages/`:
+- `_pywhispercpp.cp312-win_amd64.pyd` (~330KB) - Python extension with GPU params
+- `ggml-vulkan.dll` (~55MB) - Vulkan compute backend with shaders
+- `whisper.dll` (~1.3MB) - Core whisper.cpp library
+- `ggml.dll`, `ggml-base.dll`, `ggml-cpu.dll` - Support libraries
+
+### Known Build Issue: vulkan-shaders-gen Path Length
+
+The Vulkan build may fail with error `C1083: Cannot open compiler generated file: ''` due to Windows path length limits. The nested CMake invocation for vulkan-shaders-gen creates extremely long paths that exceed Windows limits.
+
+Affected path pattern:
+```
+D:\...\build\temp.win-amd64-cpython-312\Release\_pywhispercpp\whisper.cpp\ggml\src\ggml-vulkan\vulkan-shaders-gen-prefix\src\vulkan-shaders-gen-build\CMakeFiles\CMakeScratch\TryCompile-xxxxx\
+```
+
+**Solution**: Use `subst` to create a short drive letter mapping to the source folder:
+```batch
+subst X: D:\claudecli-dictate2\pywhispercpp-src
+cd /d X:\
+python -m pip install --no-cache-dir . --force-reinstall
+subst X: /d  REM Remove mapping when done
+```
+
+The build script `build-scripts/build_vulkan_short_path.bat` automates this process.
+
+### Parallel Compilation
+Set `CMAKE_BUILD_PARALLEL_LEVEL` to use all CPU cores:
+```batch
+set CMAKE_BUILD_PARALLEL_LEVEL=16
+```
+
+### delvewheel and repairwheel
+
+The pywhispercpp build uses `repairwheel` (in pyproject.toml build-system requires) which invokes `delvewheel` on Windows. This is the standard way to create self-contained Python wheels for Windows.
+
+**What delvewheel does:**
+1. Scans the .pyd file for DLL dependencies
+2. Copies required DLLs into the wheel
+3. Adds SHA256 hash suffixes to DLL names to prevent "DLL hell"
+4. Modifies the .pyd import table to reference the mangled names
+
+**Why hash suffixes?**
+If multiple Python packages bundle `ggml.dll`, Windows would load whichever is already in memory, potentially wrong version → crash. The hash makes each DLL unique:
+```
+ggml-vulkan.dll → ggml-vulkan-c394d1f39c32686ec401654749edeaa1.dll
+```
+
+**Bundled runtime DLLs:**
+delvewheel automatically bundles dependencies that may be missing on target systems:
+- `vulkan-1-*.dll` (~1.7 MB) - Vulkan loader (works without SDK installed)
+- `msvcp140-*.dll` (~558 KB) - Visual C++ 2015-2022 runtime
+- `vcomp140-*.dll` (~193 KB) - OpenMP runtime for parallel operations
+
+**Build output comparison:**
+```
+Old build (no repairwheel): 6 files, plain names
+  ggml.dll, ggml-base.dll, ggml-cpu.dll, ggml-vulkan.dll, whisper.dll
+  _pywhispercpp.cp312-win_amd64.pyd
+
+New build (with repairwheel): 9 files, hash suffixes
+  ggml-*.dll, ggml-base-*.dll, ggml-cpu-*.dll, ggml-vulkan-*.dll, whisper-*.dll
+  vulkan-1-*.dll, msvcp140-*.dll, vcomp140-*.dll
+  _pywhispercpp.cp312-win_amd64.pyd
+```
+
+**PyInstaller compatibility:**
+Use glob patterns in CLD.spec to handle both old and new naming:
+```python
+for pattern in ['whisper*.dll', 'ggml*.dll', 'vulkan*.dll', 'msvcp*.dll', 'vcomp*.dll']:
+    for f in glob.glob(f'{site_packages}/{pattern}'):
+        pywhispercpp_binaries.append((f, '.'))
+```
+
+### Why Vulkan Over CUDA
+| Aspect | Vulkan | CUDA |
+|--------|--------|------|
+| GPU Support | NVIDIA, AMD, Intel (all) | NVIDIA only |
+| Distribution Size | ~100-150 MB | ~600 MB per arch |
+| Performance | 80-95% of CUDA | Fastest on NVIDIA |
+| Architecture Builds | Single universal build | One per GPU family |
+
+### Verifying Build Success
+Check system info for Vulkan:
+```python
+import _pywhispercpp as pw
+info = pw.whisper_print_system_info()
+print("Vulkan" in info)  # Should be True
+```
+
+Check GPU device selection:
+```python
+has_gpu_params = hasattr(pw, 'whisper_init_from_file_with_params')
+print(f"GPU device selection: {has_gpu_params}")
+```
+
+### n_threads Bug
+CRITICAL: Always pass `n_threads` to Model constructor! Without it, whisper.cpp uses default thread count causing 2x slower CPU transcription:
+```python
+# BAD - n_threads not passed
+self._model = Model(str(model_path), use_gpu=self.use_gpu)
+
+# GOOD - n_threads explicitly passed
+self._model = Model(str(model_path), n_threads=self.n_threads, use_gpu=self.use_gpu)
+```
+
 ## Testing Checklist
 
 1. Fresh install - model download dialog appears
