@@ -20,30 +20,43 @@ def _early_version_check():
     """Check for --version flag early and print version before imports.
 
     In PyInstaller windowed mode, there's no console to print to.
-    Allocate a console, print version, wait for keypress, then exit.
+    Try to attach to parent console first (PowerShell/cmd), then allocate
+    a new console as fallback (GUI launch). Only wait for keypress if we
+    allocated a new console.
     """
     if "--version" in sys.argv or "-V" in sys.argv:
+        attached = False
         if getattr(sys, 'frozen', False) and sys.platform == 'win32':
             try:
                 import ctypes
                 kernel32 = ctypes.windll.kernel32
-                # Allocate console for windowed exe
-                kernel32.AllocConsole()
-                # Redirect stdout/stderr to the new console
+
+                # Try to attach to parent console (PowerShell/cmd) first
+                ATTACH_PARENT_PROCESS = -1
+                attached = bool(kernel32.AttachConsole(ATTACH_PARENT_PROCESS))
+
+                if not attached:
+                    # No parent console (GUI launch) - create new one
+                    kernel32.AllocConsole()
+
+                # Redirect stdout/stderr to the console
                 sys.stdout = open('CONOUT$', 'w', encoding='utf-8')
                 sys.stderr = open('CONOUT$', 'w', encoding='utf-8')
             except Exception:
                 pass
+
         # Import version here to avoid circular imports
         from cld import __version__
         print(f"CLD version {__version__}")
-        # In frozen exe, wait for keypress so user can see output
+
+        # Only wait for keypress if we allocated new console (not attached to parent)
         if getattr(sys, 'frozen', False) and sys.platform == 'win32':
-            print("\nPress Enter to exit...")
-            try:
-                input()
-            except Exception:
-                pass
+            if not attached:
+                print("\nPress Enter to exit...")
+                try:
+                    input()
+                except Exception:
+                    pass
         sys.exit(0)
 
 

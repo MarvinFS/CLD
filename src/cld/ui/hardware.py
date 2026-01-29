@@ -90,12 +90,77 @@ def _detect_gpu_wmi() -> tuple[bool, Optional[str]]:
 
 
 def enumerate_gpus() -> List[GPUDeviceInfo]:
-    """Enumerate all GPUs via Windows WMI.
+    """Enumerate GPUs as seen by whisper.cpp's Vulkan backend.
+
+    IMPORTANT: Uses Vulkan enumeration, not Windows WMI, because whisper.cpp
+    uses Vulkan device indices. WMI may include virtual GPUs (like Parsec)
+    that Vulkan doesn't see, causing index mismatches.
 
     Returns:
-        List of GPUDeviceInfo for each detected GPU.
+        List of GPUDeviceInfo matching whisper.cpp's Vulkan device order.
     """
     devices = []
+
+    # Try to get Vulkan device list from pywhispercpp by capturing C-level output
+    try:
+        import _pywhispercpp as pw
+        import os
+        import sys
+        import tempfile
+        import re
+
+        # Capture C-level stderr by redirecting file descriptor
+        # This is necessary because whisper.cpp prints directly to stderr
+        old_stderr_fd = os.dup(2)
+        with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.txt') as tmp:
+            tmp_path = tmp.name
+
+        # Redirect stderr to temp file
+        with open(tmp_path, 'w') as tmp_file:
+            os.dup2(tmp_file.fileno(), 2)
+
+            # Trigger device enumeration by getting system info
+            _ = pw.whisper_print_system_info()
+
+            # Flush stderr
+            sys.stderr.flush() if sys.stderr else None
+
+        # Restore stderr
+        os.dup2(old_stderr_fd, 2)
+        os.close(old_stderr_fd)
+
+        # Read captured output
+        with open(tmp_path, 'r') as f:
+            output = f.read()
+
+        # Clean up temp file
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+        # Parse "ggml_vulkan: X = GPU_NAME (vendor)" lines
+        pattern = r'ggml_vulkan:\s*(\d+)\s*=\s*([^|]+)'
+        for match in re.finditer(pattern, output):
+            index = int(match.group(1))
+            # Extract just the GPU name (before the parenthetical vendor info)
+            name_full = match.group(2).strip()
+            # Clean up: "NVIDIA GeForce RTX 4090 (NVIDIA)" -> "RTX 4090"
+            name = name_full.split('(')[0].strip()
+            # Simplify common prefixes
+            name = name.replace("NVIDIA GeForce ", "").replace("AMD ", "")
+            devices.append(GPUDeviceInfo(index=index, name=name))
+
+        if devices:
+            logger.debug("Enumerated %d Vulkan GPUs: %s", len(devices),
+                        [(d.index, d.name) for d in devices])
+            return devices
+
+    except Exception as e:
+        logger.debug("Vulkan GPU enumeration failed: %s", e)
+
+    # Fallback to WMI if Vulkan enumeration fails, filtering virtual adapters
+    logger.debug("Falling back to WMI GPU enumeration")
     try:
         creationflags = 0
         if hasattr(subprocess, "CREATE_NO_WINDOW"):
@@ -110,11 +175,30 @@ def enumerate_gpus() -> List[GPUDeviceInfo]:
         )
         if result.returncode == 0 and result.stdout.strip():
             lines = [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
-            index = 0
+            # Collect GPUs in categories matching Vulkan enumeration order:
+            # Vulkan typically enumerates: discrete NVIDIA, discrete AMD, then integrated
+            nvidia_discrete = []
+            amd_discrete = []
+            integrated = []
             for line in lines[1:]:  # Skip header "Name"
                 if line and line != "Name":
-                    devices.append(GPUDeviceInfo(index=index, name=line))
-                    index += 1
+                    lower = line.lower()
+                    # Skip known virtual display adapters
+                    if "parsec" in lower or "virtual" in lower or "microsoft" in lower:
+                        continue
+                    # Categorize to match Vulkan enumeration order
+                    if "radeon graphics" in lower or "uhd graphics" in lower or "iris" in lower:
+                        integrated.append(line)
+                    elif "nvidia" in lower or "geforce" in lower or "rtx" in lower or "gtx" in lower:
+                        nvidia_discrete.append(line)
+                    elif "radeon" in lower or "amd" in lower:
+                        amd_discrete.append(line)
+                    else:
+                        # Unknown - treat as discrete
+                        nvidia_discrete.append(line)
+            # Build device list matching Vulkan order: NVIDIA first, then AMD discrete, then integrated
+            for name in nvidia_discrete + amd_discrete + integrated:
+                devices.append(GPUDeviceInfo(index=len(devices), name=name))
     except FileNotFoundError:
         pass
     except subprocess.TimeoutExpired:
