@@ -110,6 +110,9 @@ class SettingsDialog:
         self._gpu_devices: list[GPUDeviceInfo] = []
         self._restart_label: Optional[tk.Label] = None
         self._original_force_cpu: bool = False
+
+        # Engine section state
+        self._translate_var: Optional[tk.BooleanVar] = None
         self._original_gpu_device: int = -1
         self._hw_info: Optional[object] = None  # Cached hardware info
 
@@ -543,6 +546,32 @@ class SettingsDialog:
         self._model_combo.pack(side=tk.RIGHT)
         self._update_model_options()
 
+        # Translate to English checkbox
+        translate_row = tk.Frame(section, bg=self._surface)
+        translate_row.pack(fill=tk.X, padx=12, pady=8)
+
+        tk.Label(
+            translate_row,
+            text="Translate to English",
+            font=("Segoe UI", 10),
+            fg=self._text,
+            bg=self._surface,
+        ).pack(side=tk.LEFT)
+
+        self._translate_var = tk.BooleanVar(value=self._config.engine.translate_to_english)
+        translate_cb = tk.Checkbutton(
+            translate_row,
+            variable=self._translate_var,
+            bg=self._surface,
+            fg=self._text,
+            activebackground=self._surface,
+            activeforeground=self._text,
+            selectcolor=self._accent,
+            highlightthickness=0,
+            bd=0,
+        )
+        translate_cb.pack(side=tk.RIGHT)
+
         # Hardware info row (shows specs when model selected)
         hw_row = tk.Frame(section, bg=self._surface)
         hw_row.pack(fill=tk.X, padx=12, pady=(0, 8))
@@ -950,6 +979,7 @@ class SettingsDialog:
         # Always use Whisper (multilingual)
         self._config.engine.type = "whisper"
         self._config.engine.whisper_model = self._model_var.get()
+        self._config.engine.translate_to_english = self._translate_var.get() if self._translate_var else False
 
         # Save GPU settings
         if self._force_cpu_var and self._force_cpu_var.get():

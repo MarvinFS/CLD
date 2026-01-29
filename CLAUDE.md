@@ -2,6 +2,18 @@
 
 This file provides guidance to Claude Code when working with code in this repository.
 
+## CRITICAL: Development Location
+
+**ALL CODE CHANGES MUST BE MADE IN `D:\claudecli-dictate2` ONLY.**
+
+DO NOT make any modifications to code in `D:\OneDrive - NoWay Inc\APPS\claudecli-dictate\`. That folder contains a stale copy that syncs to OneDrive and causes confusion. The canonical, working codebase is **ONLY** at `D:\claudecli-dictate2`.
+
+When running from source for testing:
+```bash
+cd D:\claudecli-dictate2
+.venv\Scripts\python.exe -m cld.daemon run --overlay
+```
+
 ## Project Overview
 
 CLD is a Windows GUI speech-to-text application forked from claude-stt. Features:
@@ -295,6 +307,7 @@ Settings stored in JSON format at `%LOCALAPPDATA%\CLD\settings.json`:
 Engine settings:
 - `force_cpu`: Set to `true` to disable GPU acceleration and use CPU only
 - `gpu_device`: GPU index to use (-1 = auto-select, 0/1/2 = specific GPU)
+- `translate_to_english`: Set to `true` to translate non-English speech to English (default: false)
 
 CRITICAL: Passing `gpu_device=-1` directly to pywhispercpp falls back to CPU, not auto-select! The engine_factory.py handles this by mapping -1 to 0 when GPU is available:
 ```python
@@ -373,6 +386,24 @@ The dialog shows:
 Hotkey press -> AudioRecorder.start() -> [user speaks] -> Hotkey release
     -> AudioRecorder.stop() -> Engine.transcribe() -> output_text()
 ```
+
+### Pre-roll Buffer
+
+The recorder uses a 300ms pre-roll buffer to capture audio from just before the hotkey is pressed. This prevents the first syllables from being cut off when users start speaking immediately.
+
+How it works:
+1. `prime()` is called at daemon startup to start continuous audio capture
+2. Audio fills a circular pre-roll buffer (300ms, configurable via `preroll_ms`)
+3. When `start()` is called, the pre-roll buffer contents are copied to the recording
+4. Recording continues until `stop()` is called
+5. Stream keeps running for the next pre-roll (call `shutdown()` to fully stop)
+
+### Clipboard Fallback
+
+When no target window is focused (e.g., desktop is active), text output falls back to clipboard instead of attempting to type into nothing. The keyboard.py logic:
+1. If `window_info is None` → clipboard fallback with log message
+2. If focus restore fails → clipboard fallback
+3. Otherwise → keyboard injection
 
 ### Threading Model
 

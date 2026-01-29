@@ -145,6 +145,12 @@ class STTDaemon:
             return self._recorder.get_current_level()
         return 0.0
 
+    def get_audio_spectrum(self) -> list[float]:
+        """Get current spectrum bands (16 floats, 0.0-1.0) for visualization."""
+        if self._recorder and self._recording:
+            return self._recorder.get_spectrum_bands()
+        return [0.0] * 16
+
     def _update_tray(self, state: str) -> None:
         """Update the tray icon state."""
         if self._tray:
@@ -678,6 +684,12 @@ class STTDaemon:
 
         print("Model loaded. Ready for voice input.", flush=True)
 
+        # Prime the audio recorder for low-latency recording
+        # This starts the pre-roll buffer to capture audio before hotkey press
+        if self._recorder:
+            if not self._recorder.prime():
+                self._logger.warning("Failed to prime audio recorder; may miss first syllables")
+
         # Start hotkey listener
         if not self._hotkey.start():
             self._logger.error("Failed to start hotkey listener")
@@ -707,6 +719,7 @@ class STTDaemon:
                     on_close=self._on_overlay_close,
                     on_settings=self._on_settings_click,
                     get_audio_level=self.get_audio_level,
+                    get_audio_spectrum=self.get_audio_spectrum,
                 )
                 self._overlay.show()
             except Exception as e:
@@ -778,8 +791,10 @@ class STTDaemon:
         self._running = False
         self._stop_event.set()
 
-        if self._recording and self._recorder:
-            self._recorder.stop()
+        if self._recorder:
+            if self._recording:
+                self._recorder.stop()
+            self._recorder.shutdown()  # Fully stop the primed audio stream
 
         if self._hotkey:
             self._hotkey.stop()

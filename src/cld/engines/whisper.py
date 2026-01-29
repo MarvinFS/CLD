@@ -123,6 +123,7 @@ class WhisperEngine:
         use_gpu: Optional[bool] = None,
         gpu_device: int = -1,
         transcription_timeout: int = 120,
+        translate_to_english: bool = False,
     ):
         self.model_name = model_name
         # Use all cores except core 0 (leaves core 0 for system responsiveness)
@@ -131,6 +132,7 @@ class WhisperEngine:
         self.gpu_device = gpu_device
         self._cpu_count = cpu_count
         self.transcription_timeout = transcription_timeout
+        self.translate_to_english = translate_to_english
         self._model: Optional[object] = None
         self._model_lock = threading.Lock()
         self._logger = logging.getLogger(__name__)
@@ -298,7 +300,7 @@ class WhisperEngine:
         Returns:
             Transcribed text.
         """
-        segments = self._model.transcribe(audio, translate=False, language="auto")
+        segments = self._model.transcribe(audio, translate=self.translate_to_english, language="auto")
         text = " ".join(s.text.strip() for s in segments)
         return text.strip()
 

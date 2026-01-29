@@ -266,6 +266,82 @@ def get_level():
         return _current_level
 ```
 
+## Pre-roll Buffer for Audio Recording
+
+### Problem
+When users press the hotkey and immediately start speaking, the first 50-100ms of audio is lost due to:
+- Hotkey detection latency
+- Audio stream initialization time
+- First buffer fill delay
+
+This causes the first 1-2 letters/syllables to be cut off (e.g., "НЕ подожди" → "е подожди").
+
+### Solution
+Implement a pre-roll buffer that continuously captures audio even before recording starts:
+
+```python
+# In RecorderConfig
+preroll_ms: int = 300  # 300ms pre-roll buffer
+
+# In AudioRecorder.__init__
+preroll_chunks = int(preroll_ms * sample_rate / 1000 / blocksize)
+self._preroll_buffer: Deque[np.ndarray] = deque(maxlen=preroll_chunks)
+
+# prime() starts stream early, callback fills pre-roll when not recording
+# start() copies pre-roll buffer to beginning of recording
+# stop() keeps stream running for next pre-roll
+# shutdown() fully stops stream
+```
+
+### Key Methods
+- `prime()` - Call at daemon startup to start pre-roll capture
+- `start()` - Includes pre-roll buffer in recording
+- `stop()` - Returns audio but keeps stream running
+- `shutdown()` - Fully stops stream (call on daemon exit)
+
+## Clipboard Fallback When No Window Focused
+
+### Problem
+When no application window is focused (e.g., desktop active, all windows minimized), text injection fails silently because there's no target window.
+
+### Solution
+In keyboard.py `_output_via_injection()`, check for `window_info is None` BEFORE attempting to type:
+
+```python
+# If no window was captured, fall back to clipboard
+if window_info is None:
+    _logger.info("No target window captured; using clipboard")
+    return _output_via_clipboard(text, config)
+
+# Then check focus restore
+if not restore_focus(window_info):
+    _logger.warning("Focus restore failed; falling back to clipboard")
+    return _output_via_clipboard(text, config)
+
+# Only then type
+kb.type(text)
+```
+
+## Translate to English Setting
+
+### Implementation
+Add `translate_to_english` boolean to EngineConfig, pass through engine_factory to WhisperEngine, use in transcribe():
+
+```python
+# config.py
+translate_to_english: bool = False
+
+# whisper.py
+segments = self._model.transcribe(audio, translate=self.translate_to_english, language="auto")
+```
+
+### UI
+Add checkbox in Settings dialog STT Engine section. Save to config on dialog close.
+
+## Development Location
+
+**CRITICAL**: All code changes must be made in `D:\claudecli-dictate2` ONLY. The OneDrive folder (`D:\OneDrive - NoWay Inc\APPS\claudecli-dictate\`) is a stale copy that causes confusion. Never modify code there.
+
 ## Testing Checklist
 
 1. Fresh install - model download dialog appears
@@ -278,3 +354,6 @@ def get_level():
 8. Config saves correctly with retry on file lock
 9. --version works in windowed exe (console allocated)
 10. Long transcriptions timeout gracefully after 120s
+11. Pre-roll buffer captures first syllables (test by speaking immediately after hotkey)
+12. Clipboard fallback when no window focused (click desktop, record, check clipboard)
+13. Translate to English checkbox works (enable, speak Russian, get English output)

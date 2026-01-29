@@ -32,6 +32,7 @@ class EngineConfig:
     whisper_model: str = "medium-q5_0"  # ~1.5GB, good accuracy
     force_cpu: bool = False  # Force CPU-only mode (ignore GPU)
     gpu_device: int = -1  # -1=auto-select, 0=first GPU, 1=second GPU, etc.
+    translate_to_english: bool = False  # Translate non-English speech to English
 
 
 @dataclass
@@ -279,6 +280,7 @@ class Config:
                 whisper_model=eng.get("whisper_model", config.engine.whisper_model),
                 force_cpu=force_cpu,
                 gpu_device=eng.get("gpu_device", config.engine.gpu_device),
+                translate_to_english=eng.get("translate_to_english", config.engine.translate_to_english),
             )
 
         # Load output settings

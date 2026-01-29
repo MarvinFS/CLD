@@ -182,11 +182,15 @@ def _output_via_injection(
                 return True
             _logger.debug("Claude Code focus failed; falling back to original window")
 
-        # Fallback: restore focus to original window if provided
-        if window_info is not None:
-            if not restore_focus(window_info):
-                _logger.warning("Focus restore failed; falling back to clipboard")
-                return _output_via_clipboard(text, config)
+        # If no window was captured, fall back to clipboard
+        if window_info is None:
+            _logger.info("No target window captured; using clipboard")
+            return _output_via_clipboard(text, config)
+
+        # Restore focus to original window
+        if not restore_focus(window_info):
+            _logger.warning("Focus restore failed; falling back to clipboard")
+            return _output_via_clipboard(text, config)
 
         # Type the text
         kb = get_keyboard()
