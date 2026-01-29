@@ -222,11 +222,11 @@ def _output_via_clipboard(text: str, config: Config) -> bool:
         except ImportError:
             _logger.error("pyperclip not installed; clipboard output unavailable")
             return False
-        if hasattr(pyperclip, "is_available") and not pyperclip.is_available():
-            _logger.error("No clipboard mechanism available")
-            return False
 
+        # Just try to copy - Windows native clipboard should always work
+        # The is_available() check can give false negatives on Windows
         pyperclip.copy(text)
+        _logger.info("Text copied to clipboard (%d chars)", len(text))
 
         if config.sound_effects:
             play_sound("complete")
