@@ -304,8 +304,45 @@ self._preroll_buffer: Deque[np.ndarray] = deque(maxlen=preroll_chunks)
 ### Problem
 When no application window is focused (e.g., desktop active, all windows minimized), text injection fails silently because there's no target window.
 
-### Solution
-In keyboard.py `_output_via_injection()`, check for `window_info is None` BEFORE attempting to type:
+### Root Cause
+Windows `GetForegroundWindow()` returns a valid handle even for the desktop (Progman, WorkerW, Shell_TrayWnd). These windows exist and can receive focus, but they don't accept text input. So `window_info` was not None, but typing went nowhere.
+
+### Solution - Part 1: Desktop Detection (window.py)
+Detect desktop/shell windows and return None so clipboard fallback triggers:
+
+```python
+_DESKTOP_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd"}
+
+def _get_window_class(hwnd: int) -> Optional[str]:
+    buffer = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, buffer, 256)
+    return buffer.value
+
+def _is_desktop_window(hwnd: int) -> bool:
+    return _get_window_class(hwnd) in _DESKTOP_CLASSES
+
+def get_active_window() -> Optional[WindowInfo]:
+    hwnd = user32.GetForegroundWindow()
+    if hwnd:
+        if _is_desktop_window(hwnd):
+            return None  # Triggers clipboard fallback
+        return WindowInfo(window_id=str(hwnd))
+```
+
+### Solution - Part 2: Clipboard Check Fix (keyboard.py)
+The `pyperclip.is_available()` check gives false negatives on Windows. Remove it:
+
+```python
+# BAD - gives false negatives on Windows
+if hasattr(pyperclip, "is_available") and not pyperclip.is_available():
+    return False  # This incorrectly fails on Windows!
+
+# GOOD - just try to copy, let exception handler catch real failures
+pyperclip.copy(text)
+```
+
+### Solution - Part 3: Explicit None Check (keyboard.py)
+In `_output_via_injection()`, check for `window_info is None` BEFORE attempting to type:
 
 ```python
 # If no window was captured, fall back to clipboard
