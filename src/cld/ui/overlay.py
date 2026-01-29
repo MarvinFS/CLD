@@ -68,6 +68,7 @@ class STTOverlay:
         on_close: Optional[Callable] = None,
         on_settings: Optional[Callable] = None,
         get_audio_level: Optional[Callable[[], float]] = None,
+        get_audio_spectrum: Optional[Callable[[], list[float]]] = None,
     ):
         """Initialize the overlay.
 
@@ -75,10 +76,12 @@ class STTOverlay:
             on_close: Callback when overlay is closed.
             on_settings: Callback when gear button is clicked.
             get_audio_level: Callback to get current audio level (0.0-1.0).
+            get_audio_spectrum: Callback to get 16-band spectrum (list of 0.0-1.0).
         """
         self.on_close = on_close
         self.on_settings = on_settings
         self._get_audio_level = get_audio_level
+        self._get_audio_spectrum = get_audio_spectrum
 
         self._root: Optional[tk.Tk] = None
         self._canvas: Optional[tk.Canvas] = None
@@ -98,7 +101,7 @@ class STTOverlay:
         self._animation_id: Optional[str] = None
         self._running = False
         self._record_start_time: float = 0
-        self._audio_levels: list[float] = [0.3] * 12  # 12 bars
+        self._audio_levels: list[float] = [0.3] * 16  # 16 bars
         self._state_queue: queue.Queue = queue.Queue()  # Thread-safe state updates
 
         # Dragging state
@@ -680,33 +683,39 @@ class STTOverlay:
 
         self._canvas.delete("all")
 
-        num_bars = 12
-        bar_width = 8
-        bar_gap = 6
+        num_bars = 16
+        bar_width = 6
+        bar_gap = 4
         total_width = num_bars * bar_width + (num_bars - 1) * bar_gap
         start_x = (270 - total_width) // 2
-        center_y = 15
-        max_height = 12
+        baseline_y = 28  # Bottom of waveform area
+        max_height = 24
 
         for i in range(num_bars):
             if idle:
-                height = 3  # Minimal height when idle
+                height = 2  # Minimal height when idle
                 color = self._bar_color_idle
             else:
-                height = max(3, int(self._audio_levels[i] * max_height))
-                color = (
-                    self._bar_color_recording
-                    if self._state == "recording"
-                    else self._bar_color_active
-                )
+                level = self._audio_levels[i]
+                height = max(2, int(level * max_height))
+                # Gradient color based on level: dim green -> bright green -> yellow-white
+                if self._state == "recording":
+                    # Interpolate from dim green (0x33, 0x99, 0x33) to bright green-yellow
+                    intensity = min(1.0, level * 1.5)  # Boost for visibility
+                    r = int(0x33 + (0xcc - 0x33) * intensity)
+                    g = int(0x99 + (0xff - 0x99) * intensity)
+                    b = int(0x33 + (0x66 - 0x33) * intensity)
+                    color = f"#{r:02x}{g:02x}{b:02x}"
+                else:
+                    color = self._bar_color_active
 
             x = start_x + i * (bar_width + bar_gap)
-            # Draw bar centered vertically
+            # Draw bar expanding upward from baseline
             self._canvas.create_rectangle(
                 x,
-                center_y - height,
+                baseline_y - height,
                 x + bar_width,
-                center_y + height,
+                baseline_y,
                 fill=color,
                 outline="",
             )
@@ -744,25 +753,20 @@ class STTOverlay:
             return
 
         if self._state == "recording":
-            # Get real audio level from microphone
-            level = 0.0
-            if self._get_audio_level:
+            # Get real FFT spectrum bands from microphone
+            spectrum = [0.0] * 16
+            if self._get_audio_spectrum:
                 try:
-                    level = self._get_audio_level()
+                    spectrum = self._get_audio_spectrum()
                 except Exception:
                     pass
 
-            # Update bars with real audio level, adding variation per bar
-            t = time.time()
-            phases = [0, 0.5, 1.2, 0.3, 0.8, 1.5, 0.1, 0.9, 1.3, 0.6, 1.0, 0.4]
-            for i in range(12):
-                # Each bar varies slightly around the main level for visual interest
-                variation = 0.3 * abs(math.sin(t * 3 + phases[i]))
-                bar_level = level * (0.7 + variation)
-                # Smooth transition (exponential moving average)
-                self._audio_levels[i] = 0.3 * bar_level + 0.7 * self._audio_levels[i]
+            # Update bars with real spectrum data - each bar is independent
+            for i in range(16):
+                # Smooth transition: 70% new, 30% old for responsive feel
+                self._audio_levels[i] = 0.7 * spectrum[i] + 0.3 * self._audio_levels[i]
                 # Clamp to valid range
-                self._audio_levels[i] = max(0.1, min(1.0, self._audio_levels[i]))
+                self._audio_levels[i] = max(0.03, min(1.0, self._audio_levels[i]))
 
             self._draw_waveform(idle=False)
             self._update_timer()
@@ -772,7 +776,7 @@ class STTOverlay:
             # Gentle pulsing for transcribing state
             t = time.time() * 1.5
             self._audio_levels = [
-                0.25 + 0.25 * abs(math.sin(t + i * 0.25)) for i in range(12)
+                0.25 + 0.25 * abs(math.sin(t + i * 0.2)) for i in range(16)
             ]
             self._draw_waveform(idle=False)
             self._update_timer()

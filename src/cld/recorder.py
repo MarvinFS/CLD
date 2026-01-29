@@ -2,6 +2,7 @@
 
 import logging
 import math
+import random
 import threading
 from collections import deque
 from dataclasses import dataclass
@@ -9,9 +10,11 @@ from typing import Deque, Optional
 
 import numpy as np
 
-# Thread-safe atomic float for audio level visualization
+# Thread-safe audio level and spectrum for visualization
 _current_level: float = 0.0
 _level_lock = threading.Lock()
+_spectrum_bands: list[float] = [0.0] * 16
+_spectrum_lock = threading.Lock()
 
 _SOUNDDEVICE_IMPORT_ERROR: Exception | None = None
 try:
@@ -117,15 +120,51 @@ class AudioRecorder:
                 self._recorded_chunks = deque()
 
             def callback(indata, frames, time_info, status):
-                global _current_level
+                global _current_level, _spectrum_bands
                 if status:
                     self._logger.debug("Audio callback status: %s", status)
-                # Calculate audio level for visualization (atomic update)
-                rms = np.sqrt(np.mean(indata ** 2))
-                # Normalize: typical speech ~0.01-0.1 RMS, scale to 0-1
-                level = min(1.0, rms * 10)
+
+                audio = indata.flatten()
+
+                # Calculate overall RMS level
+                rms = np.sqrt(np.mean(audio ** 2))
+                level = min(1.0, rms * 80)
                 with _level_lock:
                     _current_level = level
+
+                # Compute FFT spectrum for visualization (16 bands)
+                # Focus on actual voice frequency range: 200-4000 Hz
+                # This is where speech formants and consonants live
+                fft = np.fft.rfft(audio)
+                magnitudes = np.abs(fft)
+
+                n_bins = len(magnitudes)
+                bands = []
+                # Voice-focused frequency range (200 Hz to 4000 Hz)
+                min_freq, max_freq = 200, 4000
+                for i in range(16):
+                    # Log-spaced frequency boundaries within voice range
+                    f_low = min_freq * (max_freq / min_freq) ** (i / 16)
+                    f_high = min_freq * (max_freq / min_freq) ** ((i + 1) / 16)
+                    # Convert to FFT bin indices
+                    bin_low = int(f_low * n_bins * 2 / self.config.sample_rate)
+                    bin_high = int(f_high * n_bins * 2 / self.config.sample_rate)
+                    bin_low = max(0, min(bin_low, n_bins - 1))
+                    bin_high = max(bin_low + 1, min(bin_high, n_bins))
+                    # Average magnitude in this band
+                    band_mag = np.mean(magnitudes[bin_low:bin_high]) if bin_high > bin_low else 0
+                    bands.append(band_mag)
+
+                # Normalize bands - pure FFT, no fake bass
+                max_mag = max(bands) if bands else 1.0
+                if max_mag > 0:
+                    bands = [min(1.0, (b / max_mag) * level * 3.0) for b in bands]
+                else:
+                    bands = [0.0] * 16
+
+                with _spectrum_lock:
+                    _spectrum_bands = bands
+
                 # Store all chunks for transcription (never drops)
                 with self._lock:
                     self._recorded_chunks.append(indata.copy())
@@ -185,6 +224,15 @@ class AudioRecorder:
         """
         with _level_lock:
             return _current_level
+
+    def get_spectrum_bands(self) -> list[float]:
+        """Get current spectrum bands (16 floats, 0.0-1.0) for visualization.
+
+        Thread-safe method to get FFT spectrum divided into 16 logarithmic
+        frequency bands covering voice range (~85Hz to ~8kHz).
+        """
+        with _spectrum_lock:
+            return _spectrum_bands.copy()
 
     def get_volume_level(self, chunk: np.ndarray) -> float:
         """Calculate volume level (0-1) for a chunk.

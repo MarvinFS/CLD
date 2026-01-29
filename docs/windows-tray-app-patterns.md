@@ -1418,6 +1418,61 @@ Benefits:
 2. Frozen exe detection in one place
 3. Easy to update path structure
 
+## Audio Spectrum Visualization
+
+Real-time audio visualization requires careful frequency band selection for voice applications.
+
+### Voice Frequency Focus
+
+Don't visualize the full audio spectrum (20Hz-20kHz). Voice content lives in a narrow range:
+
+| Component | Range | Visual Feedback |
+|-----------|-------|-----------------|
+| Fundamentals | 85-255 Hz | Low bars |
+| Formants | 300-3400 Hz | Middle bars |
+| Consonants | 2000-4000 Hz | High bars |
+
+For 16-bar visualization, focus on 200-4000 Hz:
+
+```python
+min_freq, max_freq = 200, 4000
+for i in range(16):
+    f_low = min_freq * (max_freq / min_freq) ** (i / 16)
+    f_high = min_freq * (max_freq / min_freq) ** ((i + 1) / 16)
+    bin_low = int(f_low * n_bins * 2 / sample_rate)
+    bin_high = int(f_high * n_bins * 2 / sample_rate)
+    band_mag = np.mean(magnitudes[bin_low:bin_high])
+```
+
+### Failed Approach: Fake Bass
+
+Synthesizing bass response from overall volume level produces unnatural results:
+
+```python
+# DON'T DO THIS - bass bars are constantly maxed out
+for i in range(8):
+    noise = random.uniform(0.8, 1.2)
+    bands[i] = level * bass_weight * noise  # Fake, not real FFT
+```
+
+Problems:
+- Left bars maxed out regardless of voice content
+- Random variation looks artificial
+- Right bars don't respond to actual consonants
+
+### Recommended Approach: Pure FFT
+
+Let FFT show real frequency content without artificial enhancement:
+
+```python
+# Normalize to peak magnitude, scale by level
+max_mag = max(bands) if bands else 1.0
+if max_mag > 0:
+    bands = [min(1.0, (b / max_mag) * level * 3.0) for b in bands]
+```
+
+All 16 bars respond naturally to voice content when focused on the voice frequency range.
+
 ## Summary Checklist
 
 When building a Windows tray app with tkinter and pystray, verify:
