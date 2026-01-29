@@ -275,8 +275,20 @@ class STTDaemon:
 
             text = self._engine.transcribe(audio, self.config.sample_rate)
             text = text.strip()
+            self._logger.debug("Raw transcription result: %r", text)
+
+            # Filter out whisper artifacts that aren't real transcription
+            # These are special tokens that whisper outputs for non-speech audio
+            whisper_artifacts = [
+                "[BLANK_AUDIO]", "[MUSIC]", "[APPLAUSE]", "[LAUGHTER]",
+                "(BLANK_AUDIO)", "(MUSIC)", "(APPLAUSE)", "(LAUGHTER)",
+                "[inaudible]", "(inaudible)", "[silence]", "(silence)",
+            ]
+            if text in whisper_artifacts or text.startswith("[") and text.endswith("]"):
+                text = ""  # Treat as no speech detected
 
             if text:
+                self._logger.info("Outputting text: %r to window: %s", text, window_info)
                 if not output_text(text, window_info, self.config):
                     self._logger.warning("Failed to output transcription")
                     self._print_status("✗ Output failed")

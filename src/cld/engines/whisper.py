@@ -28,15 +28,19 @@ try:
         import _pywhispercpp as _pw
         _system_info = _pw.whisper_print_system_info()
         _cuda_supported = "CUDA" in _system_info
-        # Check Vulkan support: either in system_info or DLL exists
+        # Check Vulkan support: system_info or DLL presence
+        # Note: whisper_print_system_info() doesn't report Vulkan even when available,
+        # so we primarily check for the DLL
         _vulkan_supported = "Vulkan" in _system_info
         if not _vulkan_supported:
-            # Also check for ggml-vulkan.dll in site-packages (pre-built binaries)
+            # Check for ggml-vulkan*.dll (with or without hash suffix from delvewheel)
             import importlib.util
             spec = importlib.util.find_spec("_pywhispercpp")
             if spec and spec.origin:
-                vulkan_dll = Path(spec.origin).parent / "ggml-vulkan.dll"
-                _vulkan_supported = vulkan_dll.exists()
+                site_packages = Path(spec.origin).parent
+                # Check both plain name and hash-suffixed name (from delvewheel)
+                vulkan_dlls = list(site_packages.glob("ggml-vulkan*.dll"))
+                _vulkan_supported = len(vulkan_dlls) > 0
         # Check if GPU device selection function exists (custom build)
         _has_gpu_init_params = hasattr(_pw, 'whisper_init_from_file_with_params')
     except Exception:

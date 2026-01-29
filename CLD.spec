@@ -1,10 +1,25 @@
 # -*- mode: python ; coding: utf-8 -*-
+import glob
+import os
 
+# Collect pywhispercpp binaries (delvewheel adds hash suffixes to DLL names)
+site_packages = '.venv/Lib/site-packages'
+pywhispercpp_binaries = []
+
+# Python extension
+pyd_files = glob.glob(f'{site_packages}/_pywhispercpp*.pyd')
+for f in pyd_files:
+    pywhispercpp_binaries.append((f, '.'))
+
+# Core DLLs (whisper, ggml, vulkan)
+for pattern in ['whisper*.dll', 'ggml*.dll', 'vulkan*.dll', 'msvcp*.dll', 'vcomp*.dll']:
+    for f in glob.glob(f'{site_packages}/{pattern}'):
+        pywhispercpp_binaries.append((f, '.'))
 
 a = Analysis(
     ['src\\cld\\cli.py'],
     pathex=[],
-    binaries=[('.venv/Lib/site-packages/_pywhispercpp.cp312-win_amd64.pyd', '.'), ('.venv/Lib/site-packages/whisper.dll', '.'), ('.venv/Lib/site-packages/ggml.dll', '.'), ('.venv/Lib/site-packages/ggml-base.dll', '.'), ('.venv/Lib/site-packages/ggml-cpu.dll', '.'), ('.venv/Lib/site-packages/ggml-vulkan.dll', '.')],
+    binaries=pywhispercpp_binaries,
     datas=[('sounds', 'sounds'), ('cld_icon.png', '.'), ('mic_256.png', '.'), ('C:/Program Files/Python312/tcl/tcl8.6', 'tcl/tcl8.6'), ('C:/Program Files/Python312/tcl/tk8.6', 'tcl/tk8.6'), ('.venv/Lib/site-packages/_sounddevice_data', '_sounddevice_data')],
     hiddenimports=['pywhispercpp', 'pywhispercpp.model'],
     hookspath=[],

@@ -80,3 +80,6 @@ cld_launcher.dist/
 docs/code-review-*.md
 docs/*-options.md
 .claude-scripts/
+
+# Public sync folder (for GitHub releases)
+public/
