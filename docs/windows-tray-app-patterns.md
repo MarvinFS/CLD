@@ -1473,6 +1473,63 @@ if max_mag > 0:
 
 All 16 bars respond naturally to voice content when focused on the voice frequency range.
 
+## GPU Device Selection for Whisper.cpp
+
+When using pywhispercpp with Vulkan backend, GPU device selection has important gotchas.
+
+### Auto-Select Doesn't Work with gpu_device=-1
+
+Passing `gpu_device=-1` to pywhispercpp Model doesn't auto-select the best GPU. Whisper.cpp interprets -1 as "no specific device" which falls back to CPU. Fix: explicitly use `gpu_device=0` for auto-select.
+
+```python
+# BAD: -1 causes CPU fallback
+gpu_device = config.engine.gpu_device  # -1 for "Auto-select"
+engine = WhisperEngine(gpu_device=gpu_device)  # Uses CPU!
+
+# GOOD: Map -1 to 0 when GPU is available
+gpu_device = config.engine.gpu_device
+if gpu_device == -1 and is_gpu_supported():
+    gpu_device = 0  # First discrete GPU in Vulkan order
+engine = WhisperEngine(gpu_device=gpu_device)  # Uses GPU!
+```
+
+### Vulkan vs Windows GPU Order
+
+Windows Task Manager shows GPUs in its own order (often integrated first). Vulkan enumerates discrete GPUs before integrated:
+
+| Windows Task Manager | Vulkan Order |
+|---------------------|--------------|
+| GPU 0: AMD Radeon (integrated) | Device 0: RTX 4090 (discrete) |
+| GPU 1: RTX 4090 (discrete) | Device 1: AMD Radeon (integrated) |
+
+When WMI fallback is used for GPU enumeration, reorder to match Vulkan's expected order: NVIDIA discrete first, then AMD discrete, then integrated.
+
+### Cache Hardware Detection
+
+Hardware detection is slow (WMI queries, Vulkan probing). Cache the result instead of detecting repeatedly:
+
+```python
+class SettingsDialog:
+    def __init__(self):
+        self._hw_info = None  # Cached hardware info
+
+    def _build_engine_section(self, parent):
+        if self._hw_info is None:
+            self._hw_info = detect_hardware()  # Detect once
+        # Use self._hw_info
+
+    def _build_hardware_section(self, parent):
+        # Reuse cached result
+        hw_info = self._hw_info
+
+    def _on_gpu_change(self, event=None):
+        # DON'T call detect_hardware() here - causes UI hang
+        # Use cached self._hw_info instead
+        backend = self._hw_info.gpu_backend if self._hw_info else "CPU"
+```
+
+Calling `detect_hardware()` on every dropdown change causes UI freeze and duplicate log lines.
+
 ## Summary Checklist
 
 When building a Windows tray app with tkinter and pystray, verify:

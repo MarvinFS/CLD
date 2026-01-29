@@ -111,6 +111,7 @@ class SettingsDialog:
         self._restart_label: Optional[tk.Label] = None
         self._original_force_cpu: bool = False
         self._original_gpu_device: int = -1
+        self._hw_info: Optional[object] = None  # Cached hardware info
 
     def show(self):
         """Show the settings dialog."""
@@ -546,10 +547,11 @@ class SettingsDialog:
         hw_row = tk.Frame(section, bg=self._surface)
         hw_row.pack(fill=tk.X, padx=12, pady=(0, 8))
 
-        # Detect hardware once
+        # Detect hardware once and cache
         try:
-            hw_info = detect_hardware()
-            hw_text = f"CPU: {hw_info.cpu_cores} cores | RAM: {hw_info.ram_gb:.1f} GB | Recommended: {hw_info.recommended_model}"
+            if self._hw_info is None:
+                self._hw_info = detect_hardware()
+            hw_text = f"CPU: {self._hw_info.cpu_cores} cores | RAM: {self._hw_info.ram_gb:.1f} GB | Recommended: {self._hw_info.recommended_model}"
         except Exception:
             hw_text = ""
 
@@ -566,8 +568,10 @@ class SettingsDialog:
         """Build the hardware/GPU settings section."""
         section = self._build_section(parent, "Hardware")
 
-        # Detect hardware and GPUs
-        hw_info = detect_hardware()
+        # Use cached hardware info, detect only if not already cached
+        if self._hw_info is None:
+            self._hw_info = detect_hardware()
+        hw_info = self._hw_info
         self._gpu_devices = enumerate_gpus()
 
         # Store originals for restart detection
@@ -729,8 +733,8 @@ class SettingsDialog:
         """Update the backend info label based on current selection."""
         if not hasattr(self, '_backend_info_label') or not self._backend_info_label:
             return
-        hw_info = detect_hardware()
-        backend = hw_info.gpu_backend or "CPU"
+        # Use cached hardware info - don't call detect_hardware() on every dropdown change
+        backend = self._hw_info.gpu_backend if self._hw_info else "CPU"
         self._backend_info_label.config(text=self._get_backend_info_text(backend))
 
     def _check_restart_needed(self):
@@ -753,10 +757,10 @@ class SettingsDialog:
         val = self._gpu_device_var.get()
         if val == "Auto-select":
             return -1
-        # Find index by matching shortened display name
-        for i, dev in enumerate(self._gpu_devices):
+        # Find device by matching shortened display name, return its Vulkan index
+        for dev in self._gpu_devices:
             if self._shorten_gpu_name(dev.name) == val:
-                return i
+                return dev.index  # Use actual Vulkan device index, not list position
         return -1
 
     def _build_output_section(self, parent: tk.Frame):

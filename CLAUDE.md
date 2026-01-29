@@ -294,7 +294,13 @@ Settings stored in JSON format at `%LOCALAPPDATA%\CLD\settings.json`:
 
 Engine settings:
 - `force_cpu`: Set to `true` to disable GPU acceleration and use CPU only
-- `gpu_device`: GPU index to use (-1 = auto-select first discrete GPU, 0/1/2 = specific GPU)
+- `gpu_device`: GPU index to use (-1 = auto-select, 0/1/2 = specific GPU)
+
+CRITICAL: Passing `gpu_device=-1` directly to pywhispercpp falls back to CPU, not auto-select! The engine_factory.py handles this by mapping -1 to 0 when GPU is available:
+```python
+if gpu_device == -1 and is_gpu_supported():
+    gpu_device = 0  # First discrete GPU in Vulkan order
+```
 
 ### Whisper Models (GGML, CPU-only)
 
