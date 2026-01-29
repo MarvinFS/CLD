@@ -14,17 +14,29 @@ _whisper_available = False
 _Model = None
 _import_error = None
 _cuda_supported = False
+_vulkan_supported = False
+_system_info = ""
 
 try:
     from pywhispercpp.model import Model as _Model
     _whisper_available = True
-    # Check if CUDA backend is available via system info
-    # CUDA builds use GPU automatically - no use_gpu parameter needed
+    # Check GPU backends via system info and DLL presence
+    # Vulkan is preferred (universal), CUDA is NVIDIA-only fallback
     try:
         import _pywhispercpp as _pw
-        _cuda_supported = "CUDA" in _pw.whisper_print_system_info()
+        _system_info = _pw.whisper_print_system_info()
+        _cuda_supported = "CUDA" in _system_info
+        # Check Vulkan support: either in system_info or DLL exists
+        _vulkan_supported = "Vulkan" in _system_info
+        if not _vulkan_supported:
+            # Also check for ggml-vulkan.dll in site-packages (pre-built binaries)
+            import importlib.util
+            spec = importlib.util.find_spec("_pywhispercpp")
+            if spec and spec.origin:
+                vulkan_dll = Path(spec.origin).parent / "ggml-vulkan.dll"
+                _vulkan_supported = vulkan_dll.exists()
     except Exception:
-        _cuda_supported = False
+        pass
 except Exception as e:
     _import_error = f"{type(e).__name__}: {e}"
 
@@ -42,11 +54,42 @@ def is_cuda_supported() -> bool:
     return _cuda_supported
 
 
+def is_vulkan_supported() -> bool:
+    """Check if pywhispercpp was built with Vulkan support."""
+    return _vulkan_supported
+
+
+def is_gpu_supported() -> bool:
+    """Check if any GPU backend is available (Vulkan or CUDA)."""
+    return _vulkan_supported or _cuda_supported
+
+
+def get_gpu_backend() -> Optional[str]:
+    """Get the active GPU backend name.
+
+    Returns:
+        "Vulkan" (preferred, universal), "CUDA" (NVIDIA-only), or None if CPU-only.
+    """
+    if _vulkan_supported:
+        return "Vulkan"
+    if _cuda_supported:
+        return "CUDA"
+    return None
+
+
+def get_system_info() -> str:
+    """Get the pywhispercpp system info string."""
+    return _system_info
+
+
 class WhisperEngine:
     """Whisper speech-to-text engine backed by pywhispercpp (whisper.cpp).
 
-    Uses GGML model files. Supports GPU acceleration when pywhispercpp
-    is built with GGML_CUDA=1.
+    Uses GGML model files. Supports GPU acceleration via:
+    - Vulkan backend (universal, ~160MB): Works with NVIDIA, AMD, and Intel GPUs
+    - CUDA backend (NVIDIA-only, ~600MB per architecture family): Slightly faster but vendor-locked
+
+    CLD prefers Vulkan for universal GPU support at ~4x smaller distribution size.
 
     Models (default: medium-q5_0):
         - small: ~488MB, fast, good accuracy
@@ -59,26 +102,30 @@ class WhisperEngine:
         model_name: str = "medium-q5_0",
         n_threads: Optional[int] = None,
         use_gpu: Optional[bool] = None,
+        gpu_device: int = -1,
     ):
         self.model_name = model_name
         self.n_threads = n_threads or max(4, (os.cpu_count() or 8) - 2)
+        self.gpu_device = gpu_device
         self._model: Optional[object] = None
         self._model_lock = threading.Lock()
         self._logger = logging.getLogger(__name__)
         self._last_error: Optional[str] = None
 
         # GPU support: auto-detect or use explicit setting
+        # Vulkan is preferred (universal), CUDA is fallback (NVIDIA-only)
+        gpu_available = is_gpu_supported()
         if use_gpu is None:
-            # Auto: use GPU if pywhispercpp supports it
-            self.use_gpu = _cuda_supported
-        elif use_gpu and not _cuda_supported:
-            self._logger.warning("GPU requested but pywhispercpp lacks CUDA support. Using CPU.")
+            self.use_gpu = gpu_available
+        elif use_gpu and not gpu_available:
+            self._logger.warning("GPU requested but pywhispercpp has no GPU backend. Using CPU.")
             self.use_gpu = False
         else:
             self.use_gpu = use_gpu
 
-        self._logger.info("WhisperEngine: model=%s, threads=%d, use_gpu=%s (cuda_supported=%s)",
-                         model_name, self.n_threads, self.use_gpu, _cuda_supported)
+        backend = get_gpu_backend() or "CPU"
+        self._logger.info("WhisperEngine: model=%s, threads=%d, backend=%s (use_gpu=%s, gpu_device=%d)",
+                         model_name, self.n_threads, backend, self.use_gpu, self.gpu_device)
 
     def is_available(self) -> bool:
         return _whisper_available
@@ -118,12 +165,21 @@ class WhisperEngine:
                 return False
 
             try:
-                # CUDA is used automatically when available - no explicit flag needed
-                # pywhispercpp will use ggml-cuda backend if built with CUDA support
-                self._model = _Model(str(model_path))
+                # GPU backend is used automatically when available
+                # Vulkan: universal (NVIDIA/AMD/Intel), CUDA: NVIDIA-only fallback
+                # gpu_device: -1 = auto, 0 = first GPU (usually discrete), 1 = second GPU
+                self._model = _Model(
+                    str(model_path),
+                    use_gpu=self.use_gpu,
+                    gpu_device=self.gpu_device,
+                )
                 self._last_error = None
 
-                device_str = "GPU" if (self.use_gpu and _cuda_supported) else "CPU"
+                backend = get_gpu_backend()
+                if self.use_gpu and backend:
+                    device_str = f"GPU ({backend}, device={self.gpu_device})"
+                else:
+                    device_str = "CPU"
                 self._logger.info(
                     f"Loaded {self.model_name} model on {device_str} with {self.n_threads} threads"
                 )

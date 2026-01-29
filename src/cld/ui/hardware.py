@@ -13,6 +13,7 @@ class HardwareInfo:
     """Hardware capability information."""
 
     has_cuda: bool = False
+    has_vulkan: bool = False
     gpu_name: Optional[str] = None
     vram_gb: Optional[float] = None
     cpu_cores: int = 1
@@ -21,11 +22,26 @@ class HardwareInfo:
     recommended_model: str = "medium-q5_0"
 
     @property
+    def has_gpu(self) -> bool:
+        """True if any GPU acceleration is available."""
+        return self.has_cuda or self.has_vulkan
+
+    @property
+    def gpu_backend(self) -> Optional[str]:
+        """Return the active GPU backend name, or None if CPU-only."""
+        if self.has_vulkan:
+            return "Vulkan"
+        if self.has_cuda:
+            return "CUDA"
+        return None
+
+    @property
     def summary(self) -> str:
         """Human-readable hardware summary."""
-        if self.has_cuda and self.gpu_name:
+        if self.has_gpu and self.gpu_name:
             vram_str = f", {self.vram_gb:.1f}GB VRAM" if self.vram_gb else ""
-            return f"{self.gpu_name}{vram_str}"
+            backend = f" ({self.gpu_backend})" if self.gpu_backend else ""
+            return f"{self.gpu_name}{vram_str}{backend}"
         return f"CPU ({self.cpu_cores} cores)"
 
 
@@ -82,6 +98,43 @@ def _check_pywhispercpp_cuda() -> bool:
     return False
 
 
+def _check_pywhispercpp_vulkan() -> bool:
+    """Check if pywhispercpp was built with Vulkan support.
+
+    Vulkan builds include ggml-vulkan backend for cross-vendor GPU acceleration.
+    Works with NVIDIA, AMD, and Intel GPUs (both discrete and integrated).
+    Detection via whisper_print_system_info() or presence of ggml-vulkan.dll.
+    """
+    try:
+        import _pywhispercpp as pw
+        info = pw.whisper_print_system_info()
+        if "Vulkan" in info:
+            return True
+        # Also check for ggml-vulkan.dll in site-packages (pre-built binaries)
+        import importlib.util
+        from pathlib import Path
+        spec = importlib.util.find_spec("_pywhispercpp")
+        if spec and spec.origin:
+            vulkan_dll = Path(spec.origin).parent / "ggml-vulkan.dll"
+            return vulkan_dll.exists()
+    except Exception:
+        pass
+    return False
+
+
+def get_gpu_backend_info() -> str:
+    """Get detailed GPU backend information from pywhispercpp.
+
+    Returns:
+        Backend information string from whisper_print_system_info().
+    """
+    try:
+        import _pywhispercpp as pw
+        return pw.whisper_print_system_info()
+    except Exception as e:
+        return f"Error getting backend info: {e}"
+
+
 def detect_hardware() -> HardwareInfo:
     """Detect hardware capabilities and recommend STT configuration.
 
@@ -131,16 +184,25 @@ def detect_hardware() -> HardwareInfo:
     except Exception:
         pass
 
-    # Detect NVIDIA GPU
-    has_gpu, gpu_name, vram_gb = _detect_nvidia_gpu()
-    if has_gpu:
+    # Detect NVIDIA GPU (for display purposes and CUDA fallback)
+    has_nvidia, gpu_name, vram_gb = _detect_nvidia_gpu()
+    if has_nvidia:
         info.gpu_name = gpu_name
         info.vram_gb = vram_gb
-        # Check if pywhispercpp has CUDA support
-        info.has_cuda = _check_pywhispercpp_cuda()
-        if has_gpu and not info.has_cuda:
-            logger.info("NVIDIA GPU detected but pywhispercpp lacks CUDA support. "
-                       "Rebuild with GGML_CUDA=1 for GPU acceleration.")
+
+    # Check GPU backends in pywhispercpp
+    # Vulkan is preferred (universal support: NVIDIA, AMD, Intel discrete and integrated)
+    # CUDA is fallback (NVIDIA-only, specific architecture builds)
+    info.has_vulkan = _check_pywhispercpp_vulkan()
+    info.has_cuda = _check_pywhispercpp_cuda()
+
+    if info.has_vulkan:
+        logger.info("Vulkan GPU backend available (universal GPU support)")
+    elif info.has_cuda:
+        logger.info("CUDA GPU backend available (NVIDIA-only)")
+    elif has_nvidia:
+        logger.info("NVIDIA GPU detected but pywhispercpp has no GPU backend. "
+                   "Rebuild with GGML_VULKAN=1 for universal GPU acceleration.")
 
     # Determine recommendations based on hardware
     info.recommended_engine, info.recommended_model = _get_recommendations(info)
@@ -152,7 +214,7 @@ def _get_recommendations(info: HardwareInfo) -> tuple[str, str]:
     """Determine recommended GGML Whisper model based on hardware.
 
     CLD uses pywhispercpp with GGML models:
-    - With GPU (CUDA): medium or larger for fast inference
+    - With GPU (Vulkan/CUDA): medium or larger for fast inference
     - CPU 8+ cores: medium (full precision)
     - CPU 4+ cores: medium-q5_0 (quantized, default)
     - CPU 2-3 cores: small
@@ -163,14 +225,19 @@ def _get_recommendations(info: HardwareInfo) -> tuple[str, str]:
     Returns:
         Tuple of (engine, model) recommendations.
     """
-    # GPU recommendations (based on VRAM)
-    if info.has_cuda and info.vram_gb:
-        if info.vram_gb >= 6:
-            return ("whisper", "medium")
-        elif info.vram_gb >= 3:
-            return ("whisper", "medium-q5_0")
+    # GPU recommendations (based on VRAM if known, otherwise assume capable)
+    if info.has_gpu:
+        if info.vram_gb is not None:
+            if info.vram_gb >= 6:
+                return ("whisper", "medium")
+            elif info.vram_gb >= 3:
+                return ("whisper", "medium-q5_0")
+            else:
+                return ("whisper", "small")
         else:
-            return ("whisper", "small")
+            # Vulkan with unknown VRAM (e.g., iGPU without nvidia-smi)
+            # Default to medium-q5_0 as safe choice
+            return ("whisper", "medium-q5_0")
 
     # CPU-only recommendations based on core count
     if info.cpu_cores < 2:
@@ -213,3 +280,18 @@ def get_available_models(engine: str = "whisper") -> list[tuple[str, str]]:
         ("medium-q5_0", "Medium Q5 (~539MB) - Recommended"),
         ("medium", "Medium (~1.5GB) - Best accuracy"),
     ]
+
+
+def auto_select_gpu() -> int:
+    """Auto-select the best GPU device index.
+
+    Vulkan typically lists discrete GPUs before integrated GPUs.
+    Returns device index 0 (first GPU, usually discrete) for auto-selection,
+    or -1 to let whisper.cpp decide.
+
+    Returns:
+        GPU device index (0 for first/discrete GPU).
+    """
+    # Return 0 (first GPU) which is usually discrete
+    # whisper.cpp Vulkan backend lists discrete GPUs before iGPUs
+    return 0

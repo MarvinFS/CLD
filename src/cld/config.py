@@ -29,7 +29,8 @@ class EngineConfig:
     """STT engine settings."""
     type: Literal["whisper"] = "whisper"  # Whisper for multilingual support
     whisper_model: str = "medium-q5_0"  # ~1.5GB, good accuracy
-    device: str = "auto"
+    device: str = "auto"  # "auto", "cpu", or "gpu"
+    gpu_device: int = -1  # -1=auto-select, 0=first GPU, 1=second GPU
 
 
 @dataclass
@@ -281,6 +282,7 @@ class Config:
                 type="whisper",  # Only whisper supported
                 whisper_model=eng.get("whisper_model", config.engine.whisper_model),
                 device=eng.get("device", config.engine.device),
+                gpu_device=eng.get("gpu_device", config.engine.gpu_device),
             )
 
         # Load features settings

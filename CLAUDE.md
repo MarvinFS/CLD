@@ -11,7 +11,7 @@ CLD is a Windows GUI speech-to-text application forked from claude-stt. Features
 - Local transcription via pywhispercpp with multilingual support
 - Configurable activation key with scancode detection
 - Privacy: All processing is local, audio never sent to cloud
-- GPU acceleration via CUDA (RTX 4090 tested) or CPU fallback using GGML models
+- GPU acceleration via Vulkan (universal) or CPU fallback using GGML models
 
 ## Commands
 
@@ -31,20 +31,32 @@ uv run python -m unittest tests.test_config
 # Lint (ruff) - ALWAYS run after code changes
 uv run ruff check src/
 
-# Build standalone exe with PyInstaller
-# CRITICAL: Must use "uv run" to use Python 3.12 from venv - system Python won't work!
-uv run pyinstaller -y --onedir --windowed --name CLD ^
+# Build standalone exe with PyInstaller (from D:\claudecli-dictate2, not OneDrive)
+# CRITICAL: Must use Python 3.12 from venv - pywhispercpp pyd is compiled for 3.12
+cd D:\claudecli-dictate2
+.venv\Scripts\python.exe -m PyInstaller -y --onedir --windowed --name CLD ^
     --icon cld_icon.ico ^
     --add-data "sounds;sounds" ^
     --add-data "cld_icon.png;." ^
     --add-data "mic_256.png;." ^
-    --add-data "C:/Python314/tcl/tcl8.6;tcl/tcl8.6" ^
-    --add-data "C:/Python314/tcl/tk8.6;tcl/tk8.6" ^
+    --add-data "C:/Program Files/Python312/tcl/tcl8.6;tcl/tcl8.6" ^
+    --add-data "C:/Program Files/Python312/tcl/tk8.6;tcl/tk8.6" ^
     --add-data ".venv/Lib/site-packages/_sounddevice_data;_sounddevice_data" ^
+    --add-binary ".venv/Lib/site-packages/_pywhispercpp.cp312-win_amd64.pyd;." ^
+    --add-binary ".venv/Lib/site-packages/whisper.dll;." ^
+    --add-binary ".venv/Lib/site-packages/ggml.dll;." ^
+    --add-binary ".venv/Lib/site-packages/ggml-base.dll;." ^
+    --add-binary ".venv/Lib/site-packages/ggml-cpu.dll;." ^
+    --add-binary ".venv/Lib/site-packages/ggml-vulkan.dll;." ^
     --runtime-hook pyi_rth_numpy.py ^
     --runtime-hook pyi_rth_tcltk.py ^
+    --runtime-hook pyi_rth_pywhispercpp.py ^
     --hidden-import pywhispercpp ^
+    --hidden-import pywhispercpp.model ^
     src/cld/cli.py
+
+# Compress with UPX (reduces ~429MB to ~67MB)
+powershell.exe -ExecutionPolicy Bypass -File compress_upx.ps1
 
 # Run exe with --debug flag to show console window for troubleshooting
 dist/CLD/CLD.exe --debug daemon run --overlay
@@ -70,7 +82,7 @@ Key considerations:
 - --debug flag: allocate console with AllocConsole() BEFORE imports, redirect stdout to CONOUT$
 - --debug mode forces foreground execution so console stays open
 
-Output: `dist/CLD/` folder (~80MB with UPX compression) with `CLD.exe` and `_internal/` directory
+Output: `dist/CLD/` folder (~67MB with UPX compression, ~429MB uncompressed) with `CLD.exe` and `_internal/` directory containing Vulkan DLLs (ggml-vulkan.dll is 55MB)
 
 ### PyInstaller pywhispercpp Requirements
 
@@ -90,28 +102,85 @@ CRITICAL: Python version must match between venv and PyInstaller. The pyd file i
 
 Runtime hook `pyi_rth_pywhispercpp.py` adds DLL search directories so the native extension can find whisper.dll at runtime
 
-## GPU/CUDA Support
+## GPU Acceleration
 
-pywhispercpp can be built with CUDA support for GPU acceleration. See `docs/audio-gpu-implementation-plan.md` for full details.
+CLD uses pywhispercpp with the Vulkan backend for universal GPU acceleration. See `docs/audio-gpu-implementation-plan.md` for full details.
+
+### Why Vulkan Over CUDA
+
+CLD chose Vulkan as the GPU backend for two key reasons:
+
+1. Universal GPU Support: Vulkan works with all GPU vendors (NVIDIA, AMD, Intel) including integrated graphics. CUDA only supports NVIDIA GPUs and requires architecture-specific builds (one for RTX 40-series, another for RTX 30-series, etc.).
+
+2. Distribution Size: Vulkan adds ~100-150MB to the build. CUDA adds ~600MB per GPU architecture family due to cuBLAS libraries (cublasLt64_13.dll alone is 449MB).
+
+| Backend | Size Impact | GPU Support |
+|---------|-------------|-------------|
+| Vulkan | ~100-150 MB | NVIDIA, AMD, Intel (discrete + integrated) |
+| CUDA | ~600 MB per arch | NVIDIA only (specific architecture) |
+
+While CUDA may be slightly faster on NVIDIA GPUs, Vulkan provides 80-95% of that performance with universal hardware support at a fraction of the distribution size.
+
+### Building pywhispercpp with Vulkan
+
+All build files are consolidated in `D:\claudecli-dictate2\`:
+
+| Folder | Contents |
+|--------|----------|
+| `pywhispercpp-src/` | pywhispercpp source code with modified main.cpp for GPU device selection |
+| `build-scripts/` | Build scripts (`build_vulkan_py312.bat`) |
+| `whisper-vulkan-prebuilt/` | Backup pre-built Vulkan DLLs from jerryshell/whisper.cpp-windows-vulkan-bin |
+| `.venv/` | Python 3.12 venv with Vulkan-enabled pywhispercpp installed |
 
 Build requirements:
-- CUDA Toolkit 13.x installed
-- Visual Studio 2022 Build Tools
+- Visual Studio 2022 Build Tools (C++ compiler and CMake)
 - Python 3.12 (must exclude Python 3.14 from PATH during build)
+- Vulkan SDK (C:\VulkanSDK\1.4.x) - Required for compiling ggml-vulkan.dll with Vulkan shaders
+- GPU drivers with Vulkan support (standard on all modern drivers)
 
-Build script location: `D:\TMP\build_cuda_py312.bat`
+Why Vulkan SDK is needed: The SDK provides the Vulkan headers and libraries needed to compile the ggml-vulkan.dll (55MB) which contains the GPU compute shaders. Without the SDK, you cannot build from source - you would need pre-built binaries.
 
-Key build insights:
-- Use 8.3 short paths (PROGRA~1\NVIDIA~2) to avoid space issues in CMAKE_ARGS
-- Add `-DPython_FIND_REGISTRY=NEVER` to prevent cmake finding wrong Python
-- CUDA DLLs are in `bin/x64/` not `bin/` - add both to PATH for delvewheel
-- Use pip directly (not uv) to avoid temp directory issues with cmake cache
+Build script location: `D:\claudecli-dictate2\build-scripts\build_vulkan_py312.bat`
 
-CUDA detection (pywhispercpp uses GPU automatically when available):
+```batch
+@echo off
+REM Build pywhispercpp with Vulkan backend
+REM Run from Developer Command Prompt with Visual Studio Build Tools
+
+set VENV=D:\claudecli-dictate2\.venv
+set PYWHISPERCPP_SRC=D:\claudecli-dictate2\pywhispercpp-src
+set PATH=%VENV%\Scripts;C:\Program Files\Python312;%PATH%
+
+cd /d %PYWHISPERCPP_SRC%
+rmdir /s /q build 2>nul
+
+set CMAKE_ARGS=-DGGML_VULKAN=1 -DPython_FIND_REGISTRY=NEVER
+python -m pip install --no-cache-dir . --force-reinstall
+
+REM Copy Vulkan DLLs to venv
+copy "%PYWHISPERCPP_SRC%\whisper.cpp\*.dll" "%VENV%\Lib\site-packages\"
+```
+
+Key files produced by the build:
+- `_pywhispercpp.cp312-win_amd64.pyd` (330KB) - Python extension with GPU device selection
+- `ggml-vulkan.dll` (55MB) - Vulkan compute backend with shaders
+- `whisper.dll`, `ggml.dll`, `ggml-base.dll`, `ggml-cpu.dll` - Core whisper.cpp libraries
+
+The pywhispercpp source at `pywhispercpp-src/` includes a modified `src/main.cpp` that adds `whisper_init_from_file_with_params` function to expose GPU device selection via `use_gpu` and `gpu_device` parameters
+
+### GPU Backend Detection
+
+pywhispercpp uses GPU automatically when available. Detection:
 ```python
 import _pywhispercpp as pw
-has_cuda = "CUDA" in pw.whisper_print_system_info()
+info = pw.whisper_print_system_info()
+has_vulkan = "Vulkan" in info  # Preferred (universal)
+has_cuda = "CUDA" in info       # Fallback (NVIDIA-only)
 ```
+
+### CUDA Build (Legacy/Optional)
+
+For NVIDIA-only deployments requiring maximum performance, CUDA builds are still supported but not recommended for general distribution. See `docs/audio-gpu-implementation-plan.md` for CUDA build instructions.
 
 ## Architecture
 
@@ -136,7 +205,7 @@ Daemon-based design: A background process (STTDaemon) runs continuously, listeni
 - `settings_popup.py` - Quick settings popup from overlay gear button
 - `settings_dialog.py` - Full settings dialog from tray menu
 - `key_scanner.py` - Activation key capture using keyboard library
-- `hardware.py` - CPU/GPU detection for model recommendations and CUDA support
+- `hardware.py` - CPU/GPU detection for model recommendations and Vulkan/CUDA support
 - `model_dialog.py` - Model download/setup dialog shown when model is missing
 
 ### Configuration

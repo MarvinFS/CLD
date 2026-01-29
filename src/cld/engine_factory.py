@@ -22,5 +22,6 @@ def build_engine(config: Config) -> STTEngine:
         return WhisperEngine(
             model_name=config.engine.whisper_model,
             use_gpu=use_gpu,
+            gpu_device=config.engine.gpu_device,
         )
     raise EngineError(f"Unknown engine '{engine_type}'")
