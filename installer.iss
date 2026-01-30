@@ -4,7 +4,7 @@
 #define MyAppName "CLD"
 #define MyAppVersion "0.5.1"
 #define MyAppPublisher "MarvinFS"
-#define MyAppURL "https://github.com/MarvinFS/Public/tree/main/ClaudeCli-Dictate"
+#define MyAppURL "https://github.com/MarvinFS/CLD"
 #define MyAppExeName "CLD.exe"
 
 [Setup]
@@ -45,9 +45,9 @@ Name: "startupicon"; Description: "Start CLD when Windows starts"; GroupDescript
 
 [Files]
 ; Main application
-Source: "dist\CLD\CLD.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist2\CLD\CLD.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; Internal folder with all dependencies
-Source: "dist\CLD\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist2\CLD\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Icon files for shortcuts
 Source: "cld_icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 

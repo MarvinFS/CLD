@@ -84,5 +84,10 @@ docs/*-options.md
 # Public sync folder (for GitHub releases)
 public/
 
+# Alternate build output
+dist2/
+
 # Temporary backup files
 compiled_backup/
+backup_readme.md
+README2.md
