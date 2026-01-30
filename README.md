@@ -19,7 +19,7 @@ Talk to your computer, get text anywhere. CLD captures your voice, transcribes i
 
 **📺 See CLD in Action**
 
-https://github.com/MarvinFS/CLD/raw/main/demo.mp4
+https://github.com/user-attachments/assets/581e5ec1-b7af-47f8-93b2-9f47d97e5a8f
 
 </div>
 
