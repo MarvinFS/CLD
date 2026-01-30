@@ -248,10 +248,12 @@ if (-not (Test-Path $PublicRepoPath)) {
                 Remove-Item $lockFile -Force
             }
 
-            git fetch origin 2>$null
-            $branch = git symbolic-ref --short HEAD 2>$null
-            if (-not $branch) { $branch = "main" }
-            git reset --hard "origin/$branch" 2>$null
+            $ErrorActionPreference = 'SilentlyContinue'
+            git fetch origin *>&1 | Out-Null
+            $branch = (git symbolic-ref --short HEAD 2>&1) -replace "`n|`r",""
+            if (-not $branch -or $branch -match "fatal") { $branch = "main" }
+            git reset --hard "origin/$branch" *>&1 | Out-Null
+            $ErrorActionPreference = 'Continue'
         } finally {
             Pop-Location
         }
@@ -262,8 +264,8 @@ if (-not (Test-Path $PublicRepoPath)) {
 if (-not $DryRun -and (Test-Path $PublicRepoPath)) {
     Push-Location $PublicRepoPath
     try {
-        if ($gitUserName) { git config user.name $gitUserName 2>$null }
-        if ($gitUserEmail) { git config user.email $gitUserEmail 2>$null }
+        if ($gitUserName) { git config user.name $gitUserName 2>&1 | Out-Null }
+        if ($gitUserEmail) { git config user.email $gitUserEmail 2>&1 | Out-Null }
     } finally {
         Pop-Location
     }

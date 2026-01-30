@@ -475,48 +475,6 @@ Set `CMAKE_BUILD_PARALLEL_LEVEL` to use all CPU cores:
 set CMAKE_BUILD_PARALLEL_LEVEL=16
 ```
 
-### delvewheel and repairwheel
-
-The pywhispercpp build uses `repairwheel` (in pyproject.toml build-system requires) which invokes `delvewheel` on Windows. This is the standard way to create self-contained Python wheels for Windows.
-
-**What delvewheel does:**
-1. Scans the .pyd file for DLL dependencies
-2. Copies required DLLs into the wheel
-3. Adds SHA256 hash suffixes to DLL names to prevent "DLL hell"
-4. Modifies the .pyd import table to reference the mangled names
-
-**Why hash suffixes?**
-If multiple Python packages bundle `ggml.dll`, Windows would load whichever is already in memory, potentially wrong version → crash. The hash makes each DLL unique:
-```
-ggml-vulkan.dll → ggml-vulkan-c394d1f39c32686ec401654749edeaa1.dll
-```
-
-**Bundled runtime DLLs:**
-delvewheel automatically bundles dependencies that may be missing on target systems:
-- `vulkan-1-*.dll` (~1.7 MB) - Vulkan loader (works without SDK installed)
-- `msvcp140-*.dll` (~558 KB) - Visual C++ 2015-2022 runtime
-- `vcomp140-*.dll` (~193 KB) - OpenMP runtime for parallel operations
-
-**Build output comparison:**
-```
-Old build (no repairwheel): 6 files, plain names
-  ggml.dll, ggml-base.dll, ggml-cpu.dll, ggml-vulkan.dll, whisper.dll
-  _pywhispercpp.cp312-win_amd64.pyd
-
-New build (with repairwheel): 9 files, hash suffixes
-  ggml-*.dll, ggml-base-*.dll, ggml-cpu-*.dll, ggml-vulkan-*.dll, whisper-*.dll
-  vulkan-1-*.dll, msvcp140-*.dll, vcomp140-*.dll
-  _pywhispercpp.cp312-win_amd64.pyd
-```
-
-**PyInstaller compatibility:**
-Use glob patterns in CLD.spec to handle both old and new naming:
-```python
-for pattern in ['whisper*.dll', 'ggml*.dll', 'vulkan*.dll', 'msvcp*.dll', 'vcomp*.dll']:
-    for f in glob.glob(f'{site_packages}/{pattern}'):
-        pywhispercpp_binaries.append((f, '.'))
-```
-
 ### Why Vulkan Over CUDA
 | Aspect | Vulkan | CUDA |
 |--------|--------|------|

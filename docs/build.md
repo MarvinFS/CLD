@@ -49,16 +49,8 @@ The script:
 1. Sets up Visual Studio build environment
 2. Uses Ninja generator for fast parallel builds
 3. Creates short path mapping (`subst X:`) to avoid Windows MAX_PATH limits
-4. Skips delvewheel wheel repair (NO_REPAIR=1) which had path issues
-5. Manually copies DLLs to site-packages after build
-6. Verifies Vulkan support
-
-### Why NO_REPAIR
-
-The standard pywhispercpp build uses delvewheel to bundle DLLs with hash suffixes. This failed due to path resolution issues with the subst mapping. The NO_REPAIR approach:
-- Builds pywhispercpp normally
-- Copies DLLs directly without hash mangling
-- Results in simpler, predictable file names
+4. Builds pywhispercpp and copies DLLs to site-packages
+5. Verifies Vulkan support
 
 ### Setup Requirements
 
@@ -103,7 +95,7 @@ Build the executable:
 .venv\Scripts\python.exe -m PyInstaller -y CLD.spec
 ```
 
-The `CLD.spec` file collects DLLs via glob patterns to handle both plain names (current) and hash-suffixed names (delvewheel):
+The `CLD.spec` file collects DLLs via glob patterns:
 
 ```python
 for pattern in ['whisper*.dll', 'ggml*.dll', 'vulkan*.dll', 'msvcp*.dll', 'vcomp*.dll']:

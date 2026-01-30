@@ -150,7 +150,7 @@ Note: The `api-ms-win-crt-*.dll` files in the output are Windows Universal C Run
 
 pywhispercpp has native C++ extensions that must be bundled:
 - `_pywhispercpp.cp312-win_amd64.pyd` - Python extension module
-- `whisper-*.dll`, `ggml-*.dll`, `vulkan-1-*.dll`, etc. - Native libraries (with hash suffixes from delvewheel)
+- `whisper.dll`, `ggml.dll`, `ggml-base.dll`, `ggml-cpu.dll`, `ggml-vulkan.dll` - Native libraries
 
 Use the `CLD.spec` file which handles DLL collection via glob patterns:
 ```python
@@ -159,7 +159,7 @@ site_packages = '.venv/Lib/site-packages'
 pywhispercpp_binaries = []
 for f in glob.glob(f'{site_packages}/_pywhispercpp*.pyd'):
     pywhispercpp_binaries.append((f, '.'))
-for pattern in ['whisper*.dll', 'ggml*.dll', 'vulkan*.dll', 'msvcp*.dll', 'vcomp*.dll']:
+for pattern in ['whisper*.dll', 'ggml*.dll']:
     for f in glob.glob(f'{site_packages}/{pattern}'):
         pywhispercpp_binaries.append((f, '.'))
 ```

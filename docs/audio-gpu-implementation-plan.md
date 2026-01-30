@@ -220,7 +220,7 @@ Key challenges and solutions for building pywhispercpp with CUDA on Windows:
 1. PATH must exclude Python 3.14 (cmake/pybind11 picks up from registry)
 2. Use 8.3 short paths (PROGRA~1\NVIDIA~2) to avoid space issues in CMAKE_ARGS
 3. Add `-DPython_FIND_REGISTRY=NEVER` to prevent cmake finding wrong Python
-4. CUDA DLLs are in `bin/x64/` not `bin/` - add both to PATH for delvewheel
+4. CUDA DLLs are in `bin/x64/` not `bin/` - add both to PATH
 5. Use pip directly (not uv) to avoid temp directory issues with cmake cache
 
 Final build command:
