@@ -95,10 +95,10 @@ Build the executable:
 .venv\Scripts\python.exe -m PyInstaller -y CLD.spec
 ```
 
-The `CLD.spec` file collects DLLs via glob patterns:
+The `CLD.spec` file collects the pywhispercpp DLLs via glob patterns:
 
 ```python
-for pattern in ['whisper*.dll', 'ggml*.dll', 'vulkan*.dll', 'msvcp*.dll', 'vcomp*.dll']:
+for pattern in ['whisper*.dll', 'ggml*.dll']:
     for f in glob.glob(f'{site_packages}/{pattern}'):
         pywhispercpp_binaries.append((f, '.'))
 ```

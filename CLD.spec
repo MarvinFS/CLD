@@ -2,17 +2,16 @@
 import glob
 import os
 
-# Collect pywhispercpp binaries (delvewheel adds hash suffixes to DLL names)
+# Collect pywhispercpp binaries
 site_packages = '.venv/Lib/site-packages'
 pywhispercpp_binaries = []
 
 # Python extension
-pyd_files = glob.glob(f'{site_packages}/_pywhispercpp*.pyd')
-for f in pyd_files:
+for f in glob.glob(f'{site_packages}/_pywhispercpp*.pyd'):
     pywhispercpp_binaries.append((f, '.'))
 
-# Core DLLs (whisper, ggml, vulkan)
-for pattern in ['whisper*.dll', 'ggml*.dll', 'vulkan*.dll', 'msvcp*.dll', 'vcomp*.dll']:
+# Core DLLs (whisper, ggml)
+for pattern in ['whisper*.dll', 'ggml*.dll']:
     for f in glob.glob(f'{site_packages}/{pattern}'):
         pywhispercpp_binaries.append((f, '.'))
 
