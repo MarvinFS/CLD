@@ -1,7 +1,7 @@
 # Sign CLD installer with MarvinFS certificate
 $ErrorActionPreference = "Stop"
 
-$installerPath = "D:\claudecli-dictate2\dist\CLD-0.5.1-Setup.exe"
+$installerPath = "D:\claudecli-dictate2\dist\CLD-0.5.2-Setup.exe"
 
 # Find the MarvinFS certificate
 $cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Where-Object { $_.Subject -like '*MarvinFS*' }

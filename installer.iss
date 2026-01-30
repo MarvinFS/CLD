@@ -2,7 +2,7 @@
 ; https://github.com/MarvinFS/ClaudeCli-Dictate
 
 #define MyAppName "CLD"
-#define MyAppVersion "0.5.1"
+#define MyAppVersion "0.5.2"
 #define MyAppPublisher "MarvinFS"
 #define MyAppURL "https://github.com/MarvinFS/CLD"
 #define MyAppExeName "CLD.exe"

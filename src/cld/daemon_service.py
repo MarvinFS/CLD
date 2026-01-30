@@ -581,7 +581,7 @@ class STTDaemon:
             def open_github(event=None):
                 """Open GitHub URL in browser."""
                 try:
-                    webbrowser.open("https://github.com/MarvinFS/claudecli-dictate")
+                    webbrowser.open("https://github.com/MarvinFS/CLD")
                 except Exception as ex:
                     self._logger.error("Failed to open URL: %s", ex)
 
