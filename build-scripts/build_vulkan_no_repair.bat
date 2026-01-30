@@ -2,8 +2,7 @@
 setlocal
 
 REM ============================================================================
-REM Build pywhispercpp with Vulkan using short path via subst
-REM This avoids Windows MAX_PATH issues while keeping files in project
+REM Build pywhispercpp with Vulkan - skip wheel repair and copy DLLs manually
 REM ============================================================================
 
 echo === Setting up Visual Studio build environment ===
@@ -13,11 +12,12 @@ echo === Setting up Python 3.12 environment ===
 set PATH=D:\claudecli-dictate2\.venv\Scripts;C:\Program Files\Python312;%PATH%
 REM Use all CPU cores for parallel compilation
 set CMAKE_BUILD_PARALLEL_LEVEL=16
-REM CMAKE_ARGS is passed through environment to CMake - use Ninja for faster builds
 set CMAKE_GENERATOR=Ninja
 set CMAKE_ARGS=-DGGML_VULKAN=1 -DPython_FIND_REGISTRY=NEVER
 set SETUPTOOLS_SCM_PRETEND_VERSION=1.4.2
 set SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PYWHISPERCPP=1.4.2
+REM Skip wheel repair - we'll copy DLLs manually
+set NO_REPAIR=1
 
 echo Python version:
 python --version
@@ -43,6 +43,18 @@ python -m pip install --no-cache-dir . --force-reinstall
 
 set BUILD_RESULT=%errorlevel%
 
+echo.
+echo === Copying DLLs to site-packages ===
+set DLL_SRC=X:\build\temp.win-amd64-cpython-312\Release\_pywhispercpp\bin
+set DLL_DEST=D:\claudecli-dictate2\.venv\Lib\site-packages
+
+echo Copying from %DLL_SRC% to %DLL_DEST%
+copy /Y "%DLL_SRC%\*.dll" "%DLL_DEST%\" 2>nul
+if not exist "%DLL_SRC%\*.dll" (
+    echo Trying Release subfolder...
+    copy /Y "%DLL_SRC%\Release\*.dll" "%DLL_DEST%\" 2>nul
+)
+
 REM Remove mapping
 echo.
 echo === Removing short path mapping ===
@@ -59,6 +71,8 @@ echo.
 echo === Checking results ===
 echo DLLs in site-packages:
 dir /b D:\claudecli-dictate2\.venv\Lib\site-packages\*.dll 2>nul
+echo.
+echo PYD files:
 dir /b D:\claudecli-dictate2\.venv\Lib\site-packages\*pywhispercpp*.pyd 2>nul
 
 echo.

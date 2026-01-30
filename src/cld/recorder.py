@@ -12,7 +12,7 @@ import numpy as np
 # Thread-safe audio level and spectrum for visualization
 _current_level: float = 0.0
 _level_lock = threading.Lock()
-_spectrum_bands: list[float] = [0.0] * 16
+_spectrum_bands: list[float] = [0.0] * 32
 _spectrum_lock = threading.Lock()
 
 _SOUNDDEVICE_IMPORT_ERROR: Exception | None = None
@@ -124,7 +124,7 @@ class AudioRecorder:
         with _level_lock:
             _current_level = level
 
-        # Compute FFT spectrum for visualization (16 bands)
+        # Compute FFT spectrum for visualization (32 bands)
         # Focus on actual voice frequency range: 200-4000 Hz
         # This is where speech formants and consonants live
         fft = np.fft.rfft(audio)
@@ -134,10 +134,11 @@ class AudioRecorder:
         bands = []
         # Voice-focused frequency range (200 Hz to 4000 Hz)
         min_freq, max_freq = 200, 4000
-        for i in range(16):
+        num_bands = 32
+        for i in range(num_bands):
             # Log-spaced frequency boundaries within voice range
-            f_low = min_freq * (max_freq / min_freq) ** (i / 16)
-            f_high = min_freq * (max_freq / min_freq) ** ((i + 1) / 16)
+            f_low = min_freq * (max_freq / min_freq) ** (i / num_bands)
+            f_high = min_freq * (max_freq / min_freq) ** ((i + 1) / num_bands)
             # Convert to FFT bin indices
             bin_low = int(f_low * n_bins * 2 / self.config.sample_rate)
             bin_high = int(f_high * n_bins * 2 / self.config.sample_rate)
@@ -152,7 +153,7 @@ class AudioRecorder:
         if max_mag > 0:
             bands = [min(1.0, (b / max_mag) * level * 3.0) for b in bands]
         else:
-            bands = [0.0] * 16
+            bands = [0.0] * 32
 
         with _spectrum_lock:
             _spectrum_bands = bands

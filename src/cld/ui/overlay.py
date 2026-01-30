@@ -1,5 +1,7 @@
 """Floating overlay GUI for CLD status display with tiny mode and settings access."""
 
+from __future__ import annotations
+
 import logging
 import math
 import queue
@@ -7,9 +9,12 @@ import sys
 import time
 import tkinter as tk
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, TYPE_CHECKING
 
 from PIL import Image, ImageTk
+
+if TYPE_CHECKING:
+    from cld.config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +74,7 @@ class STTOverlay:
         on_settings: Optional[Callable] = None,
         get_audio_level: Optional[Callable[[], float]] = None,
         get_audio_spectrum: Optional[Callable[[], list[float]]] = None,
+        config: Optional["Config"] = None,
     ):
         """Initialize the overlay.
 
@@ -77,11 +83,13 @@ class STTOverlay:
             on_settings: Callback when gear button is clicked.
             get_audio_level: Callback to get current audio level (0.0-1.0).
             get_audio_spectrum: Callback to get 16-band spectrum (list of 0.0-1.0).
+            config: Configuration for position persistence.
         """
         self.on_close = on_close
         self.on_settings = on_settings
         self._get_audio_level = get_audio_level
         self._get_audio_spectrum = get_audio_spectrum
+        self._config = config
 
         self._root: Optional[tk.Tk] = None
         self._canvas: Optional[tk.Canvas] = None
@@ -101,7 +109,7 @@ class STTOverlay:
         self._animation_id: Optional[str] = None
         self._running = False
         self._record_start_time: float = 0
-        self._audio_levels: list[float] = [0.3] * 16  # 16 bars
+        self._audio_levels: list[float] = [0.3] * 32  # 32 frequency bands
         self._state_queue: queue.Queue = queue.Queue()  # Thread-safe state updates
 
         # Dragging state
@@ -111,6 +119,11 @@ class STTOverlay:
         # Mode switch protection
         self._mode_switching = False  # Prevent concurrent mode switches
         self._last_gear_click = 0.0   # Debounce gear clicks
+        self._last_position_save = 0.0  # Debounce position saves
+
+        # Separate position tracking for tiny and normal modes
+        self._tiny_pos_x = 0
+        self._tiny_pos_y = 0
 
         # Window dimensions
         self._normal_width = 300
@@ -181,6 +194,86 @@ class STTOverlay:
         except Exception:
             pass
 
+    def _get_monitor_bounds(self) -> tuple[int, int, int, int]:
+        """Get work area bounds of monitor containing the overlay.
+
+        Returns (left, top, right, bottom) of the monitor's work area.
+        Falls back to primary monitor if detection fails.
+        """
+        if sys.platform != "win32":
+            # Fallback for non-Windows
+            return (0, 0, self._root.winfo_screenwidth(), self._root.winfo_screenheight())
+
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            # Get HWND
+            hwnd = ctypes.windll.user32.GetParent(self._root.winfo_id())
+            if not hwnd:
+                hwnd = ctypes.windll.user32.GetAncestor(self._root.winfo_id(), 2)  # GA_ROOT
+
+            # Get monitor from window
+            MONITOR_DEFAULTTONEAREST = 2
+            hmonitor = ctypes.windll.user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+
+            # Get monitor info
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT),
+                    ("dwFlags", wintypes.DWORD),
+                ]
+
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            ctypes.windll.user32.GetMonitorInfoW(hmonitor, ctypes.byref(mi))
+
+            # Return work area (excludes taskbar)
+            return (mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom)
+        except Exception:
+            return (0, 0, self._root.winfo_screenwidth(), self._root.winfo_screenheight())
+
+    def _calculate_expansion_position(self, target_w: int, target_h: int) -> tuple[int, int]:
+        """Calculate new position for expansion based on screen edges.
+
+        Expands away from nearby edges (within 50px threshold).
+        """
+        EDGE_THRESHOLD = 50
+
+        # Get current position and monitor bounds
+        curr_x = self._root.winfo_x()
+        curr_y = self._root.winfo_y()
+        curr_w = self._root.winfo_width()
+        curr_h = self._root.winfo_height()
+
+        mon_left, mon_top, mon_right, mon_bottom = self._get_monitor_bounds()
+
+        # Calculate distances to edges
+        dist_left = curr_x - mon_left
+        dist_right = mon_right - (curr_x + curr_w)
+        dist_top = curr_y - mon_top
+        dist_bottom = mon_bottom - (curr_y + curr_h)
+
+        # Default: top-left anchor (current behavior)
+        new_x = curr_x
+        new_y = curr_y
+
+        # Horizontal: expand away from nearest edge
+        if dist_right < EDGE_THRESHOLD and dist_left >= target_w:
+            # Near right edge, expand leftward (anchor right edge)
+            new_x = curr_x + curr_w - target_w
+        # else: keep left anchor (default)
+
+        # Vertical: expand away from nearest edge
+        if dist_bottom < EDGE_THRESHOLD and dist_top >= target_h:
+            # Near bottom edge, expand upward (anchor bottom edge)
+            new_y = curr_y + curr_h - target_h
+        # else: keep top anchor (default)
+
+        return (new_x, new_y)
+
     def _create_window(self):
         """Create the overlay window."""
         self._root = tk.Tk()
@@ -189,11 +282,20 @@ class STTOverlay:
         self._root.attributes("-topmost", True)  # Always on top
         self._root.configure(bg=self._bg_color)
 
-        # Position in bottom-center of screen
+        # Position: restore from config or center-screen
         screen_w = self._root.winfo_screenwidth()
         screen_h = self._root.winfo_screenheight()
+
+        # Default position: center-bottom above taskbar
         x = (screen_w - self._normal_width) // 2
-        y = screen_h - self._normal_height - 100  # Above taskbar
+        y = screen_h - self._normal_height - 100
+
+        # Try to restore saved position if valid
+        if self._config and self._config.ui.overlay_position:
+            saved_x, saved_y = self._config.ui.overlay_position
+            if -50 < saved_x < screen_w and -50 < saved_y < screen_h:
+                x, y = saved_x, saved_y
+
         self._root.geometry(f"{self._normal_width}x{self._normal_height}+{x}+{y}")
 
         # Store position for mode switching
@@ -626,6 +728,11 @@ class STTOverlay:
         self._mode = self.MODE_TINY
         self._save_position_and_clear_ui()
 
+        # Restore tiny position (where user originally placed the tiny overlay)
+        if self._tiny_pos_x != 0 or self._tiny_pos_y != 0:
+            self._pos_x = self._tiny_pos_x
+            self._pos_y = self._tiny_pos_y
+
         # Callback to build UI and apply visual effects
         def after_anim():
             self._build_tiny_ui()
@@ -634,17 +741,32 @@ class STTOverlay:
             self._enable_shadow()
             self._mode_switching = False
 
-        # Animate to new size
+        # Animate to new size at restored position
         self._animate_to_size(self._tiny_width, self._tiny_height, callback=after_anim)
 
     def _switch_to_normal(self):
-        """Switch to normal mode with smooth animation."""
+        """Switch to normal mode with smart directional expansion."""
         if self._mode == self.MODE_NORMAL or self._mode_switching:
             return
 
         self._mode_switching = True
+
+        # Save tiny position BEFORE switching modes
+        self._tiny_pos_x = self._root.winfo_x()
+        self._tiny_pos_y = self._root.winfo_y()
+
         self._mode = self.MODE_NORMAL
+
+        # Calculate smart expansion position BEFORE clearing UI
+        new_x, new_y = self._calculate_expansion_position(
+            self._normal_width, self._normal_height
+        )
+
         self._save_position_and_clear_ui()
+
+        # Update position for smart expansion
+        self._pos_x = new_x
+        self._pos_y = new_y
 
         # Animate to new size, then build UI
         def after_anim():
@@ -671,54 +793,78 @@ class STTOverlay:
         self._drag_y = event.y
 
     def _on_drag(self, event):
-        """Handle window dragging."""
+        """Handle window dragging and save position."""
         x = self._root.winfo_x() + event.x - self._drag_x
         y = self._root.winfo_y() + event.y - self._drag_y
         self._root.geometry(f"+{x}+{y}")
 
+        # Save position to config (debounced - max once per second)
+        now = time.time()
+        if self._config and now - self._last_position_save > 1.0:
+            self._last_position_save = now
+            self._config.ui.overlay_position = [x, y]
+            try:
+                self._config.save()
+            except Exception:
+                pass
+
     def _draw_waveform(self, idle: bool = False):
-        """Draw audio waveform bars (normal mode only)."""
+        """Draw audio waveform bars with bi-directional expansion from center.
+
+        Uses 32 unique frequency bands. Each bar has vertical gradient
+        (darker at center, lighter at edges).
+        """
         if not self._canvas or self._mode == self.MODE_TINY:
             return
 
         self._canvas.delete("all")
 
-        num_bars = 16
-        bar_width = 6
-        bar_gap = 4
+        num_bars = 32
+        bar_width = 4  # Narrower bars
+        bar_gap = 2    # Smaller gap
         total_width = num_bars * bar_width + (num_bars - 1) * bar_gap
         start_x = (270 - total_width) // 2
-        baseline_y = 28  # Bottom of waveform area
-        max_height = 24
+
+        canvas_height = 30
+        center_y = 16  # Shifted down to compensate for visual cropping at bottom
+        max_height = 12  # Max extension in each direction
+
+        # Draw faint center line hint when idle
+        if idle:
+            self._canvas.create_line(
+                start_x, center_y, start_x + total_width, center_y,
+                fill="#333333", width=1
+            )
 
         for i in range(num_bars):
+            x = start_x + i * (bar_width + bar_gap)
+
             if idle:
-                height = 2  # Minimal height when idle
-                color = self._bar_color_idle
+                height = 1  # Minimal height when idle
+                self._canvas.create_rectangle(
+                    x, center_y - height, x + bar_width, center_y + height + 1,
+                    fill=self._bar_color_idle, outline=""
+                )
             else:
                 level = self._audio_levels[i]
-                height = max(2, int(level * max_height))
-                # Gradient color based on level: dim green -> bright green -> yellow-white
+                height = max(1, int(level * max_height))
+
                 if self._state == "recording":
-                    # Interpolate from dim green (0x33, 0x99, 0x33) to bright green-yellow
-                    intensity = min(1.0, level * 1.5)  # Boost for visibility
-                    r = int(0x33 + (0xcc - 0x33) * intensity)
-                    g = int(0x99 + (0xff - 0x99) * intensity)
-                    b = int(0x33 + (0x66 - 0x33) * intensity)
+                    # Calculate color based on level (brighter = louder)
+                    intensity = min(1.0, level * 1.5)
+                    r = int(0x33 + (0x88 - 0x33) * intensity)
+                    g = int(0x88 + (0xff - 0x88) * intensity)
+                    b = int(0x33 + (0x55 - 0x33) * intensity)
                     color = f"#{r:02x}{g:02x}{b:02x}"
                 else:
                     color = self._bar_color_active
 
-            x = start_x + i * (bar_width + bar_gap)
-            # Draw bar expanding upward from baseline
-            self._canvas.create_rectangle(
-                x,
-                baseline_y - height,
-                x + bar_width,
-                baseline_y,
-                fill=color,
-                outline="",
-            )
+                # Draw symmetric bar: height pixels above AND height pixels below center
+                self._canvas.create_rectangle(
+                    x, center_y - height,
+                    x + bar_width, center_y + height + 1,  # +1 to include center pixel
+                    fill=color, outline=""
+                )
 
     def _update_timer(self):
         """Update the recording timer display."""
@@ -754,7 +900,7 @@ class STTOverlay:
 
         if self._state == "recording":
             # Get real FFT spectrum bands from microphone
-            spectrum = [0.0] * 16
+            spectrum = [0.0] * 32
             if self._get_audio_spectrum:
                 try:
                     spectrum = self._get_audio_spectrum()
@@ -762,7 +908,7 @@ class STTOverlay:
                     pass
 
             # Update bars with real spectrum data - each bar is independent
-            for i in range(16):
+            for i in range(32):
                 # Smooth transition: 70% new, 30% old for responsive feel
                 self._audio_levels[i] = 0.7 * spectrum[i] + 0.3 * self._audio_levels[i]
                 # Clamp to valid range
@@ -776,7 +922,7 @@ class STTOverlay:
             # Gentle pulsing for transcribing state
             t = time.time() * 1.5
             self._audio_levels = [
-                0.25 + 0.25 * abs(math.sin(t + i * 0.2)) for i in range(16)
+                0.25 + 0.25 * abs(math.sin(t + i * 0.1)) for i in range(32)
             ]
             self._draw_waveform(idle=False)
             self._update_timer()
@@ -902,6 +1048,33 @@ class STTOverlay:
             else:
                 self._root.geometry(f"{self._normal_width}x{self._normal_height}+{x}+{y}")
             self._root.lift()
+
+    def reset_position(self):
+        """Reset overlay to center-screen position."""
+        if not self._root:
+            return
+        screen_w = self._root.winfo_screenwidth()
+        screen_h = self._root.winfo_screenheight()
+
+        if self._mode == self.MODE_TINY:
+            w, h = self._tiny_width, self._tiny_height
+        else:
+            w, h = self._normal_width, self._normal_height
+
+        x = (screen_w - w) // 2
+        y = screen_h - h - 100
+
+        self._pos_x = x
+        self._pos_y = y
+        self._root.geometry(f"{w}x{h}+{x}+{y}")
+
+        # Save reset position
+        if self._config:
+            self._config.ui.overlay_position = [x, y]
+            try:
+                self._config.save()
+            except Exception:
+                pass
 
     def hide(self):
         """Hide the overlay by moving off-screen.
