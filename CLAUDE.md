@@ -175,73 +175,39 @@ Runtime hook `pyi_rth_pywhispercpp.py` adds DLL search directories so the native
 
 ## GPU Acceleration
 
-CLD uses pywhispercpp with the Vulkan backend for universal GPU acceleration. See `docs/audio-gpu-implementation-plan.md` for full details.
+CLD uses pywhispercpp with Vulkan for universal GPU acceleration. See `docs/build.md` for build instructions.
 
 ### Why Vulkan Over CUDA
 
-CLD chose Vulkan as the GPU backend for two key reasons:
-
-1. Universal GPU Support: Vulkan works with all GPU vendors (NVIDIA, AMD, Intel) including integrated graphics. CUDA only supports NVIDIA GPUs and requires architecture-specific builds (one for RTX 40-series, another for RTX 30-series, etc.).
-
-2. Distribution Size: Vulkan adds ~100-150MB to the build. CUDA adds ~600MB per GPU architecture family due to cuBLAS libraries (cublasLt64_13.dll alone is 449MB).
-
-| Backend | Size Impact | GPU Support |
-|---------|-------------|-------------|
-| Vulkan | ~100-150 MB | NVIDIA, AMD, Intel (discrete + integrated) |
-| CUDA | ~600 MB per arch | NVIDIA only (specific architecture) |
-
-While CUDA may be slightly faster on NVIDIA GPUs, Vulkan provides 80-95% of that performance with universal hardware support at a fraction of the distribution size.
+| Aspect | Vulkan | CUDA |
+|--------|--------|------|
+| GPU Support | NVIDIA, AMD, Intel (all) | NVIDIA only |
+| Distribution Size | ~100-150 MB | ~600 MB per architecture |
+| Build Complexity | Single universal build | One per GPU family |
 
 ### Building pywhispercpp with Vulkan
 
-See `docs/build.md` for comprehensive build documentation including prerequisites, troubleshooting, and detailed explanations.
+Prerequisites: Visual Studio 2022 Build Tools, Python 3.12, Vulkan SDK (C:\VulkanSDK\)
 
-All build files are consolidated in `D:\claudecli-dictate2\`:
-
-| Folder | Contents |
-|--------|----------|
-| `pywhispercpp-src/` | pywhispercpp source code with modified main.cpp for GPU device selection |
-| `build-scripts/` | Build scripts (`build_vulkan_short_path.bat` recommended) |
-| `compiled_backup/` | Backup of pre-built DLLs (without hash suffixes) |
-| `.venv/` | Python 3.12 venv with Vulkan-enabled pywhispercpp installed |
-
-Build requirements:
-- Visual Studio 2022 Build Tools (C++ compiler and CMake)
-- Python 3.12 (must exclude Python 3.14 from PATH during build)
-- Vulkan SDK (C:\VulkanSDK\1.4.x) - Required for compiling ggml-vulkan.dll with Vulkan shaders
-- GPU drivers with Vulkan support (standard on all modern drivers)
-
-Build command (from regular Command Prompt):
 ```batch
 cd D:\claudecli-dictate2
-build-scripts\build_vulkan_short_path.bat
+build-scripts\build_vulkan_no_repair.bat
 ```
 
-The script uses `subst X:` to create a short path mapping, avoiding Windows MAX_PATH issues with deeply nested Vulkan shader compilation paths.
+Build output in `.venv/Lib/site-packages/`:
+- `_pywhispercpp.cp312-win_amd64.pyd` - Python extension
+- `ggml-vulkan.dll` (~55MB) - Vulkan compute backend
+- `whisper.dll`, `ggml.dll`, `ggml-base.dll`, `ggml-cpu.dll` - Core libraries
 
-Key files produced by the build (with delvewheel hash suffixes):
-- `_pywhispercpp.cp312-win_amd64.pyd` (~330KB) - Python extension with GPU device selection
-- `ggml-vulkan-*.dll` (~55MB) - Vulkan compute backend with shaders
-- `whisper-*.dll`, `ggml-*.dll`, `ggml-base-*.dll`, `ggml-cpu-*.dll` - Core whisper.cpp libraries
-- `vulkan-1-*.dll`, `msvcp140-*.dll`, `vcomp140-*.dll` - Runtime dependencies bundled by delvewheel
+The pywhispercpp source at `pywhispercpp-src/` includes GPU device selection via `whisper_init_from_file_with_params`.
 
-Note: The build uses `repairwheel` which invokes `delvewheel` on Windows, adding SHA256 hash suffixes to DLL names to prevent DLL conflicts between packages.
+### GPU Detection
 
-The pywhispercpp source at `pywhispercpp-src/` includes a modified `src/main.cpp` that adds `whisper_init_from_file_with_params` function to expose GPU device selection via `use_gpu` and `gpu_device` parameters
-
-### GPU Backend Detection
-
-pywhispercpp uses GPU automatically when available. Detection:
 ```python
 import _pywhispercpp as pw
 info = pw.whisper_print_system_info()
-has_vulkan = "Vulkan" in info  # Preferred (universal)
-has_cuda = "CUDA" in info       # Fallback (NVIDIA-only)
+has_vulkan = "Vulkan" in info
 ```
-
-### CUDA Build (Legacy/Optional)
-
-For NVIDIA-only deployments requiring maximum performance, CUDA builds are still supported but not recommended for general distribution. See `docs/audio-gpu-implementation-plan.md` for CUDA build instructions.
 
 ## Architecture
 
