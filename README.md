@@ -15,27 +15,13 @@ Talk to your computer, get text anywhere. CLD captures your voice, transcribes i
 
 ---
 
-## 📑 Contents
+<div align="center">
 
-| | Section | Description |
-|:--:|---------|-------------|
-| 🚀 | [Quick Start](#-quick-start) | Get running in one minute |
-| 💡 | [Why CLD?](#-why-cld) | Privacy, speed, simplicity |
-| ✨ | [Features](#-features-at-a-glance) | What CLD can do |
-| 🌍 | [Languages](#-supported-languages) | 99 languages supported |
-| 💻 | [Requirements](#-system-requirements) | Hardware and OS |
-| 📥 | [Installation](#-installation) | Download and setup |
-| 🧠 | [Models](#-understanding-the-models) | Which model to choose |
-| 🎤 | [Usage](#-your-first-dictation) | How to dictate |
-| ⚙️ | [Settings](#%EF%B8%8F-settings-guide) | Configuration options |
-| 🖥️ | [CLI](#%EF%B8%8F-command-line-reference) | Command line usage |
-| ⚡ | [Performance](#-performance-expectations) | Speed benchmarks |
-| 🔧 | [Troubleshooting](#-troubleshooting) | Common issues |
-| 🛠️ | [Building](#%EF%B8%8F-building-pywhispercpp-with-vulkan) | Compile from source |
-| 📜 | [License](#-license) | GPL 3.0 |
-| 🙏 | [Credits](#-credits-and-origin) | Acknowledgments |
+**📺 See CLD in Action**
 
----
+https://github.com/MarvinFS/CLD/raw/main/demo.mp4
+
+</div>
 
 ## 🚀 Quick Start
 
