@@ -1,0 +1,265 @@
+"""Keyboard output: direct injection or clipboard fallback."""
+
+import json
+import logging
+import time
+from typing import Optional
+
+try:
+    from pynput.keyboard import Controller, Key
+    _PYNPUT_AVAILABLE = True
+    _PYNPUT_IMPORT_ERROR: Exception | None = None
+except Exception as exc:
+    Controller = None
+    Key = None
+    _PYNPUT_AVAILABLE = False
+    _PYNPUT_IMPORT_ERROR = exc
+
+from cld.config import Config
+from cld.sounds import play_sound
+from cld.window import WindowInfo, restore_focus, focus_window_by_hwnd
+
+# Global keyboard controller
+_keyboard: Optional[Controller] = None
+_injection_capable: Optional[bool] = None
+_injection_checked_at: Optional[float] = None
+_injection_cache_ttl = 300.0
+_logger = logging.getLogger(__name__)
+_pynput_warned = False
+
+
+def get_keyboard() -> Controller:
+    """Get the global keyboard controller."""
+    global _keyboard
+    if not _PYNPUT_AVAILABLE:
+        raise RuntimeError("pynput unavailable; keyboard injection disabled")
+    if _keyboard is None:
+        _keyboard = Controller()
+    return _keyboard
+
+
+def _warn_pynput_missing() -> None:
+    global _pynput_warned
+    if _pynput_warned:
+        return
+    message = "pynput unavailable; falling back to clipboard output"
+    if _PYNPUT_IMPORT_ERROR:
+        message = f"{message} ({_PYNPUT_IMPORT_ERROR})"
+    _logger.warning(message)
+    _pynput_warned = True
+
+
+def _read_claude_code_window() -> Optional[int]:
+    """Read Claude Code window handle from statusline's window.json.
+
+    The statusline.ps1 script writes its terminal window handle to this file,
+    allowing CLD to auto-focus Claude Code CLI for text injection.
+
+    Returns:
+        Window handle (hwnd) as int, or None if unavailable/stale.
+    """
+    window_file = Config.get_config_dir() / "window.json"
+    if not window_file.exists():
+        return None
+
+    try:
+        with open(window_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Check staleness (30 second threshold)
+        age = time.time() - data.get("timestamp", 0)
+        if age > 30:
+            _logger.debug("Claude Code window handle stale (%.1fs old)", age)
+            return None
+
+        hwnd = int(data.get("hwnd", 0))
+        return hwnd if hwnd else None
+    except Exception:
+        _logger.debug("Failed to read Claude Code window handle", exc_info=True)
+        return None
+
+
+def test_injection() -> bool:
+    """Test if keyboard injection works.
+
+    This is a lightweight probe that presses/release a modifier key.
+    If it fails, we know injection doesn't work.
+
+    Returns:
+        True if injection appears to work, False otherwise.
+    """
+    global _injection_capable, _injection_checked_at
+    now = time.monotonic()
+    if (
+        _injection_capable is not None
+        and _injection_checked_at is not None
+        and now - _injection_checked_at < _injection_cache_ttl
+    ):
+        return _injection_capable
+
+    if not _PYNPUT_AVAILABLE:
+        _warn_pynput_missing()
+        _injection_capable = False
+        _injection_checked_at = now
+        return _injection_capable
+
+    try:
+        kb = get_keyboard()
+        # Try a simple key press/release
+        kb.press(Key.shift)
+        kb.release(Key.shift)
+        _injection_capable = True
+        _injection_checked_at = now
+        return _injection_capable
+    except Exception:
+        _injection_capable = False
+        _injection_checked_at = now
+        return _injection_capable
+
+
+def output_text(
+    text: str,
+    window_info: Optional[WindowInfo] = None,
+    config: Optional[Config] = None,
+) -> bool:
+    """Output transcribed text using the best available method.
+
+    Args:
+        text: The text to output.
+        window_info: Optional window to restore focus to before typing.
+        config: Configuration (uses default if not provided).
+
+    Returns:
+        True if text was output successfully, False otherwise.
+    """
+    if config is None:
+        config = Config.load().validate()
+
+    # Determine output mode
+    mode = config.output_mode
+    if mode == "auto":
+        mode = "injection" if test_injection() else "clipboard"
+        _logger.debug("Output mode auto-selected: %s", mode)
+
+    if mode == "injection":
+        if not _PYNPUT_AVAILABLE:
+            _warn_pynput_missing()
+            return _output_via_clipboard(text, config)
+        return _output_via_injection(text, window_info, config)
+    else:
+        return _output_via_clipboard(text, config)
+
+
+def _output_via_injection(
+    text: str,
+    window_info: Optional[WindowInfo],
+    config: Config,
+) -> bool:
+    """Output text by simulating keyboard input.
+
+    Args:
+        text: The text to type.
+        window_info: Window to restore focus to before typing.
+        config: Configuration.
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    try:
+        if not _PYNPUT_AVAILABLE:
+            _warn_pynput_missing()
+            return _output_via_clipboard(text, config)
+
+        # Try Claude Code window first (from statusline's window.json)
+        claude_hwnd = _read_claude_code_window()
+        if claude_hwnd:
+            _logger.debug("Attempting to focus Claude Code window (hwnd=%d)", claude_hwnd)
+            if focus_window_by_hwnd(claude_hwnd):
+                kb = get_keyboard()
+                kb.type(text)
+                if config.sound_effects:
+                    play_sound("complete")
+                return True
+            _logger.debug("Claude Code focus failed; falling back to original window")
+
+        # If no window was captured, fall back to clipboard
+        if window_info is None:
+            _logger.info("No target window captured; using clipboard")
+            return _output_via_clipboard(text, config)
+
+        # Restore focus to original window
+        if not restore_focus(window_info):
+            _logger.warning("Focus restore failed; falling back to clipboard")
+            return _output_via_clipboard(text, config)
+
+        kb = get_keyboard()
+
+        # Dismiss any menus that may have opened due to Alt key release
+        # (Alt Gr releases as Ctrl+Alt, which can activate menu bars in some apps)
+        kb.press(Key.esc)
+        kb.release(Key.esc)
+        time.sleep(0.05)
+
+        # Type the text
+        kb.type(text)
+
+        if config.sound_effects:
+            play_sound("complete")
+
+        return True
+    except Exception:
+        # Fall back to clipboard on any error
+        _logger.warning("Injection failed; falling back to clipboard", exc_info=True)
+        return _output_via_clipboard(text, config)
+
+
+def _output_via_clipboard(text: str, config: Config) -> bool:
+    """Output text by copying to clipboard.
+
+    Args:
+        text: The text to copy.
+        config: Configuration.
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    try:
+        try:
+            import pyperclip
+        except ImportError:
+            _logger.error("pyperclip not installed; clipboard output unavailable")
+            return False
+
+        # Just try to copy - Windows native clipboard should always work
+        # The is_available() check can give false negatives on Windows
+        pyperclip.copy(text)
+        _logger.info("Text copied to clipboard (%d chars)", len(text))
+
+        if config.sound_effects:
+            play_sound("complete")
+
+        return True
+    except Exception:
+        if config.sound_effects:
+            play_sound("error")
+        _logger.warning("Clipboard output failed", exc_info=True)
+        return False
+
+
+def type_text_streaming(text: str) -> bool:
+    """Type text character by character for streaming output.
+
+    This is used during live transcription to show words as they're recognized.
+
+    Args:
+        text: The text to type.
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    try:
+        kb = get_keyboard()
+        kb.type(text)
+        return True
+    except Exception:
+        return False

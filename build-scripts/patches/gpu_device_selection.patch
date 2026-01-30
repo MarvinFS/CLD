@@ -1,0 +1,77 @@
+--- CLD pywhispercpp GPU Device Selection Patch ---
+This patch modifies pywhispercpp/src/main.cpp to:
+1. Add whisper_init_from_file_with_params binding with use_gpu and gpu_device parameters
+2. Expose whisper_context_default_params for context parameter access
+3. Allow Python to specify GPU device for multi-GPU systems
+
+The patch adds these functions to the pybind11 module:
+- whisper_context_default_params() -> whisper_context_params
+- whisper_init_from_file_with_params(path, params) -> whisper_context
+
+And modifies the Model class in pywhispercpp/model.py to accept use_gpu and gpu_device parameters.
+
+=== Changes to src/main.cpp ===
+
+After line 80 (whisper_init_wrapper), add:
+
+// Context params wrapper for GPU device selection
+struct whisper_context_params_wrapper {
+    bool use_gpu;
+    bool flash_attn;
+    int gpu_device;
+    bool dtw_token_timestamps;
+    // Note: Skipping dtw_aheads_preset and dtw_aheads for simplicity
+    int dtw_n_top;
+    size_t dtw_mem_size;
+};
+
+whisper_context_params_wrapper whisper_context_default_params_wrapper(){
+    whisper_context_params params = whisper_context_default_params();
+    whisper_context_params_wrapper wrapper;
+    wrapper.use_gpu = params.use_gpu;
+    wrapper.flash_attn = params.flash_attn;
+    wrapper.gpu_device = params.gpu_device;
+    wrapper.dtw_token_timestamps = params.dtw_token_timestamps;
+    wrapper.dtw_n_top = params.dtw_n_top;
+    wrapper.dtw_mem_size = params.dtw_mem_size;
+    return wrapper;
+}
+
+struct whisper_context_wrapper whisper_init_from_file_with_params_wrapper(
+    const char * path_model,
+    bool use_gpu,
+    int gpu_device
+){
+    whisper_context_params params = whisper_context_default_params();
+    params.use_gpu = use_gpu;
+    params.gpu_device = gpu_device;
+
+    struct whisper_context * ctx = whisper_init_from_file_with_params(path_model, params);
+    struct whisper_context_wrapper ctw_w;
+    ctw_w.ptr = ctx;
+    return ctw_w;
+}
+
+=== Add to PYBIND11_MODULE section ===
+
+After the whisper_init binding, add:
+
+// GPU device selection support
+py::class_<whisper_context_params_wrapper>(m, "whisper_context_params")
+    .def(py::init<>())
+    .def_readwrite("use_gpu", &whisper_context_params_wrapper::use_gpu)
+    .def_readwrite("flash_attn", &whisper_context_params_wrapper::flash_attn)
+    .def_readwrite("gpu_device", &whisper_context_params_wrapper::gpu_device)
+    .def_readwrite("dtw_token_timestamps", &whisper_context_params_wrapper::dtw_token_timestamps)
+    .def_readwrite("dtw_n_top", &whisper_context_params_wrapper::dtw_n_top)
+    .def_readwrite("dtw_mem_size", &whisper_context_params_wrapper::dtw_mem_size);
+
+m.def("whisper_context_default_params", &whisper_context_default_params_wrapper,
+    "Get default context params (use_gpu=true, gpu_device=0 by default)");
+
+DEF_RELEASE_GIL("whisper_init_from_file_with_params", &whisper_init_from_file_with_params_wrapper,
+    "Initialize whisper context with GPU device selection.\n"
+    "Args:\n"
+    "  path_model: Path to GGML model file\n"
+    "  use_gpu: Enable GPU acceleration (default: true if available)\n"
+    "  gpu_device: GPU device index (0 = first GPU, -1 = auto)");
