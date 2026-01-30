@@ -149,7 +149,7 @@ class STTDaemon:
         """Get current spectrum bands (16 floats, 0.0-1.0) for visualization."""
         if self._recorder and self._recording:
             return self._recorder.get_spectrum_bands()
-        return [0.0] * 16
+        return [0.0] * 32
 
     def _update_tray(self, state: str) -> None:
         """Update the tray icon state."""
@@ -420,6 +420,7 @@ class STTDaemon:
         def do_show():
             if self._overlay:
                 self._overlay._running = True  # Resume animation
+                self._overlay.reset_position()  # Reset to center on show
                 self._overlay.unhide()
                 if self._tray:
                     self._tray.set_overlay_visible(True)
@@ -580,7 +581,7 @@ class STTDaemon:
             def open_github(event=None):
                 """Open GitHub URL in browser."""
                 try:
-                    webbrowser.open("https://github.com/MarvinFS/claudecli-dictate")
+                    webbrowser.open("https://github.com/MarvinFS/CLD")
                 except Exception as ex:
                     self._logger.error("Failed to open URL: %s", ex)
 
@@ -732,6 +733,7 @@ class STTDaemon:
                     on_settings=self._on_settings_click,
                     get_audio_level=self.get_audio_level,
                     get_audio_spectrum=self.get_audio_spectrum,
+                    config=self.config,
                 )
                 self._overlay.show()
             except Exception as e:
