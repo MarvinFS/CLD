@@ -7,7 +7,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
@@ -137,10 +137,32 @@ class Config:
 
         Uses LOCALAPPDATA on Windows to avoid OneDrive sync issues.
         Falls back to home directory on other platforms.
+
+        Security: CLD_CONFIG_DIR override is validated to prevent path traversal.
         """
         override = os.environ.get("CLD_CONFIG_DIR")
         if override:
-            return Path(override).expanduser()
+            override_path = Path(override).expanduser().resolve()
+            # Security: Validate the override path
+            if not override_path.is_absolute():
+                logger.warning("CLD_CONFIG_DIR must be absolute path, ignoring: %s", override)
+            else:
+                # Prevent use of system directories
+                system_root = os.environ.get("SYSTEMROOT", "C:\\Windows")
+                system_dirs = [Path(system_root)]
+                is_system_dir = False
+                for sd in system_dirs:
+                    try:
+                        override_path.relative_to(sd.resolve())
+                        is_system_dir = True
+                        break
+                    except ValueError:
+                        pass
+                if is_system_dir:
+                    logger.warning("CLD_CONFIG_DIR cannot be system directory, ignoring: %s", override)
+                else:
+                    override_path.mkdir(parents=True, exist_ok=True)
+                    return override_path
 
         local_app_data = os.environ.get("LOCALAPPDATA")
         if local_app_data:
@@ -152,74 +174,9 @@ class Config:
         return config_dir
 
     @classmethod
-    def _get_legacy_toml_path(cls) -> Optional[Path]:
-        """Get path to legacy TOML config if it exists."""
-        legacy_paths = [
-            Path.home() / ".claude" / "plugins" / "claude-stt" / "config.toml",
-        ]
-        plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT")
-        if plugin_root:
-            legacy_paths.insert(0, Path(plugin_root).expanduser() / "config.toml")
-
-        for path in legacy_paths:
-            if path.exists():
-                return path
-        return None
-
-    @classmethod
     def get_config_path(cls) -> Path:
         """Get the configuration file path."""
         return cls.get_config_dir() / "settings.json"
-
-    @classmethod
-    def _migrate_from_toml(cls, toml_path: Path) -> Optional["Config"]:
-        """Migrate configuration from legacy TOML format."""
-        try:
-            try:
-                import tomllib as tomli
-            except ImportError:
-                try:
-                    import tomli
-                except ImportError:
-                    logger.warning("Cannot migrate TOML config: tomli not installed")
-                    return None
-
-            with open(toml_path, "rb") as f:
-                data = tomli.load(f)
-
-            stt_config = data.get("claude-stt", {})
-
-            # Map old config to new structure
-            config = cls()
-
-            # Activation settings
-            old_hotkey = stt_config.get("hotkey", "ctrl+shift+space")
-            if "alt_gr" in old_hotkey.lower():
-                config.activation.key = "alt_gr"
-                config.activation.scancode = 541
-            else:
-                config.activation.key = old_hotkey
-
-            old_mode = stt_config.get("mode", "toggle")
-            config.activation.mode = "toggle" if old_mode == "toggle" else "push_to_talk"
-
-            # Engine settings (whisper only, moonshine deprecated)
-            config.engine.type = "whisper"
-            config.engine.whisper_model = stt_config.get("whisper_model", "medium")
-
-            # Recording settings
-            config.recording.max_seconds = stt_config.get("max_recording_seconds", 300)
-            config.recording.sample_rate = stt_config.get("sample_rate", 16000)
-
-            # Output settings
-            config.output.mode = stt_config.get("output_mode", "auto")
-            config.output.sound_effects = stt_config.get("sound_effects", True)
-
-            logger.info("Migrated config from %s", toml_path)
-            return config
-        except Exception:
-            logger.exception("Failed to migrate TOML config")
-            return None
 
     @classmethod
     def load(cls) -> "Config":
@@ -235,14 +192,6 @@ class Config:
             except Exception:
                 logger.exception("Failed to load config; using defaults")
                 return cls()
-
-        # Try to migrate from legacy TOML
-        legacy_path = cls._get_legacy_toml_path()
-        if legacy_path:
-            config = cls._migrate_from_toml(legacy_path)
-            if config:
-                config.save()
-                return config
 
         # Return defaults
         return cls()

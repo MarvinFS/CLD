@@ -102,6 +102,7 @@ class SettingsPopup:
         config: Config,
         on_settings_click: Optional[Callable[[], None]] = None,
         on_change: Optional[Callable[[Config], None]] = None,
+        on_hide_overlay: Optional[Callable[[], None]] = None,
     ):
         """Initialize the settings popup.
 
@@ -110,11 +111,13 @@ class SettingsPopup:
             config: Current configuration.
             on_settings_click: Callback when "All Settings" is clicked.
             on_change: Callback when a setting changes.
+            on_hide_overlay: Callback when "Hide Overlay" is clicked.
         """
         self._parent = parent
         self._config = config
         self._on_settings_click = on_settings_click
         self._on_change = on_change
+        self._on_hide_overlay = on_hide_overlay
         self._window: Optional[tk.Toplevel] = None
         self._toggles: dict[str, ToggleSwitch] = {}
 
@@ -139,7 +142,7 @@ class SettingsPopup:
         self._window.attributes("-topmost", True)
 
         # Calculate position (above parent, centered)
-        width, height = 300, 180
+        width, height = 300, 220
         px = self._parent.winfo_x()
         py = self._parent.winfo_y()
         pw = self._parent.winfo_width()
@@ -203,6 +206,12 @@ class SettingsPopup:
             "Sound Effects",
             self._config.output.sound_effects,
             self._on_sound_effects_change,
+        )
+        self._add_toggle(
+            settings_frame,
+            "Hide Overlay",
+            False,  # Always starts as "off" - it's an action, not a setting
+            self._on_hide_overlay_change,
         )
 
         # Divider
@@ -272,6 +281,12 @@ class SettingsPopup:
         """Handle sound effects toggle."""
         self._config.output.sound_effects = value
         self._save_and_notify()
+
+    def _on_hide_overlay_change(self, value: bool):
+        """Handle hide overlay toggle."""
+        if value and self._on_hide_overlay:
+            self.hide()  # Close popup first
+            self._on_hide_overlay()
 
     def _save_and_notify(self):
         """Save config and notify listener."""

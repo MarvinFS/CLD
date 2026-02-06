@@ -18,6 +18,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Windows power event constants
+WM_POWERBROADCAST = 0x218
+PBT_APMRESUMEAUTOMATIC = 0x12  # System woke automatically (e.g., scheduled task)
+PBT_APMRESUMESUSPEND = 0x07   # System woke from user action
+
 # Animation frame interval in milliseconds (approximately 30 FPS)
 ANIMATION_FRAME_MS = 33
 
@@ -75,6 +80,7 @@ class STTOverlay:
         get_audio_level: Optional[Callable[[], float]] = None,
         get_audio_spectrum: Optional[Callable[[], list[float]]] = None,
         config: Optional["Config"] = None,
+        on_power_resume: Optional[Callable] = None,
     ):
         """Initialize the overlay.
 
@@ -84,12 +90,14 @@ class STTOverlay:
             get_audio_level: Callback to get current audio level (0.0-1.0).
             get_audio_spectrum: Callback to get 16-band spectrum (list of 0.0-1.0).
             config: Configuration for position persistence.
+            on_power_resume: Callback when system resumes from sleep/hibernate.
         """
         self.on_close = on_close
         self.on_settings = on_settings
         self._get_audio_level = get_audio_level
         self._get_audio_spectrum = get_audio_spectrum
         self._config = config
+        self.on_power_resume = on_power_resume
 
         self._root: Optional[tk.Tk] = None
         self._canvas: Optional[tk.Canvas] = None
@@ -120,6 +128,10 @@ class STTOverlay:
         self._mode_switching = False  # Prevent concurrent mode switches
         self._last_gear_click = 0.0   # Debounce gear clicks
         self._last_position_save = 0.0  # Debounce position saves
+
+        # Power event handling (Windows)
+        self._wndproc = None  # Keep reference to prevent GC
+        self._original_wndproc = None
 
         # Separate position tracking for tiny and normal modes
         self._tiny_pos_x = 0
@@ -193,6 +205,85 @@ class STTOverlay:
                 )
         except Exception:
             pass
+
+    def _hook_power_events(self):
+        """Hook window procedure to receive WM_POWERBROADCAST events.
+
+        This allows detection of system resume from sleep/hibernate so we can
+        restart the tray icon which may disappear after sleep on some Windows
+        configurations.
+        """
+        if sys.platform != "win32":
+            return
+
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            # Get window handle
+            hwnd = ctypes.windll.user32.GetParent(self._root.winfo_id())
+            if not hwnd:
+                hwnd = ctypes.windll.user32.GetAncestor(self._root.winfo_id(), 2)  # GA_ROOT
+
+            if not hwnd:
+                logger.warning("Could not get HWND for power event hook")
+                return
+
+            # Define window procedure callback type (LRESULT is pointer-sized on 64-bit)
+            LRESULT = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+            WNDPROC = ctypes.WINFUNCTYPE(
+                LRESULT,            # Return type (LRESULT - pointer-sized)
+                wintypes.HWND,      # hwnd
+                wintypes.UINT,      # msg
+                wintypes.WPARAM,    # wparam
+                wintypes.LPARAM     # lparam
+            )
+
+            # Set up function signatures for 64-bit compatibility
+            GetWindowLongPtrW = ctypes.windll.user32.GetWindowLongPtrW
+            GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+            GetWindowLongPtrW.restype = ctypes.c_void_p
+
+            SetWindowLongPtrW = ctypes.windll.user32.SetWindowLongPtrW
+            SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            SetWindowLongPtrW.restype = ctypes.c_void_p
+
+            CallWindowProcW = ctypes.windll.user32.CallWindowProcW
+            CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT,
+                                        wintypes.WPARAM, wintypes.LPARAM]
+            CallWindowProcW.restype = LRESULT
+
+            # Get original window procedure
+            GWL_WNDPROC = -4
+            self._original_wndproc = GetWindowLongPtrW(hwnd, GWL_WNDPROC)
+
+            def new_wndproc(hwnd, msg, wparam, lparam):
+                # Check for power broadcast messages
+                if msg == WM_POWERBROADCAST:
+                    if wparam in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND):
+                        logger.info("Power resume detected (wparam=%s)", hex(wparam))
+                        if self.on_power_resume:
+                            # Schedule callback with 1 second delay to let Windows stabilize
+                            self._root.after(1000, self.on_power_resume)
+
+                # Call original window procedure
+                return CallWindowProcW(
+                    self._original_wndproc, hwnd, msg, wparam, lparam
+                )
+
+            # Keep reference to callback to prevent garbage collection
+            self._wndproc = WNDPROC(new_wndproc)
+
+            # Set new window procedure
+            SetWindowLongPtrW(
+                hwnd, GWL_WNDPROC,
+                ctypes.cast(self._wndproc, ctypes.c_void_p)
+            )
+
+            logger.debug("Power event hook installed successfully")
+
+        except Exception as e:
+            logger.warning("Failed to hook power events: %s", e)
 
     def _get_monitor_bounds(self) -> tuple[int, int, int, int]:
         """Get work area bounds of monitor containing the overlay.
@@ -309,6 +400,9 @@ class STTOverlay:
         self._root.update()
         self._apply_rounded_corners()
         self._enable_shadow()
+
+        # Hook power events to detect sleep/hibernate resume
+        self._hook_power_events()
 
         self._root.protocol("WM_DELETE_WINDOW", self._close)
 

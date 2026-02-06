@@ -1,6 +1,6 @@
 [project]
 name = "claudecli-dictate"
-version = "0.5.2"
+version = "0.6.0"
 description = "ClaudeCli-Dictate (CLD) - Windows GUI speech-to-text with pywhispercpp backend, overlay UI and system tray integration"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"

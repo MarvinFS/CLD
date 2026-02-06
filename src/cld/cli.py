@@ -86,15 +86,24 @@ def _early_debug_check():
             sys.stdout = open('CONOUT$', 'w', encoding='utf-8')
             sys.stderr = open('CONOUT$', 'w', encoding='utf-8')
 
-            # Install console control handler to prevent MKL crash on console close
-            # Intel MKL's Fortran runtime crashes with error 200 when console closes
-            # We intercept CTRL_CLOSE_EVENT (2), detach from console, and exit cleanly
+            # Install console control handler to prevent MKL crash on console close.
+            # Intel MKL's Fortran runtime crashes with "forrtl: error (200)" when the
+            # console window is closed. We intercept CTRL_CLOSE_EVENT (2), detach from
+            # the console, and call os._exit(0) to bypass normal cleanup.
+            #
+            # INTENTIONAL TRADE-OFF: os._exit() skips atexit handlers and __del__
+            # methods, but this is acceptable because:
+            # 1. The MKL crash is worse (hangs/crashes the process)
+            # 2. On console close, the user expects immediate termination anyway
+            # 3. Critical cleanup (audio stream, PID file) happens on SIGTERM instead
+            #
+            # See: https://github.com/numpy/numpy/issues related to MKL on Windows
             @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
             def console_handler(event):
                 if event == 2:  # CTRL_CLOSE_EVENT
                     # Detach from console FIRST to prevent MKL from seeing the close
                     kernel32.FreeConsole()
-                    # Now exit cleanly - MKL won't crash because we're detached
+                    # Exit immediately - MKL won't crash because we're detached
                     import os
                     os._exit(0)
                 return False  # Let other handlers process other events

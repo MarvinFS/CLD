@@ -82,8 +82,12 @@ def _read_claude_code_window() -> Optional[int]:
 def test_injection() -> bool:
     """Test if keyboard injection works.
 
-    This is a lightweight probe that presses/release a modifier key.
-    If it fails, we know injection doesn't work.
+    WARNING: This function performs a real Shift key press/release to probe
+    the system's keyboard injection capability. The operation is instantaneous
+    but may briefly affect modifier state if called during user typing.
+
+    Results are cached for 5 minutes (_injection_cache_ttl) to minimize
+    probe frequency and reduce interference with normal keyboard use.
 
     Returns:
         True if injection appears to work, False otherwise.

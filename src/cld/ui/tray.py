@@ -261,6 +261,17 @@ class TrayIcon:
             self._icon = None
         self._running = False
 
+    def restart(self):
+        """Restart the tray icon (stop and start fresh).
+
+        Used to recover the tray icon after sleep/hibernate when Windows
+        may fail to send WM_TASKBARCREATED to restore icons.
+        """
+        logger.info("Restarting tray icon")
+        if self._running:
+            self.stop()
+        return self.start()
+
     def set_state(self, state: str):
         """Update the tray icon state.
 

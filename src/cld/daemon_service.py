@@ -86,6 +86,8 @@ class STTDaemon:
         # Threading - use RLock to avoid deadlocks in nested callbacks
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
+        # Transcription state protected by dedicated lock for thread-safety
+        self._transcription_lock = threading.Lock()
         self._is_transcribing: bool = False
         self._logger = logging.getLogger(__name__)
 
@@ -131,14 +133,6 @@ class STTDaemon:
 
         return True
 
-    def _update_overlay(self, state: str) -> None:
-        """Update the GUI overlay state."""
-        if self._overlay:
-            try:
-                self._overlay.set_state(state)
-            except Exception:
-                self._logger.debug("Failed to update overlay state", exc_info=True)
-
     def get_audio_level(self) -> float:
         """Get current audio level (0.0-1.0) for visualization."""
         if self._recorder and self._recording:
@@ -151,40 +145,55 @@ class STTDaemon:
             return self._recorder.get_spectrum_bands()
         return [0.0] * 32
 
-    def _update_tray(self, state: str) -> None:
-        """Update the tray icon state."""
+    def _message_to_state(self, message: str, clear: bool = False) -> str:
+        """Map a status message to an overlay/tray state."""
+        if "Recording" in message:
+            return "recording"
+        elif "Transcribing" in message:
+            return "transcribing"
+        elif "Ready" in message or "No speech" in message or "Too short" in message:
+            return "ready"
+        elif "failed" in message:
+            return "error"
+        elif clear:
+            return "ready"
+        return "ready"
+
+    def _update_overlay_safe(self, state: str) -> None:
+        """Update overlay from main thread only."""
+        if self._overlay and self._overlay.has_window():
+            try:
+                self._overlay.set_state(state)
+            except Exception:
+                self._logger.debug("Failed to update overlay state", exc_info=True)
+
+    def _update_tray_safe(self, state: str) -> None:
+        """Update tray from main thread only."""
         if self._tray:
             try:
-                # Map internal states to tray states
                 tray_state_map = {
                     "ready": "ready",
                     "recording": "recording",
                     "transcribing": "processing",
-                    "error": "ready",  # Fall back to ready for errors
+                    "error": "ready",
                 }
                 self._tray.set_state(tray_state_map.get(state, "ready"))
             except Exception:
                 self._logger.debug("Failed to update tray state", exc_info=True)
 
-    def _update_state(self, state: str) -> None:
-        """Update overlay and tray state."""
-        self._update_overlay(state)
-        self._update_tray(state)
-
     def _print_status(self, message: str = "", clear: bool = False) -> None:
-        """Print status on a single line, overwriting previous."""
+        """Print status on a single line, overwriting previous.
+
+        Thread-safe: UI updates are queued for main thread execution.
+        """
         output = "" if clear else message
-        # Update UI state
-        if "Recording" in message:
-            self._update_state("recording")
-        elif "Transcribing" in message:
-            self._update_state("transcribing")
-        elif "Ready" in message or "No speech" in message or "Too short" in message:
-            self._update_state("ready")
-        elif "failed" in message:
-            self._update_state("error")
-        elif clear:
-            self._update_state("ready")
+        state = self._message_to_state(message, clear)
+
+        # Queue UI updates for main thread (thread-safe for tkinter)
+        if self._overlay:
+            self._main_thread_queue.put(lambda s=state: self._update_overlay_safe(s))
+        if self._tray:
+            self._main_thread_queue.put(lambda s=state: self._update_tray_safe(s))
 
         # Print to console (with encoding fallback)
         try:
@@ -195,10 +204,11 @@ class STTDaemon:
 
     def _on_recording_start(self):
         """Called when recording should start."""
-        if self._is_transcribing:
-            if self.config.sound_effects:
-                play_sound("warning")
-            return
+        with self._transcription_lock:
+            if self._is_transcribing:
+                if self.config.sound_effects:
+                    play_sound("warning")
+                return
 
         with self._lock:
             if self._recording:
@@ -244,12 +254,12 @@ class STTDaemon:
         min_samples = int(0.2 * self.config.sample_rate)  # 200ms at 16kHz = 3200 samples
 
         if audio is not None and len(audio) >= min_samples:
-            if self._is_transcribing:
-                if self.config.sound_effects:
-                    play_sound("warning")
-                return
-
-            self._is_transcribing = True
+            with self._transcription_lock:
+                if self._is_transcribing:
+                    if self.config.sound_effects:
+                        play_sound("warning")
+                    return
+                self._is_transcribing = True
             self._print_status("◐ Transcribing...")
             threading.Thread(
                 target=self._do_transcription,
@@ -301,12 +311,16 @@ class STTDaemon:
                 if self.config.sound_effects:
                     play_sound("warning")
         except (KeyboardInterrupt, SystemExit):
+            # Cleanup before re-raising to ensure state is consistent
+            with self._transcription_lock:
+                self._is_transcribing = False
             raise
         except Exception:
             self._logger.exception("Transcription failed")
             self._print_status(clear=True)
         finally:
-            self._is_transcribing = False
+            with self._transcription_lock:
+                self._is_transcribing = False
 
     def _check_max_recording_time(self):
         """Check if max recording time has been reached."""
@@ -340,6 +354,7 @@ class STTDaemon:
                 config=self.config,
                 on_settings_click=self._on_full_settings_click,
                 on_change=self._on_config_change,
+                on_hide_overlay=self._on_hide_overlay,
             )
             self._settings_popup.show()
 
@@ -389,6 +404,13 @@ class STTDaemon:
     def _on_full_settings_click(self):
         """Called when 'All Settings' is clicked in popup."""
         self._show_settings_dialog()
+
+    def _on_hide_overlay(self):
+        """Called when 'Hide Overlay' is clicked in popup."""
+        if self._overlay:
+            self._overlay.hide()
+            if self._tray:
+                self._tray.set_overlay_visible(False)
 
     def _on_tray_settings_click(self):
         """Called when 'Settings' is clicked in tray menu."""
@@ -621,6 +643,16 @@ class STTDaemon:
         if self._tray:
             self._tray.set_overlay_visible(False)
 
+    def _on_power_resume(self):
+        """Called when system resumes from sleep/hibernate.
+
+        Restarts the tray icon which may disappear after sleep on some Windows
+        configurations (known Windows bug where WM_TASKBARCREATED isn't sent).
+        """
+        self._logger.info("System resumed from sleep, restarting tray icon")
+        if self._tray:
+            self._tray.restart()
+
     def _show_model_setup_dialog(self, model_manager: ModelManager) -> bool:
         """Show model setup dialog.
 
@@ -734,6 +766,7 @@ class STTDaemon:
                     get_audio_level=self.get_audio_level,
                     get_audio_spectrum=self.get_audio_spectrum,
                     config=self.config,
+                    on_power_resume=self._on_power_resume,
                 )
                 self._overlay.show()
             except Exception as e:
@@ -778,10 +811,21 @@ class STTDaemon:
                         if root:
                             root.update()
                     except tk.TclError:
-                        # Window was destroyed
+                        # Window was destroyed - explicit cleanup before clearing reference
+                        self._logger.debug("Overlay window closed")
+                        if self._overlay:
+                            try:
+                                self._overlay.destroy()
+                            except Exception:
+                                pass
                         self._overlay = None
                     except Exception:
                         self._logger.debug("Overlay update failed", exc_info=True)
+                        if self._overlay:
+                            try:
+                                self._overlay.destroy()
+                            except Exception:
+                                pass
                         self._overlay = None
 
                 # Update settings dialog if active (has its own temp_root)
