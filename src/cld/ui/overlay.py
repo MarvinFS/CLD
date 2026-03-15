@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Windows power event constants
 WM_POWERBROADCAST = 0x218
+PBT_APMSUSPEND = 0x04          # System is about to suspend (sleep/hibernate)
 PBT_APMRESUMEAUTOMATIC = 0x12  # System woke automatically (e.g., scheduled task)
 PBT_APMRESUMESUSPEND = 0x07   # System woke from user action
 
@@ -81,6 +82,7 @@ class STTOverlay:
         get_audio_spectrum: Optional[Callable[[], list[float]]] = None,
         config: Optional["Config"] = None,
         on_power_resume: Optional[Callable] = None,
+        on_power_suspend: Optional[Callable] = None,
     ):
         """Initialize the overlay.
 
@@ -91,6 +93,7 @@ class STTOverlay:
             get_audio_spectrum: Callback to get 16-band spectrum (list of 0.0-1.0).
             config: Configuration for position persistence.
             on_power_resume: Callback when system resumes from sleep/hibernate.
+            on_power_suspend: Callback when system is about to suspend.
         """
         self.on_close = on_close
         self.on_settings = on_settings
@@ -98,6 +101,7 @@ class STTOverlay:
         self._get_audio_spectrum = get_audio_spectrum
         self._config = config
         self.on_power_resume = on_power_resume
+        self.on_power_suspend = on_power_suspend
 
         self._root: Optional[tk.Tk] = None
         self._canvas: Optional[tk.Canvas] = None
@@ -164,6 +168,40 @@ class STTOverlay:
         self._mic_idle = "#999999"  # Brighter gray mic (was #666666)
         self._mic_active = "#66ff66"  # Green when recording
         self._mic_busy = "#ffaa00"  # Amber when processing
+
+    def destroy(self):
+        """Destroy the overlay window and clean up all resources."""
+        self._running = False
+
+        # Cancel any pending animation
+        if self._animation_id and self._root:
+            try:
+                self._root.after_cancel(self._animation_id)
+            except Exception:
+                pass
+        self._animation_id = None
+
+        # Destroy the root window
+        if self._root:
+            try:
+                self._root.destroy()
+            except Exception:
+                pass
+
+        # Null out all widget references
+        self._root = None
+        self._canvas = None
+        self._drag_canvas = None
+        self._tiny_canvas = None
+        self._separator_canvas = None
+        self._timer_label = None
+        self._status_label = None
+        self._gear_btn = None
+        self._tiny_gear = None
+        self._main_container = None
+        self._mic_photo = None
+        self._wndproc = None
+        self._original_wndproc = None
 
     def _apply_rounded_corners(self, radius: int = 8):
         """Apply rounded corners to window using Win32 API."""
@@ -260,7 +298,20 @@ class STTOverlay:
             def new_wndproc(hwnd, msg, wparam, lparam):
                 # Check for power broadcast messages
                 if msg == WM_POWERBROADCAST:
-                    if wparam in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND):
+                    if wparam == PBT_APMSUSPEND:
+                        logger.info("Power suspend detected")
+                        if self.on_power_suspend:
+                            # Call DIRECTLY - not via after(). Windows waits for
+                            # the wndproc to return before actually suspending.
+                            # Using after() would schedule it for the next event
+                            # loop iteration, which never runs because the system
+                            # is already asleep. We must free Vulkan/GPU resources
+                            # NOW before handles become corrupted.
+                            try:
+                                self.on_power_suspend()
+                            except Exception:
+                                logger.error("Power suspend callback failed", exc_info=True)
+                    elif wparam in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND):
                         logger.info("Power resume detected (wparam=%s)", hex(wparam))
                         if self.on_power_resume:
                             # Schedule callback with 1 second delay to let Windows stabilize

@@ -169,6 +169,21 @@ class WhisperEngine:
     def is_available(self) -> bool:
         return _whisper_available
 
+    def unload_model(self) -> None:
+        """Unload the model and free GPU/Vulkan resources.
+
+        Must be called before system sleep to prevent native segfaults from
+        corrupted Vulkan handles on wake. Call load_model() to reload after.
+        """
+        with self._model_lock:
+            if self._model is not None:
+                self._logger.info("Unloading Whisper model (freeing GPU resources)")
+                try:
+                    del self._model
+                except Exception:
+                    pass
+                self._model = None
+
     def get_last_error(self) -> Optional[str]:
         """Get the last error message."""
         return self._last_error
@@ -235,12 +250,20 @@ class WhisperEngine:
                 # GPU backend is used automatically when available
                 # Vulkan: universal (NVIDIA/AMD/Intel), CUDA: NVIDIA-only fallback
                 # gpu_device: -1 = auto, 0 = first GPU (usually discrete), 1 = second GPU
-                self._model = _Model(
-                    str(model_path),
-                    n_threads=self.n_threads,
-                    use_gpu=self.use_gpu,
-                    gpu_device=self.gpu_device,
-                )
+                #
+                # use_gpu and gpu_device are named params on the custom Vulkan build
+                # of pywhispercpp (not passed via **params to _set_params).
+                # If stock PyPI version is installed (missing these params), fall back
+                # to n_threads only to avoid AttributeError + native segfault.
+                import inspect
+                model_sig = inspect.signature(_Model.__init__)
+                model_kwargs = {"n_threads": self.n_threads}
+                if "use_gpu" in model_sig.parameters:
+                    model_kwargs["use_gpu"] = self.use_gpu
+                    if "gpu_device" in model_sig.parameters:
+                        model_kwargs["gpu_device"] = self.gpu_device
+
+                self._model = _Model(str(model_path), **model_kwargs)
                 self._last_error = None
 
                 # Verify actual backend from system_info (not just config)

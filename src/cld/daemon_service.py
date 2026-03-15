@@ -94,6 +94,11 @@ class STTDaemon:
         # Queue for callbacks that must run in main thread (e.g., tkinter dialogs)
         self._main_thread_queue: queue.Queue[Callable[[], None]] = queue.Queue()
 
+        # Power state tracking
+        self._suspended = False
+        self._last_resume_time = 0.0  # Monotonic timestamp of last resume
+        self._overlay_recreate_attempts = 0
+
     def _init_components(self) -> bool:
         """Initialize all components.
 
@@ -204,6 +209,10 @@ class STTDaemon:
 
     def _on_recording_start(self):
         """Called when recording should start."""
+        if self._suspended:
+            self._logger.warning("Ignoring recording start during suspend/resume transition")
+            return
+
         with self._transcription_lock:
             if self._is_transcribing:
                 if self.config.sound_effects:
@@ -643,15 +652,98 @@ class STTDaemon:
         if self._tray:
             self._tray.set_overlay_visible(False)
 
+    def _on_power_suspend(self):
+        """Called when system is about to suspend (sleep/hibernate).
+
+        Cleanly shuts down audio and hotkey components that will break
+        across a sleep/wake cycle.
+        """
+        self._logger.info("System suspending, shutting down components")
+        self._suspended = True
+
+        # Cancel active recording if any
+        with self._lock:
+            if self._recording:
+                self._recording = False
+                if self._recorder:
+                    self._recorder.stop()
+
+        # Shut down audio stream cleanly before sleep
+        if self._recorder:
+            self._recorder.shutdown()
+
+        # Stop hotkey listener (pynput listener breaks across sleep)
+        if self._hotkey:
+            self._hotkey.stop()
+
+        # Unload whisper model to free Vulkan/GPU resources before sleep.
+        # GPU handles (Vulkan device, memory, command buffers) become
+        # corrupted across sleep/wake and cause native segfaults.
+        if self._engine and hasattr(self._engine, 'unload_model'):
+            self._engine.unload_model()
+
     def _on_power_resume(self):
         """Called when system resumes from sleep/hibernate.
 
-        Restarts the tray icon which may disappear after sleep on some Windows
-        configurations (known Windows bug where WM_TASKBARCREATED isn't sent).
+        Recovers all components that break across sleep/wake: audio stream,
+        hotkey listener, tray icon, and overlay state.
+
+        May be triggered by both WM_POWERBROADCAST and time-gap detection;
+        the debounce guard prevents redundant recovery within 10 seconds.
         """
-        self._logger.info("System resumed from sleep, restarting tray icon")
+        now = time.monotonic()
+        if now - self._last_resume_time < 10.0:
+            self._logger.debug("Ignoring duplicate power resume (%.1fs since last)", now - self._last_resume_time)
+            return
+        self._last_resume_time = now
+
+        self._logger.info("System resumed from sleep, recovering components")
+        self._suspended = False
+
+        # If suspend callback was missed (common - Windows suspends before
+        # tkinter processes the after() callback), do the suspend cleanup now.
+        # The model must be unloaded before any access to avoid Vulkan segfaults.
+        if self._engine and hasattr(self._engine, 'unload_model'):
+            self._engine.unload_model()
+
+        # 1. Audio recovery: shutdown old handles, wait for PortAudio, re-prime
+        if self._recorder:
+            self._recorder.shutdown()
+            time.sleep(0.5)  # Let PortAudio release device handles
+            if not self._recorder.prime():
+                self._logger.warning("Failed to re-prime audio after resume; will retry on next recording")
+
+        # 2. Hotkey recovery: restart pynput listener
+        if self._hotkey:
+            self._hotkey.stop()
+            if not self._hotkey.start():
+                self._logger.warning("Failed to restart hotkey, recreating listener")
+                try:
+                    self._hotkey = HotkeyListener(
+                        hotkey=self.config.hotkey,
+                        on_start=self._on_recording_start,
+                        on_stop=self._on_recording_stop,
+                        mode=self.config.mode,
+                    )
+                    self._hotkey.start()
+                except Exception:
+                    self._logger.error("Failed to recreate hotkey listener", exc_info=True)
+
+        # 3. Reload whisper model (Vulkan GPU context was freed on suspend)
+        if self._engine and hasattr(self._engine, 'load_model'):
+            self._logger.info("Reloading STT model after resume")
+            if not self._engine.load_model():
+                self._logger.error("Failed to reload STT model after resume")
+
+        # 4. Tray recovery (existing logic)
         if self._tray:
             self._tray.restart()
+
+        # 5. Reset overlay recreation counter
+        self._overlay_recreate_attempts = 0
+
+        # 6. Update status
+        self._print_status("Ready")
 
     def _show_model_setup_dialog(self, model_manager: ModelManager) -> bool:
         """Show model setup dialog.
@@ -683,6 +775,38 @@ class STTDaemon:
             print(f"  {name} ({info['size']}): {url}", flush=True)
         print(f"\nModels are cached in: {model_manager._models_dir}", flush=True)
         print("=" * 60 + "\n", flush=True)
+
+    def _try_recreate_overlay(self):
+        """Attempt to recreate the overlay after it was destroyed.
+
+        Limited to 3 attempts to avoid infinite recreation loops.
+        """
+        if not self._enable_overlay:
+            return
+        if self._overlay_recreate_attempts >= 3:
+            self._logger.warning("Overlay recreation limit reached, continuing headless")
+            return
+
+        self._overlay_recreate_attempts += 1
+        self._logger.info("Attempting overlay recreation (attempt %d/3)", self._overlay_recreate_attempts)
+        time.sleep(1)
+
+        try:
+            self._overlay = STTOverlay(
+                on_close=self._on_overlay_close,
+                on_settings=self._on_settings_click,
+                get_audio_level=self.get_audio_level,
+                get_audio_spectrum=self.get_audio_spectrum,
+                config=self.config,
+                on_power_resume=self._on_power_resume,
+                on_power_suspend=self._on_power_suspend,
+            )
+            self._overlay.show()
+            self._overlay_recreate_attempts = 0
+            self._logger.info("Overlay recreated successfully")
+        except Exception:
+            self._logger.warning("Overlay recreation failed", exc_info=True)
+            self._overlay = None
 
     def run(self):
         """Run the daemon main loop."""
@@ -767,6 +891,7 @@ class STTDaemon:
                     get_audio_spectrum=self.get_audio_spectrum,
                     config=self.config,
                     on_power_resume=self._on_power_resume,
+                    on_power_suspend=self._on_power_suspend,
                 )
                 self._overlay.show()
             except Exception as e:
@@ -787,8 +912,18 @@ class STTDaemon:
             self._logger.debug("Signal handlers unavailable", exc_info=True)
 
         # Main loop
+        last_loop_time = time.monotonic()
         try:
             while self._running:
+                # Time-gap based sleep detection (fallback when overlay can't
+                # receive WM_POWERBROADCAST, e.g. after overlay destruction)
+                now = time.monotonic()
+                gap = now - last_loop_time
+                last_loop_time = now
+                if gap > 5.0 and not self._suspended:
+                    self._logger.info("Detected time gap of %.1fs, likely sleep/wake - triggering recovery", gap)
+                    self._on_power_resume()
+
                 self._check_max_recording_time()
 
                 # Process main thread callbacks (e.g., settings dialogs from tray)
@@ -811,14 +946,15 @@ class STTDaemon:
                         if root:
                             root.update()
                     except tk.TclError:
-                        # Window was destroyed - explicit cleanup before clearing reference
-                        self._logger.debug("Overlay window closed")
+                        # Window was destroyed - cleanup and attempt recreation
+                        self._logger.debug("Overlay window closed (TclError)")
                         if self._overlay:
                             try:
                                 self._overlay.destroy()
                             except Exception:
                                 pass
                         self._overlay = None
+                        self._try_recreate_overlay()
                     except Exception:
                         self._logger.debug("Overlay update failed", exc_info=True)
                         if self._overlay:
@@ -827,6 +963,7 @@ class STTDaemon:
                             except Exception:
                                 pass
                         self._overlay = None
+                        self._try_recreate_overlay()
 
                 # Update settings dialog if active (has its own temp_root)
                 if self._settings_dialog and self._settings_dialog.is_visible():

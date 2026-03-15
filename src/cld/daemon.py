@@ -96,16 +96,70 @@ def is_daemon_running() -> bool:
     return last_error == ERROR_ALREADY_EXISTS
 
 
+def _get_pid_file_path() -> Path:
+    """Get the path to the daemon PID file."""
+    localappdata = os.environ.get("LOCALAPPDATA", "")
+    if localappdata:
+        return Path(localappdata) / "CLD" / "daemon.pid"
+    return Path.home() / ".cld" / "daemon.pid"
+
+
+def _write_pid_file() -> None:
+    """Write current process PID to the PID file."""
+    pid_path = _get_pid_file_path()
+    try:
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(str(os.getpid()))
+    except Exception:
+        logging.getLogger(__name__).debug("Failed to write PID file", exc_info=True)
+
+
+def _read_pid_file() -> Optional[int]:
+    """Read PID from file and validate the process exists.
+
+    Returns the PID if the file exists and the process is alive, else None.
+    """
+    pid_path = _get_pid_file_path()
+    try:
+        if not pid_path.exists():
+            return None
+        pid = int(pid_path.read_text().strip())
+        # Validate process exists (signal 0 = check existence)
+        os.kill(pid, 0)
+        return pid
+    except (ValueError, OSError):
+        return None
+    except Exception:
+        return None
+
+
+def _remove_pid_file() -> None:
+    """Delete the PID file."""
+    try:
+        pid_path = _get_pid_file_path()
+        if pid_path.exists():
+            pid_path.unlink()
+    except Exception:
+        logging.getLogger(__name__).debug("Failed to remove PID file", exc_info=True)
+
+
 def _find_cld_processes() -> list[int]:
-    """Find all CLD daemon processes by command line."""
+    """Find all CLD daemon processes by command line.
+
+    Searches for both Python-based (running from source) and frozen exe processes.
+    Falls back to PID file when PowerShell finds nothing.
+    """
     pids = []
     try:
-        # Use PowerShell to find python processes running cld.daemon
+        # Use PowerShell to find CLD processes - both source and frozen exe
         result = subprocess.run(
             [
                 "powershell", "-NoProfile", "-Command",
                 "Get-CimInstance Win32_Process | "
-                "Where-Object { $_.CommandLine -like '*cld.daemon*' -and $_.CommandLine -like '*python*' } | "
+                "Where-Object { "
+                "($_.CommandLine -like '*cld.daemon*' -and $_.CommandLine -like '*python*') -or "
+                "($_.Name -eq 'CLD.exe' -and $_.CommandLine -like '*daemon*')"
+                " } | "
                 "Select-Object -ExpandProperty ProcessId"
             ],
             capture_output=True,
@@ -121,7 +175,13 @@ def _find_cld_processes() -> list[int]:
                     if pid != os.getpid():
                         pids.append(pid)
     except Exception:
-        logging.getLogger(__name__).debug("Failed to find CLD processes", exc_info=True)
+        logging.getLogger(__name__).debug("Failed to find CLD processes via PowerShell", exc_info=True)
+
+    # Fallback: check PID file if PowerShell found nothing
+    if not pids:
+        pid = _read_pid_file()
+        if pid and pid != os.getpid():
+            pids.append(pid)
 
     return pids
 
@@ -200,8 +260,45 @@ def start_daemon(background: bool = False, enable_overlay: bool = False):
         enable_overlay: If True, show GUI overlay.
     """
     if is_daemon_running():
-        logging.getLogger(__name__).info("Daemon is already running.")
-        return
+        logger = logging.getLogger(__name__)
+        # Check if the existing instance might be a zombie (e.g., survived sleep/wake
+        # but is unresponsive). If PID file is stale (>30s old) and processes exist,
+        # kill them and retry.
+        pid_path = _get_pid_file_path()
+        try:
+            if pid_path.exists():
+                age = time.time() - pid_path.stat().st_mtime
+                if age > 30:
+                    pids = _find_cld_processes()
+                    if pids:
+                        logger.info("Found potentially zombie daemon (PID file age: %.0fs), killing processes %s", age, pids)
+                        for pid in pids:
+                            try:
+                                subprocess.run(
+                                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                                    capture_output=True, timeout=5,
+                                )
+                            except Exception:
+                                pass
+                        _remove_pid_file()
+                        time.sleep(1)
+                        if not is_daemon_running():
+                            logger.info("Zombie cleaned up, proceeding with startup")
+                        else:
+                            logger.info("Daemon is still running after cleanup attempt.")
+                            return
+                    else:
+                        logger.info("Daemon is already running.")
+                        return
+                else:
+                    logger.info("Daemon is already running.")
+                    return
+            else:
+                logger.info("Daemon is already running.")
+                return
+        except Exception:
+            logger.info("Daemon is already running.")
+            return
 
     if background:
         if _spawn_background(enable_overlay=enable_overlay):
@@ -215,10 +312,12 @@ def start_daemon(background: bool = False, enable_overlay: bool = False):
         logging.getLogger(__name__).info("Daemon is already running.")
         return
 
+    _write_pid_file()
     try:
         daemon = STTDaemon(enable_overlay=enable_overlay)
         daemon.run()
     finally:
+        _remove_pid_file()
         _release_mutex()
 
 
@@ -271,6 +370,18 @@ def stop_daemon():
         except Exception:
             pass
 
+    # Last resort: kill by image name (catches frozen exe processes)
+    if is_daemon_running():
+        try:
+            subprocess.run(
+                ["taskkill", "/IM", "CLD.exe", "/F"],
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception:
+            pass
+
+    _remove_pid_file()
     logger.info("Daemon stopped.")
 
 
