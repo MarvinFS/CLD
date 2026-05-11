@@ -3,6 +3,7 @@
 import ctypes
 import logging
 import platform
+import queue
 import threading
 import tkinter as tk
 from tkinter import ttk
@@ -85,6 +86,14 @@ class ModelSetupDialog:
         self._result: Optional[bool] = None
         self._hw_info: Optional[dict] = None
 
+        # Cross-thread UI hand-off. Background download threads enqueue
+        # callbacks here; a main-thread tick (started in `show()`) drains
+        # the queue and runs them under the Tk thread. This replaces the
+        # previous pattern of calling `self._window.after()` directly from
+        # the worker, which is documented as not reliably thread-safe.
+        self._ui_queue: "queue.Queue" = queue.Queue()
+        self._ui_pump_id: Optional[str] = None
+
         # Colors (dark theme)
         self._bg = "#1a1a1a"
         self._surface = "#242424"
@@ -113,6 +122,27 @@ class ModelSetupDialog:
         self._url_label: Optional[tk.Label] = None
         self._is_downloading: bool = False
 
+    def _post_to_ui(self, callback) -> None:
+        """Thread-safe: schedule ``callback`` for the Tk main thread."""
+        self._ui_queue.put(callback)
+
+    def _drain_ui_queue(self) -> None:
+        """Main-thread Tk tick. Runs queued callbacks then re-arms itself."""
+        while True:
+            try:
+                cb = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                cb()
+            except Exception:
+                logger.exception("Queued UI callback failed")
+        if self._window is not None:
+            try:
+                self._ui_pump_id = self._window.after(30, self._drain_ui_queue)
+            except tk.TclError:
+                self._ui_pump_id = None
+
     def show(self) -> bool:
         """Show the dialog and block until resolved."""
         # Detect hardware first
@@ -131,6 +161,10 @@ class ModelSetupDialog:
         self._window.configure(bg=self._bg)
         self._window.resizable(False, False)
         self._window.attributes("-toolwindow", True)
+
+        # Start the main-thread tick that drains _ui_queue (callbacks
+        # posted from the background download thread).
+        self._ui_pump_id = self._window.after(30, self._drain_ui_queue)
 
         # Size and center
         width, height = 540, 560
@@ -515,11 +549,12 @@ class ModelSetupDialog:
                     pct = (downloaded / total) * 100
                     text = f"{downloaded / (1024*1024):.1f} / {total / (1024*1024):.1f} MB ({pct:.0f}%) - {speed:.1f} MB/s"
                 else:
+                    pct = -1
                     text = f"{downloaded / (1024*1024):.1f} MB downloaded"
-                self._window.after(0, lambda: self._update_progress(pct if total > 0 else -1, text))
+                self._post_to_ui(lambda p=pct, t=text: self._update_progress(p, t))
 
             success, error = self._manager.download_model(self._model_name, progress_callback)
-            self._window.after(0, lambda: self._on_download_complete(success, error))
+            self._post_to_ui(lambda s=success, e=error: self._on_download_complete(s, e))
 
         self._download_thread = threading.Thread(target=download, daemon=True)
         self._download_thread.start()
@@ -812,6 +847,10 @@ class ModelUpdateDialog:
         self._result: Optional[bool] = None
         self._download_thread: Optional[threading.Thread] = None
 
+        # Cross-thread UI hand-off (see ModelSetupDialog for rationale).
+        self._ui_queue: "queue.Queue" = queue.Queue()
+        self._ui_pump_id: Optional[str] = None
+
         # Colors (dark theme)
         self._bg = "#1a1a1a"
         self._surface = "#242424"
@@ -831,6 +870,27 @@ class ModelUpdateDialog:
         self._skip_btn: Optional[tk.Button] = None
         self._is_downloading: bool = False
 
+    def _post_to_ui(self, callback) -> None:
+        """Thread-safe: schedule ``callback`` for the Tk main thread."""
+        self._ui_queue.put(callback)
+
+    def _drain_ui_queue(self) -> None:
+        """Main-thread Tk tick. Runs queued callbacks then re-arms itself."""
+        while True:
+            try:
+                cb = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                cb()
+            except Exception:
+                logger.exception("Queued UI callback failed")
+        if self._window is not None:
+            try:
+                self._ui_pump_id = self._window.after(30, self._drain_ui_queue)
+            except tk.TclError:
+                self._ui_pump_id = None
+
     def show(self) -> bool:
         """Show the update prompt dialog.
 
@@ -843,6 +903,9 @@ class ModelUpdateDialog:
         self._window.configure(bg=self._bg)
         self._window.resizable(False, False)
         self._window.attributes("-toolwindow", True)
+
+        # Start the main-thread tick that drains _ui_queue.
+        self._ui_pump_id = self._window.after(30, self._drain_ui_queue)
 
         # Size and center
         width, height = 450, 320
@@ -1007,11 +1070,12 @@ class ModelUpdateDialog:
                     pct = (downloaded / total) * 100
                     text = f"{downloaded / (1024*1024):.1f} / {total / (1024*1024):.1f} MB ({pct:.0f}%)"
                 else:
+                    pct = -1
                     text = f"{downloaded / (1024*1024):.1f} MB downloaded"
-                self._window.after(0, lambda: self._update_progress(pct if total > 0 else -1, text))
+                self._post_to_ui(lambda p=pct, t=text: self._update_progress(p, t))
 
             success, error = self._manager.update_model(self._model_name, progress_callback)
-            self._window.after(0, lambda: self._on_download_complete(success, error))
+            self._post_to_ui(lambda s=success, e=error: self._on_download_complete(s, e))
 
         self._download_thread = threading.Thread(target=download, daemon=True)
         self._download_thread.start()

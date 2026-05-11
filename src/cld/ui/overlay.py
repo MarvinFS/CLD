@@ -170,10 +170,15 @@ class STTOverlay:
         self._mic_busy = "#ffaa00"  # Amber when processing
 
     def destroy(self):
-        """Destroy the overlay window and clean up all resources."""
+        """Destroy the overlay window and clean up all resources.
+
+        Restores the original window procedure BEFORE the HWND goes away
+        so Windows never dispatches WM_POWERBROADCAST (or anything else)
+        into our soon-to-be-collected Python callback. Without this,
+        late-arriving messages could call into freed ctypes trampolines.
+        """
         self._running = False
 
-        # Cancel any pending animation
         if self._animation_id and self._root:
             try:
                 self._root.after_cancel(self._animation_id)
@@ -181,14 +186,36 @@ class STTOverlay:
                 pass
         self._animation_id = None
 
-        # Destroy the root window
+        # Save the final drag position once, instead of relying on the
+        # debounced in-flight save (which is intentionally throttled to
+        # 1Hz to avoid disk churn during continuous drags).
+        self._save_overlay_position_now()
+
+        # Unhook the subclassed wndproc before destroying the window.
+        if self._root and self._original_wndproc and sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes import wintypes
+                GWL_WNDPROC = -4
+                SetWindowLongPtrW = ctypes.windll.user32.SetWindowLongPtrW
+                SetWindowLongPtrW.argtypes = [
+                    wintypes.HWND, ctypes.c_int, ctypes.c_void_p,
+                ]
+                SetWindowLongPtrW.restype = ctypes.c_void_p
+                hwnd = ctypes.windll.user32.GetParent(self._root.winfo_id())
+                if hwnd:
+                    SetWindowLongPtrW(
+                        hwnd, GWL_WNDPROC, ctypes.c_void_p(self._original_wndproc)
+                    )
+            except Exception:
+                logger.debug("Failed to restore original wndproc", exc_info=True)
+
         if self._root:
             try:
                 self._root.destroy()
             except Exception:
                 pass
 
-        # Null out all widget references
         self._root = None
         self._canvas = None
         self._drag_canvas = None
@@ -202,6 +229,18 @@ class STTOverlay:
         self._mic_photo = None
         self._wndproc = None
         self._original_wndproc = None
+
+    def _save_overlay_position_now(self) -> None:
+        """Persist current overlay position once. Safe to call repeatedly."""
+        if not self._config or not self._root:
+            return
+        try:
+            x = self._root.winfo_x()
+            y = self._root.winfo_y()
+            self._config.ui.overlay_position = [x, y]
+            self._config.save()
+        except Exception:
+            logger.debug("Failed to save overlay position on destroy", exc_info=True)
 
     def _apply_rounded_corners(self, radius: int = 8):
         """Apply rounded corners to window using Win32 API."""
@@ -471,6 +510,7 @@ class STTOverlay:
         # Make window draggable
         self._main_container.bind("<Button-1>", self._start_drag)
         self._main_container.bind("<B1-Motion>", self._on_drag)
+        self._main_container.bind("<ButtonRelease-1>", self._on_drag_release)
 
         # Right-click to close
         self._main_container.bind("<Button-3>", lambda e: self._close())
@@ -490,6 +530,7 @@ class STTOverlay:
         self._timer_label.pack(side=tk.LEFT)
         self._timer_label.bind("<Button-1>", self._start_drag)
         self._timer_label.bind("<B1-Motion>", self._on_drag)
+        self._timer_label.bind("<ButtonRelease-1>", self._on_drag_release)
 
         # Gear button on right (settings)
         self._gear_btn = tk.Label(
@@ -530,6 +571,7 @@ class STTOverlay:
         self._status_label.pack(side=tk.RIGHT, padx=(0, 12))
         self._status_label.bind("<Button-1>", self._start_drag)
         self._status_label.bind("<B1-Motion>", self._on_drag)
+        self._status_label.bind("<ButtonRelease-1>", self._on_drag_release)
 
         # Waveform canvas
         self._canvas = tk.Canvas(
@@ -542,6 +584,7 @@ class STTOverlay:
         self._canvas.pack(pady=(0, 8))
         self._canvas.bind("<Button-1>", self._start_drag)
         self._canvas.bind("<B1-Motion>", self._on_drag)
+        self._canvas.bind("<ButtonRelease-1>", self._on_drag_release)
 
         # Draw initial idle bars
         self._draw_waveform(idle=True)
@@ -619,6 +662,7 @@ class STTOverlay:
         # Drag bindings on menu dots
         self._drag_canvas.bind("<Button-1>", self._start_drag)
         self._drag_canvas.bind("<B1-Motion>", self._on_drag)
+        self._drag_canvas.bind("<ButtonRelease-1>", self._on_drag_release)
 
         # Right-click to close on main container
         self._main_container.bind("<Button-3>", lambda e: self._close())
@@ -938,20 +982,23 @@ class STTOverlay:
         self._drag_y = event.y
 
     def _on_drag(self, event):
-        """Handle window dragging and save position."""
+        """Move the window during drag; persistence happens on release.
+
+        Previously this saved config every 1 s during the drag, which burned
+        disk writes and raced with the settings dialog's own ``save()``.
+        We now only update geometry here; ``_on_drag_release`` does a single
+        save at the end. A safety net in ``destroy()`` also flushes the
+        last-known position in case the user never released the button (e.g.
+        process killed mid-drag).
+        """
         x = self._root.winfo_x() + event.x - self._drag_x
         y = self._root.winfo_y() + event.y - self._drag_y
         self._root.geometry(f"+{x}+{y}")
+        self._last_position_save = time.time()  # used by release to debounce no-op clicks
 
-        # Save position to config (debounced - max once per second)
-        now = time.time()
-        if self._config and now - self._last_position_save > 1.0:
-            self._last_position_save = now
-            self._config.ui.overlay_position = [x, y]
-            try:
-                self._config.save()
-            except Exception:
-                pass
+    def _on_drag_release(self, _event=None):
+        """Persist overlay position on mouse-up."""
+        self._save_overlay_position_now()
 
     def _draw_waveform(self, idle: bool = False):
         """Draw audio waveform bars with bi-directional expansion from center.

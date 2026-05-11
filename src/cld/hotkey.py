@@ -215,9 +215,48 @@ class HotkeyListener:
                 self._logger.exception("Hotkey callback failed: %s", label)
 
     def _enqueue_event(self, label: str, callback: Optional[Callable[[], None]]) -> None:
+        """Enqueue a hotkey event.
+
+        Stop events MUST never be dropped: losing a "stop" leaves the
+        recorder running until ``max_recording_seconds`` elapses, which
+        users experience as their audio never being transcribed and as the
+        microphone staying live in the background. For stop events we
+        block briefly to make room (the worker drains in milliseconds);
+        for non-critical events (start, etc.) we still log-and-drop rather
+        than block the keyboard hook callback.
+        """
         self._ensure_worker()
+        item = (label, callback)
+        if label == "stop":
+            try:
+                # Bounded blocking put - we'd rather hold the keyboard hook
+                # for a few milliseconds than miss a stop.
+                self._event_queue.put(item, timeout=1.0)
+                return
+            except queue.Full:
+                self._logger.error(
+                    "Hotkey event queue still full after 1s; forcing stop by clearing oldest"
+                )
+                # Last resort: discard a pending non-stop event to make
+                # room. Iterate at most queue-maxsize times so this can't
+                # spin if every entry is also a stop.
+                drained = 0
+                while drained < self._event_queue.maxsize:
+                    try:
+                        self._event_queue.get_nowait()
+                        drained += 1
+                    except queue.Empty:
+                        break
+                    try:
+                        self._event_queue.put_nowait(item)
+                        return
+                    except queue.Full:
+                        continue
+                self._logger.error("Failed to enqueue stop event; recording may stick")
+                return
+
         try:
-            self._event_queue.put_nowait((label, callback))
+            self._event_queue.put_nowait(item)
         except queue.Full:
             self._logger.warning("Dropping hotkey event '%s'; queue full", label)
 

@@ -20,14 +20,7 @@ from cld.hotkey import HotkeyListener
 from cld.recorder import AudioRecorder, get_sounddevice_import_error
 
 
-def _is_frozen() -> bool:
-    """Check if running as frozen exe (PyInstaller or Nuitka)."""
-    # PyInstaller sets sys.frozen
-    if getattr(sys, 'frozen', False):
-        return True
-    # Nuitka sets __compiled__ on __main__
-    main_mod = sys.modules.get('__main__', object())
-    return '__compiled__' in dir(main_mod)
+from cld.runtime import is_frozen as _is_frozen  # noqa: E402
 
 
 def _get_plugin_root() -> Path:
@@ -200,7 +193,7 @@ def _ensure_engine_ready(config: Config, skip_model_download: bool) -> bool:
         return False
 
     if not engine.is_available():
-        if config.engine == "whisper":
+        if config.engine.type == "whisper":
             _print_error(
                 "Whisper dependencies missing. Run: "
                 f"{_dependency_hint('whisper')}"
@@ -345,7 +338,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--log-level",
         default=os.environ.get("CLD_LOG_LEVEL", "INFO"),
-        help="Logging level (default: CLAUDE_STT_LOG_LEVEL or INFO).",
+        help="Logging level (default: CLD_LOG_LEVEL or INFO).",
     )
     return parser
 

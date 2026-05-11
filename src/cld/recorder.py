@@ -1,5 +1,6 @@
 """Audio recording using sounddevice."""
 
+import enum
 import logging
 import math
 import threading
@@ -8,6 +9,21 @@ from dataclasses import dataclass
 from typing import Deque, Optional
 
 import numpy as np
+
+
+class _RecorderState(enum.Enum):
+    """Lifecycle states for the audio recorder.
+
+    Every state transition is performed under ``AudioRecorder._lock`` so
+    the sounddevice callback and the daemon's start/stop/shutdown calls
+    have a single source of truth instead of poking ``_recording`` and
+    ``_primed`` independently.
+    """
+
+    STOPPED = "stopped"
+    PRIMED = "primed"
+    RECORDING = "recording"
+    SHUTTING_DOWN = "shutting_down"
 
 # Thread-safe audio level and spectrum for visualization
 _current_level: float = 0.0
@@ -59,11 +75,14 @@ class AudioRecorder:
             config: Recording configuration.
         """
         self.config = config or RecorderConfig()
-        self._recording = False
-        self._primed = False  # Whether pre-roll stream is running
+        self._state: _RecorderState = _RecorderState.STOPPED
         self._stream: Optional["sd.InputStream"] = None
         self._recorded_chunks: Deque[np.ndarray] = deque()
         self._max_chunks = self._compute_max_chunks()
+        # All lifecycle (state + stream) transitions and any access to
+        # ``_recording`` and ``_primed`` happen under this lock. The
+        # sounddevice callback also reads state under this lock so it
+        # never observes a half-torn-down stream.
         self._lock = threading.Lock()
         self._logger = logging.getLogger(__name__)
 
@@ -109,6 +128,34 @@ class AudioRecorder:
             ]
         except Exception:
             return []
+
+    @property
+    def _recording(self) -> bool:
+        """Backwards-compat alias - prefer ``self._state == RECORDING``."""
+        return self._state is _RecorderState.RECORDING
+
+    @_recording.setter
+    def _recording(self, value: bool) -> None:
+        # Legacy callers used to flip this directly. Route through the
+        # state machine so the lock + transitions stay consistent.
+        with self._lock:
+            if value and self._state in (_RecorderState.STOPPED, _RecorderState.PRIMED):
+                self._state = _RecorderState.RECORDING
+            elif not value and self._state is _RecorderState.RECORDING:
+                self._state = _RecorderState.PRIMED if self._stream is not None else _RecorderState.STOPPED
+
+    @property
+    def _primed(self) -> bool:
+        """Backwards-compat alias - True when the stream is alive."""
+        return self._state in (_RecorderState.PRIMED, _RecorderState.RECORDING)
+
+    @_primed.setter
+    def _primed(self, value: bool) -> None:
+        with self._lock:
+            if value and self._state is _RecorderState.STOPPED:
+                self._state = _RecorderState.PRIMED
+            elif not value and self._state in (_RecorderState.PRIMED, _RecorderState.RECORDING):
+                self._state = _RecorderState.STOPPED
 
     def _audio_callback(self, indata, frames, time_info, status):
         """Audio callback that handles both pre-roll and recording."""
@@ -180,24 +227,29 @@ class AudioRecorder:
         if sd is None:
             return False
 
-        if self._primed:
-            return True
-
-        try:
-            self._stream = sd.InputStream(
-                samplerate=self.config.sample_rate,
-                channels=self.config.channels,
-                dtype=self.config.dtype,
-                blocksize=self.config.blocksize,
-                callback=self._audio_callback,
-            )
-            self._stream.start()
-            self._primed = True
-            self._logger.info("Audio stream primed with %dms pre-roll", self.config.preroll_ms)
-            return True
-        except Exception:
-            self._logger.exception("Failed to prime audio stream")
-            return False
+        with self._lock:
+            if self._state in (_RecorderState.PRIMED, _RecorderState.RECORDING):
+                return True
+            if self._state is _RecorderState.SHUTTING_DOWN:
+                self._logger.debug("Refusing prime() during shutdown")
+                return False
+            try:
+                self._stream = sd.InputStream(
+                    samplerate=self.config.sample_rate,
+                    channels=self.config.channels,
+                    dtype=self.config.dtype,
+                    blocksize=self.config.blocksize,
+                    callback=self._audio_callback,
+                )
+                self._stream.start()
+                self._state = _RecorderState.PRIMED
+                self._logger.info("Audio stream primed with %dms pre-roll", self.config.preroll_ms)
+                return True
+            except Exception:
+                self._logger.exception("Failed to prime audio stream")
+                self._stream = None
+                self._state = _RecorderState.STOPPED
+                return False
 
     def start(self) -> bool:
         """Start recording audio.
@@ -212,97 +264,112 @@ class AudioRecorder:
         if sd is None:
             return False
 
-        if self._recording:
-            return True
-
         try:
-            # Initialize recording buffer
-            if self._max_chunks:
-                self._recorded_chunks = deque(maxlen=self._max_chunks)
-            else:
-                self._recorded_chunks = deque()
-
             with self._lock:
-                # Copy pre-roll buffer to beginning of recording
+                if self._state is _RecorderState.RECORDING:
+                    return True
+                if self._state is _RecorderState.SHUTTING_DOWN:
+                    self._logger.debug("Refusing start() during shutdown")
+                    return False
+
+                if self._max_chunks:
+                    self._recorded_chunks = deque(maxlen=self._max_chunks)
+                else:
+                    self._recorded_chunks = deque()
+
                 if self._preroll_buffer:
                     self._logger.debug("Including %d pre-roll chunks", len(self._preroll_buffer))
                     for chunk in self._preroll_buffer:
                         self._recorded_chunks.append(chunk)
                     self._preroll_buffer.clear()
 
-                self._recording = True
+                # Open the stream if not primed. Done inside the lock so
+                # shutdown() cannot close it concurrently.
+                if self._state is _RecorderState.STOPPED:
+                    self._stream = sd.InputStream(
+                        samplerate=self.config.sample_rate,
+                        channels=self.config.channels,
+                        dtype=self.config.dtype,
+                        blocksize=self.config.blocksize,
+                        callback=self._audio_callback,
+                    )
+                    self._stream.start()
 
-            # If not primed, start stream now (fallback for direct start())
-            if not self._primed:
-                self._stream = sd.InputStream(
-                    samplerate=self.config.sample_rate,
-                    channels=self.config.channels,
-                    dtype=self.config.dtype,
-                    blocksize=self.config.blocksize,
-                    callback=self._audio_callback,
-                )
-                self._stream.start()
-
-            return True
+                self._state = _RecorderState.RECORDING
+                return True
 
         except Exception:
             self._logger.exception("Failed to start audio recording")
+            with self._lock:
+                if self._stream is not None:
+                    try:
+                        self._stream.stop()
+                        self._stream.close()
+                    except Exception:
+                        pass
+                    self._stream = None
+                self._state = _RecorderState.STOPPED
             return False
 
     def stop(self) -> Optional[np.ndarray]:
         """Stop recording and return all recorded audio.
 
-        If the recorder was primed, the stream continues running for
-        the pre-roll buffer. Call shutdown() to fully stop the stream.
+        If the recorder was primed, the stream continues running so the
+        pre-roll buffer keeps filling. Call ``shutdown()`` to fully tear
+        down the stream.
 
         Returns:
             Numpy array of all recorded audio, or None if no audio.
         """
-        if not self._recording:
-            return None
-
         with self._lock:
-            self._recording = False
-
-            if not self._recorded_chunks:
+            if self._state is not _RecorderState.RECORDING:
                 return None
 
-            # Concatenate all chunks
-            audio = np.concatenate(list(self._recorded_chunks))
+            if self._recorded_chunks:
+                audio = np.concatenate(list(self._recorded_chunks))
+            else:
+                audio = None
             self._recorded_chunks = deque()
 
-        # If primed, keep stream running for pre-roll
-        # If not primed, stop the stream
-        if not self._primed and self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                self._logger.debug("Failed to stop audio stream cleanly", exc_info=True)
-            self._stream = None
+            # Decide whether we stay primed for the next press or fully stop.
+            # The pre-roll case keeps the stream alive on a non-primed-but-
+            # started recorder we just close it here. Either way the state
+            # transitions to PRIMED (stream alive) or STOPPED (stream torn down).
+            keep_stream = self._stream is not None
+            if not keep_stream and self._stream is not None:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception:
+                    self._logger.debug("Failed to stop audio stream cleanly", exc_info=True)
+                self._stream = None
+                self._state = _RecorderState.STOPPED
+            else:
+                self._state = _RecorderState.PRIMED
 
+        if audio is None:
+            return None
         return np.squeeze(audio)
 
     def shutdown(self) -> None:
-        """Fully stop the audio stream.
-
-        Call this when the recorder is no longer needed.
-        """
-        self._recording = False
-        self._primed = False
-
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                self._logger.debug("Failed to shutdown audio stream cleanly", exc_info=True)
-            self._stream = None
+        """Fully stop the audio stream and forbid future starts."""
+        with self._lock:
+            if self._state is _RecorderState.STOPPED:
+                return
+            self._state = _RecorderState.SHUTTING_DOWN
+            if self._stream is not None:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception:
+                    self._logger.debug("Failed to shutdown audio stream cleanly", exc_info=True)
+                self._stream = None
+            self._state = _RecorderState.STOPPED
 
     @property
     def is_recording(self) -> bool:
         """Check if currently recording."""
-        return self._recording
+        return self._state is _RecorderState.RECORDING
 
     def get_current_level(self) -> float:
         """Get current audio level (0.0-1.0) for visualization.
@@ -314,10 +381,10 @@ class AudioRecorder:
             return _current_level
 
     def get_spectrum_bands(self) -> list[float]:
-        """Get current spectrum bands (16 floats, 0.0-1.0) for visualization.
+        """Get current spectrum bands (32 floats, 0.0-1.0) for visualization.
 
-        Thread-safe method to get FFT spectrum divided into 16 logarithmic
-        frequency bands covering voice range (~85Hz to ~8kHz).
+        Thread-safe method to get FFT spectrum divided into 32 logarithmic
+        frequency bands covering the voice range (200 Hz to 4000 Hz).
         """
         with _spectrum_lock:
             return _spectrum_bands.copy()

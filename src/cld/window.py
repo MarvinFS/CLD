@@ -30,7 +30,7 @@ def _get_window_class(hwnd: int) -> Optional[str]:
         if length > 0:
             return buffer.value
     except Exception:
-        pass
+        _logger.debug("GetClassNameW failed for hwnd=%s", hwnd, exc_info=True)
     return None
 
 
@@ -91,6 +91,7 @@ def _set_foreground(hwnd: int) -> bool:
         user32.ShowWindow(hwnd, 9)  # SW_RESTORE
         return bool(user32.SetForegroundWindow(hwnd))
     except Exception:
+        _logger.debug("SetForegroundWindow failed for hwnd=%s", hwnd, exc_info=True)
         return False
 
 

@@ -45,9 +45,11 @@ def _early_version_check():
             except Exception:
                 pass
 
-        # Import version here to avoid circular imports
+        # Import version here to avoid circular imports. Keep the format
+        # identical to the non-frozen path below so scripts can scrape it
+        # consistently regardless of how CLD was launched.
         from cld import __version__
-        print(f"CLD version {__version__}")
+        print(__version__)
 
         # Only wait for keypress if we allocated new console (not attached to parent)
         if getattr(sys, 'frozen', False) and sys.platform == 'win32':

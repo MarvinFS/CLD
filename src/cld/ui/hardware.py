@@ -109,35 +109,35 @@ def enumerate_gpus() -> List[GPUDeviceInfo]:
         import tempfile
         import re
 
-        # Capture C-level stderr by redirecting file descriptor
-        # This is necessary because whisper.cpp prints directly to stderr
+        # Capture C-level stderr by duplicating fd 2 to a temp file. The
+        # restore MUST live in a `finally` so any exception in the middle
+        # (model probe, file IO) doesn't leave the process with a closed or
+        # redirected stderr, which would silently break every later log call.
         old_stderr_fd = os.dup(2)
-        with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.txt') as tmp:
-            tmp_path = tmp.name
-
-        # Redirect stderr to temp file
-        with open(tmp_path, 'w') as tmp_file:
-            os.dup2(tmp_file.fileno(), 2)
-
-            # Trigger device enumeration by getting system info
-            _ = pw.whisper_print_system_info()
-
-            # Flush stderr
-            sys.stderr.flush() if sys.stderr else None
-
-        # Restore stderr
-        os.dup2(old_stderr_fd, 2)
-        os.close(old_stderr_fd)
-
-        # Read captured output
-        with open(tmp_path, 'r') as f:
-            output = f.read()
-
-        # Clean up temp file
+        tmp_path: Optional[str] = None
+        output = ""
         try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+            with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt") as tmp:
+                tmp_path = tmp.name
+            with open(tmp_path, "w") as tmp_file:
+                os.dup2(tmp_file.fileno(), 2)
+                _ = pw.whisper_print_system_info()
+                if sys.stderr is not None:
+                    sys.stderr.flush()
+        finally:
+            os.dup2(old_stderr_fd, 2)
+            os.close(old_stderr_fd)
+
+        if tmp_path is not None:
+            try:
+                with open(tmp_path, "r") as f:
+                    output = f.read()
+            except OSError as e:
+                logger.debug("Failed to read captured stderr: %s", e)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
         # Parse "ggml_vulkan: X = GPU_NAME (vendor)" lines
         pattern = r'ggml_vulkan:\s*(\d+)\s*=\s*([^|]+)'

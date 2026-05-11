@@ -139,6 +139,16 @@ class WhisperEngine:
         self.translate_to_english = translate_to_english
         self._model: Optional[object] = None
         self._model_lock = threading.Lock()
+        # Held for the entire duration of an in-flight transcribe() call so
+        # that unload_model() (driven by sleep/wake recovery) cannot delete
+        # the native model while whisper.cpp is still using it.
+        self._transcribe_lock = threading.Lock()
+        # Long-lived executor used by _transcribe_with_timeout. We keep it
+        # alive across calls so that a timeout doesn't have to wait on
+        # ThreadPoolExecutor.__exit__() (which calls shutdown(wait=True) and
+        # makes the timeout effectively unbounded).
+        self._transcribe_executor: Optional[ThreadPoolExecutor] = None
+        self._executor_lock = threading.Lock()
         self._logger = logging.getLogger(__name__)
         self._last_error: Optional[str] = None
 
@@ -169,20 +179,47 @@ class WhisperEngine:
     def is_available(self) -> bool:
         return _whisper_available
 
-    def unload_model(self) -> None:
+    def unload_model(self, wait_timeout: float = 30.0) -> bool:
         """Unload the model and free GPU/Vulkan resources.
 
         Must be called before system sleep to prevent native segfaults from
-        corrupted Vulkan handles on wake. Call load_model() to reload after.
+        corrupted Vulkan handles on wake. Call ``load_model()`` to reload.
+
+        Serialization vs ``transcribe()``: ``_transcribe_lock`` is held for
+        the entire duration of an active inference call. We acquire that
+        lock here (with a bounded wait) so we never delete the native model
+        object while a worker thread is still calling into whisper.cpp,
+        which previously caused use-after-free crashes during sleep/wake.
+
+        Args:
+            wait_timeout: Max seconds to wait for an in-flight transcription
+                to finish before forcing the unload.
+
+        Returns:
+            True if the model was unloaded cleanly; False if we had to
+            proceed without waiting (transcription thread did not release
+            the lock in time).
         """
-        with self._model_lock:
-            if self._model is not None:
-                self._logger.info("Unloading Whisper model (freeing GPU resources)")
-                try:
-                    del self._model
-                except Exception:
-                    pass
-                self._model = None
+        clean = self._transcribe_lock.acquire(timeout=wait_timeout)
+        try:
+            if not clean:
+                self._logger.warning(
+                    "Transcription did not finish within %.1fs; unloading anyway. "
+                    "Native crash is possible if inference is still running.",
+                    wait_timeout,
+                )
+            with self._model_lock:
+                if self._model is not None:
+                    self._logger.info("Unloading Whisper model (freeing GPU resources)")
+                    try:
+                        del self._model
+                    except Exception:
+                        pass
+                    self._model = None
+        finally:
+            if clean:
+                self._transcribe_lock.release()
+        return clean
 
     def get_last_error(self) -> Optional[str]:
         """Get the last error message."""
@@ -321,13 +358,21 @@ class WhisperEngine:
     def _transcribe_internal(self, audio: np.ndarray) -> str:
         """Internal transcription worker (runs in thread pool).
 
+        Snapshots ``self._model`` at entry so an in-flight call cannot be
+        torn down mid-segment by ``unload_model()``. The caller
+        (``transcribe()``) already holds ``_transcribe_lock``, which
+        ``unload_model()`` also acquires, so this is belt-and-suspenders.
+
         Args:
             audio: Audio samples as numpy array (mono, float32, 16kHz expected)
 
         Returns:
             Transcribed text.
         """
-        segments = self._model.transcribe(audio, translate=self.translate_to_english, language="auto")
+        model = self._model
+        if model is None:
+            return ""
+        segments = model.transcribe(audio, translate=self.translate_to_english, language="auto")
         text = " ".join(s.text.strip() for s in segments)
         return text.strip()
 
@@ -367,26 +412,48 @@ class WhisperEngine:
 
         return chunks
 
-    def _transcribe_with_timeout(self, audio: np.ndarray) -> str:
-        """Transcribe a single audio chunk with timeout protection.
+    def _get_transcribe_executor(self) -> ThreadPoolExecutor:
+        """Lazily build the long-lived single-worker executor.
 
-        Args:
-            audio: Audio samples as numpy array (mono, float32, 16kHz expected)
-
-        Returns:
-            Transcribed text or empty string on timeout.
+        We deliberately do NOT use ``with ThreadPoolExecutor(...) as ...`` in
+        the timeout path because the implicit ``__exit__()`` calls
+        ``shutdown(wait=True)`` and blocks until the running task finishes,
+        which makes the wall-clock timeout meaningless. The executor lives
+        for the lifetime of the engine instead, and a timed-out future is
+        cancelled via ``cancel_futures=True``.
         """
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self._transcribe_internal, audio)
-            try:
-                return future.result(timeout=self.transcription_timeout)
-            except FuturesTimeoutError:
-                self._logger.warning(
-                    "Chunk transcription timed out after %d seconds.",
-                    self.transcription_timeout
+        with self._executor_lock:
+            if self._transcribe_executor is None:
+                self._transcribe_executor = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="cld-transcribe"
                 )
-                self._last_error = f"Transcription timed out after {self.transcription_timeout}s"
-                return ""
+            return self._transcribe_executor
+
+    def _transcribe_with_timeout(self, audio: np.ndarray) -> str:
+        """Transcribe a single audio chunk with a real wall-clock timeout."""
+        executor = self._get_transcribe_executor()
+        future = executor.submit(self._transcribe_internal, audio)
+        try:
+            return future.result(timeout=self.transcription_timeout)
+        except FuturesTimeoutError:
+            self._logger.warning(
+                "Chunk transcription timed out after %d seconds.",
+                self.transcription_timeout,
+            )
+            self._last_error = f"Transcription timed out after {self.transcription_timeout}s"
+            # Best-effort cancellation. The native whisper.cpp call cannot be
+            # interrupted from Python, but cancelling the future stops any
+            # queued follow-up work from running on this stuck worker.
+            future.cancel()
+            # Replace the executor: the stuck worker thread is still alive
+            # holding the GIL-released native call, but a fresh executor
+            # ensures future transcriptions don't queue behind it.
+            with self._executor_lock:
+                stuck = self._transcribe_executor
+                self._transcribe_executor = None
+                if stuck is not None:
+                    stuck.shutdown(wait=False, cancel_futures=True)
+            return ""
 
     def _join_chunks(self, results: List[str]) -> str:
         """Join chunk transcriptions, handling overlap artifacts.
@@ -432,8 +499,9 @@ class WhisperEngine:
     def transcribe(self, audio: np.ndarray, sample_rate: int = 16000) -> str:
         """Transcribe audio to text with chunking for long recordings.
 
-        Audio longer than 60 seconds is split into overlapping chunks, transcribed
-        independently, then joined with deduplication at boundaries.
+        Holds ``_transcribe_lock`` for the entire call so concurrent
+        ``unload_model()`` (driven by sleep/wake recovery) cannot delete the
+        native model while inference is still using it.
 
         Args:
             audio: Audio samples as numpy array (mono, 16kHz expected)
@@ -442,39 +510,36 @@ class WhisperEngine:
         Returns:
             Transcribed text or empty string on error/timeout.
         """
-        if not self.load_model():
-            return ""
+        with self._transcribe_lock:
+            if not self.load_model():
+                return ""
 
-        # Set CPU affinity to exclude core 0 for system responsiveness
-        # Only relevant for CPU mode - GPU inference doesn't benefit from this
-        if not self.use_gpu:
-            self._set_cpu_affinity_exclude_core0()
+            if not self.use_gpu:
+                self._set_cpu_affinity_exclude_core0()
 
-        try:
-            if audio.dtype != np.float32:
-                audio = audio.astype(np.float32)
+            try:
+                if audio.dtype != np.float32:
+                    audio = audio.astype(np.float32)
 
-            # Split into chunks for long recordings
-            chunks = self._chunk_audio(audio, sample_rate)
+                chunks = self._chunk_audio(audio, sample_rate)
 
-            if len(chunks) == 1:
-                # Single chunk - use existing timeout logic
-                return self._transcribe_with_timeout(chunks[0])
+                if len(chunks) == 1:
+                    return self._transcribe_with_timeout(chunks[0])
 
-            # Multiple chunks - transcribe each and join
-            duration_seconds = len(audio) // sample_rate
-            self._logger.info("Transcribing %d chunks (%d seconds total)",
-                              len(chunks), duration_seconds)
+                duration_seconds = len(audio) // sample_rate
+                self._logger.info(
+                    "Transcribing %d chunks (%d seconds total)", len(chunks), duration_seconds
+                )
 
-            results = []
-            for i, chunk in enumerate(chunks):
-                self._logger.debug("Transcribing chunk %d/%d", i + 1, len(chunks))
-                text = self._transcribe_with_timeout(chunk)
-                if text:
-                    results.append(text)
+                results = []
+                for i, chunk in enumerate(chunks):
+                    self._logger.debug("Transcribing chunk %d/%d", i + 1, len(chunks))
+                    text = self._transcribe_with_timeout(chunk)
+                    if text:
+                        results.append(text)
 
-            return self._join_chunks(results)
+                return self._join_chunks(results)
 
-        except Exception:
-            self._logger.exception("Whisper transcription failed")
-            return ""
+            except Exception:
+                self._logger.exception("Whisper transcription failed")
+                return ""

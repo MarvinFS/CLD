@@ -138,16 +138,18 @@ class Config:
         Uses LOCALAPPDATA on Windows to avoid OneDrive sync issues.
         Falls back to home directory on other platforms.
 
-        Security: CLD_CONFIG_DIR override is validated to prevent path traversal.
+        Security: ``CLD_CONFIG_DIR`` override is validated to prevent path
+        traversal. The absoluteness check happens BEFORE ``.resolve()``,
+        because ``Path("foo").resolve()`` is already absolute (it's joined
+        against cwd) and the old post-resolve check accepted everything.
         """
         override = os.environ.get("CLD_CONFIG_DIR")
         if override:
-            override_path = Path(override).expanduser().resolve()
-            # Security: Validate the override path
-            if not override_path.is_absolute():
+            raw_path = Path(override).expanduser()
+            if not raw_path.is_absolute():
                 logger.warning("CLD_CONFIG_DIR must be absolute path, ignoring: %s", override)
             else:
-                # Prevent use of system directories
+                override_path = raw_path.resolve()
                 system_root = os.environ.get("SYSTEMROOT", "C:\\Windows")
                 system_dirs = [Path(system_root)]
                 is_system_dir = False
@@ -198,17 +200,24 @@ class Config:
 
     @classmethod
     def _from_dict(cls, data: dict) -> "Config":
-        """Create Config from dictionary."""
+        """Create Config from dictionary.
+
+        Each section is type-checked independently. A malformed section
+        (e.g. ``"activation": "bad"``) is logged and defaulted in isolation,
+        so one bad key doesn't wipe out every other user setting in the file.
+        """
         config = cls()
 
-        # Handle version migration if needed
+        if not isinstance(data, dict):
+            logger.warning("Config root is not a dict; using all defaults")
+            return config.validate()
+
         version = data.get("version", 1)
-        if version < CONFIG_VERSION:
+        if isinstance(version, int) and version < CONFIG_VERSION:
             logger.info("Migrating config from version %d to %d", version, CONFIG_VERSION)
 
-        # Load activation settings
-        if "activation" in data:
-            act = data["activation"]
+        act = data.get("activation")
+        if isinstance(act, dict):
             config.activation = ActivationConfig(
                 key=act.get("key", config.activation.key),
                 scancode=act.get("scancode", config.activation.scancode),
@@ -216,45 +225,53 @@ class Config:
                 mode=act.get("mode", config.activation.mode),
                 enabled=act.get("enabled", config.activation.enabled),
             )
+        elif act is not None:
+            logger.warning("Invalid 'activation' section (type %s); using defaults", type(act).__name__)
 
-        # Load engine settings
-        if "engine" in data:
-            eng = data["engine"]
+        eng = data.get("engine")
+        if isinstance(eng, dict):
             # Handle backwards compatibility: old "device": "cpu" -> new "force_cpu": true
             force_cpu = eng.get("force_cpu", False)
             if not force_cpu and eng.get("device") == "cpu":
                 force_cpu = True
             config.engine = EngineConfig(
-                type="whisper",  # Only whisper supported
+                type="whisper",
                 whisper_model=eng.get("whisper_model", config.engine.whisper_model),
                 force_cpu=force_cpu,
                 gpu_device=eng.get("gpu_device", config.engine.gpu_device),
-                translate_to_english=eng.get("translate_to_english", config.engine.translate_to_english),
+                translate_to_english=eng.get(
+                    "translate_to_english", config.engine.translate_to_english
+                ),
             )
+        elif eng is not None:
+            logger.warning("Invalid 'engine' section (type %s); using defaults", type(eng).__name__)
 
-        # Load output settings
-        if "output" in data:
-            out = data["output"]
+        out = data.get("output")
+        if isinstance(out, dict):
             config.output = OutputConfig(
                 mode=out.get("mode", config.output.mode),
                 sound_effects=out.get("sound_effects", config.output.sound_effects),
             )
+        elif out is not None:
+            logger.warning("Invalid 'output' section (type %s); using defaults", type(out).__name__)
 
-        # Load recording settings
-        if "recording" in data:
-            rec = data["recording"]
+        rec = data.get("recording")
+        if isinstance(rec, dict):
             config.recording = RecordingConfig(
                 max_seconds=rec.get("max_seconds", config.recording.max_seconds),
                 sample_rate=rec.get("sample_rate", config.recording.sample_rate),
             )
+        elif rec is not None:
+            logger.warning("Invalid 'recording' section (type %s); using defaults", type(rec).__name__)
 
-        # Load UI settings
-        if "ui" in data:
-            ui = data["ui"]
+        ui = data.get("ui")
+        if isinstance(ui, dict):
             config.ui = UIConfig(
                 overlay_position=ui.get("overlay_position", config.ui.overlay_position),
                 show_on_startup=ui.get("show_on_startup", config.ui.show_on_startup),
             )
+        elif ui is not None:
+            logger.warning("Invalid 'ui' section (type %s); using defaults", type(ui).__name__)
 
         return config.validate()
 
@@ -270,93 +287,191 @@ class Config:
         }
 
     def save(self) -> bool:
-        """Save configuration to file with retry logic for Windows file locking."""
+        """Save configuration to file with retry + inter-process lock.
+
+        Multiple processes (daemon + settings dialog) can race when both
+        save back to the same JSON. We serialize writes with a sidecar
+        lock file held via Windows ``msvcrt.locking`` (exclusive), with a
+        POSIX ``fcntl`` fallback. The lock is best-effort: if the lock
+        module is unavailable we still do the atomic write, which protects
+        against partial files but not against lost-update races.
+        """
         config_path = self.get_config_path()
         config_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = config_path.with_suffix(config_path.suffix + ".lock")
 
-        temp_file = None
+        lock_fh = None
+        locked = False
         try:
-            with tempfile.NamedTemporaryFile(
-                "w",
-                delete=False,
-                dir=str(config_path.parent),
-                encoding="utf-8",
-                suffix=".json",
-            ) as handle:
-                temp_file = Path(handle.name)
-                json.dump(self.to_dict(), handle, indent=2)
+            try:
+                # Open with O_RDWR | O_CREAT so we can use msvcrt.locking on Windows.
+                lock_fh = open(lock_path, "a+b")
+            except OSError as e:
+                logger.debug("Could not open config lock file %s: %s", lock_path, e)
 
-            # Retry os.replace() with exponential backoff to handle file locking
-            max_attempts = 3
-            delays = [0.1, 0.2, 0.4]  # Exponential backoff delays in seconds
+            if lock_fh is not None:
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    try:
+                        if os.name == "nt":
+                            import msvcrt
+                            msvcrt.locking(lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
+                        else:  # pragma: no cover - non-windows fallback
+                            import fcntl
+                            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        locked = True
+                        break
+                    except OSError:
+                        time.sleep(0.05)
+                if not locked:
+                    logger.warning("Config save proceeding without inter-process lock")
 
-            for attempt in range(max_attempts):
-                try:
-                    os.replace(temp_file, config_path)
-                    return True
-                except (PermissionError, OSError) as e:
-                    if attempt < max_attempts - 1:
-                        logger.debug(
-                            "Config save attempt %d failed with %s, retrying in %.1fs",
-                            attempt + 1,
-                            type(e).__name__,
-                            delays[attempt],
-                        )
-                        time.sleep(delays[attempt])
-                    else:
-                        # Final attempt failed, re-raise
-                        raise
+            temp_file = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    "w",
+                    delete=False,
+                    dir=str(config_path.parent),
+                    encoding="utf-8",
+                    suffix=".json",
+                ) as handle:
+                    temp_file = Path(handle.name)
+                    json.dump(self.to_dict(), handle, indent=2)
 
-            return False  # Should never reach here
-        except Exception:
-            logger.exception("Failed to save config")
-            return False
+                max_attempts = 3
+                delays = [0.1, 0.2, 0.4]
+                for attempt in range(max_attempts):
+                    try:
+                        os.replace(temp_file, config_path)
+                        return True
+                    except (PermissionError, OSError) as e:
+                        if attempt < max_attempts - 1:
+                            logger.debug(
+                                "Config save attempt %d failed with %s, retrying in %.1fs",
+                                attempt + 1,
+                                type(e).__name__,
+                                delays[attempt],
+                            )
+                            time.sleep(delays[attempt])
+                        else:
+                            raise
+                return False
+            except Exception:
+                logger.exception("Failed to save config")
+                return False
+            finally:
+                if temp_file and temp_file.exists():
+                    try:
+                        temp_file.unlink()
+                    except OSError:
+                        pass
         finally:
-            if temp_file and temp_file.exists():
+            if lock_fh is not None:
+                if locked:
+                    try:
+                        if os.name == "nt":
+                            import msvcrt
+                            msvcrt.locking(lock_fh.fileno(), msvcrt.LK_UNLCK, 1)
+                        else:  # pragma: no cover
+                            import fcntl
+                            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+                    except OSError:
+                        pass
                 try:
-                    temp_file.unlink()
+                    lock_fh.close()
                 except OSError:
                     pass
 
     def validate(self) -> "Config":
         """Validate and normalize configuration values."""
-        # Validate activation
+        # Default activation key + scancode kept in sync with the dataclass default.
         if not self.activation.key:
-            logger.warning("Invalid activation key; defaulting to 'alt_gr'")
-            self.activation.key = "alt_gr"
-            self.activation.scancode = 541
+            default_key = ActivationConfig.key
+            logger.warning("Invalid activation key; defaulting to %r", default_key)
+            self.activation.key = default_key
+            self.activation.scancode = ActivationConfig.scancode
 
         if self.activation.mode not in ("push_to_talk", "toggle"):
             logger.warning("Invalid mode '%s'; defaulting to 'push_to_talk'", self.activation.mode)
             self.activation.mode = "push_to_talk"
 
-        # Validate engine (whisper only)
+        # Normalize activation.enabled to bool.
+        self.activation.enabled = bool(self.activation.enabled)
+
+        # Filter modifiers to known values and ensure list type.
+        known_mods = {"ctrl", "shift", "alt", "alt_gr", "cmd", "meta", "win"}
+        if not isinstance(self.activation.modifiers, list):
+            logger.warning("activation.modifiers is not a list; clearing")
+            self.activation.modifiers = []
+        else:
+            filtered = [m for m in self.activation.modifiers if isinstance(m, str) and m.lower() in known_mods]
+            if len(filtered) != len(self.activation.modifiers):
+                logger.warning(
+                    "Dropped unknown activation.modifiers entries: %s",
+                    [m for m in self.activation.modifiers if m not in filtered],
+                )
+            self.activation.modifiers = filtered
+
+        # Scancode must be a non-negative int.
+        try:
+            self.activation.scancode = max(0, int(self.activation.scancode))
+        except (TypeError, ValueError):
+            logger.warning("Invalid activation.scancode; resetting to 0")
+            self.activation.scancode = 0
+
+        # Validate engine (whisper only).
         if self.engine.type != "whisper":
             logger.warning("Invalid engine '%s'; defaulting to 'whisper'", self.engine.type)
             self.engine.type = "whisper"
 
-        # Validate output
+        # Engine booleans + gpu_device range.
+        self.engine.force_cpu = bool(self.engine.force_cpu)
+        self.engine.translate_to_english = bool(self.engine.translate_to_english)
+        try:
+            gpu_device = int(self.engine.gpu_device)
+        except (TypeError, ValueError):
+            logger.warning("Invalid gpu_device; defaulting to -1 (auto)")
+            gpu_device = -1
+        # -1 == auto-select, anything below that is invalid; cap absurd values.
+        if gpu_device < -1 or gpu_device > 15:
+            logger.warning("gpu_device %s out of range; defaulting to -1 (auto)", gpu_device)
+            gpu_device = -1
+        self.engine.gpu_device = gpu_device
+
+        # Validate output.
         if self.output.mode not in ("injection", "clipboard", "auto"):
             logger.warning("Invalid output_mode '%s'; defaulting to 'auto'", self.output.mode)
             self.output.mode = "auto"
+        self.output.sound_effects = bool(self.output.sound_effects)
 
-        # Validate recording
+        # Validate recording.
         try:
             self.recording.max_seconds = int(self.recording.max_seconds)
         except (TypeError, ValueError):
             logger.warning("Invalid max_seconds; defaulting to 300")
             self.recording.max_seconds = 300
-
         if self.recording.max_seconds < 1:
             logger.warning("max_seconds too low; clamping to 1")
             self.recording.max_seconds = 1
         elif self.recording.max_seconds > 600:
             logger.warning("max_seconds too high; clamping to 600")
             self.recording.max_seconds = 600
-
         if self.recording.sample_rate != 16000:
             logger.warning("sample_rate %s not supported; forcing 16000", self.recording.sample_rate)
             self.recording.sample_rate = 16000
+
+        # Validate UI overlay position - must be a [int, int] list.
+        pos = self.ui.overlay_position
+        if (
+            not isinstance(pos, list)
+            or len(pos) != 2
+            or not all(isinstance(v, (int, float)) for v in pos)
+        ):
+            logger.warning("Invalid overlay_position %r; resetting", pos)
+            self.ui.overlay_position = [960, 1000]
+        else:
+            self.ui.overlay_position = [int(pos[0]), int(pos[1])]
+        self.ui.show_on_startup = bool(self.ui.show_on_startup)
 
         return self
 

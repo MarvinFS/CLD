@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -98,6 +99,11 @@ class STTDaemon:
         self._suspended = False
         self._last_resume_time = 0.0  # Monotonic timestamp of last resume
         self._overlay_recreate_attempts = 0
+        # Resume recovery runs on a worker thread so a slow Vulkan model
+        # reload can't wedge the main loop (and with it the tray menu
+        # callback queue + Ctrl+Shift+Space hotkey listener restart).
+        self._resume_lock = threading.Lock()
+        self._resume_in_progress = False
 
     def _init_components(self) -> bool:
         """Initialize all components.
@@ -145,7 +151,7 @@ class STTDaemon:
         return 0.0
 
     def get_audio_spectrum(self) -> list[float]:
-        """Get current spectrum bands (16 floats, 0.0-1.0) for visualization."""
+        """Get current spectrum bands (32 floats, 0.0-1.0) for visualization."""
         if self._recorder and self._recording:
             return self._recorder.get_spectrum_bands()
         return [0.0] * 32
@@ -376,11 +382,8 @@ class STTDaemon:
 
         # Check if dialog already visible (singleton pattern)
         if self._settings_dialog and self._settings_dialog.is_visible():
-            # Bring existing dialog to front
             self._logger.info("Settings dialog already open, bringing to front")
-            if self._settings_dialog._window:
-                self._settings_dialog._window.lift()
-                self._settings_dialog._window.focus_force()
+            self._settings_dialog.bring_to_front()
             return
 
         parent = self._overlay.get_root() if self._overlay else None
@@ -682,14 +685,107 @@ class STTDaemon:
         if self._engine and hasattr(self._engine, 'unload_model'):
             self._engine.unload_model()
 
+    def _start_shutdown_ipc(self) -> None:
+        """Start the background thread that listens for `cld stop` IPC.
+
+        Two channels supported:
+          * Named pipe ``\\\\.\\pipe\\CLD-<scope>-shutdown`` - preferred
+            because it doesn't poll the filesystem.
+          * Sentinel file at LOCALAPPDATA/CLD/daemon.shutdown - filesystem
+            fallback, polled at 1 Hz.
+        """
+        from cld.daemon import (
+            SHUTDOWN_PIPE_NAME,
+            get_shutdown_flag_path,
+        )
+
+        def _serve_pipe() -> None:
+            if os.name != "nt":
+                return
+            import ctypes
+            from ctypes import wintypes
+
+            PIPE_ACCESS_DUPLEX = 0x00000003
+            PIPE_TYPE_MESSAGE = 0x00000004
+            PIPE_READMODE_MESSAGE = 0x00000002
+            PIPE_WAIT = 0x00000000
+            PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
+            PIPE_UNLIMITED_INSTANCES = 255
+            INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+            CreateNamedPipeW = ctypes.windll.kernel32.CreateNamedPipeW
+            ConnectNamedPipe = ctypes.windll.kernel32.ConnectNamedPipe
+            DisconnectNamedPipe = ctypes.windll.kernel32.DisconnectNamedPipe
+            ReadFile = ctypes.windll.kernel32.ReadFile
+            CloseHandle = ctypes.windll.kernel32.CloseHandle
+
+            while self._running:
+                handle = CreateNamedPipeW(
+                    SHUTDOWN_PIPE_NAME,
+                    PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT
+                    | PIPE_REJECT_REMOTE_CLIENTS,
+                    PIPE_UNLIMITED_INSTANCES,
+                    512, 512, 0, None,
+                )
+                if not handle or handle == INVALID_HANDLE_VALUE:
+                    self._logger.debug("CreateNamedPipeW failed; sleeping")
+                    time.sleep(1.0)
+                    continue
+                try:
+                    # ConnectNamedPipe blocks until a client connects.
+                    ConnectNamedPipe(handle, None)
+                    buf = (ctypes.c_char * 64)()
+                    read = wintypes.DWORD(0)
+                    ReadFile(handle, buf, 64, ctypes.byref(read), None)
+                    msg = buf.raw[: read.value].decode("utf-8", "replace").strip()
+                    if msg.lower().startswith("shutdown"):
+                        self._logger.info("Shutdown received via IPC pipe")
+                        self._running = False
+                        break
+                finally:
+                    try:
+                        DisconnectNamedPipe(handle)
+                    except OSError:
+                        pass
+                    try:
+                        CloseHandle(handle)
+                    except OSError:
+                        pass
+
+        def _watch_flag_file() -> None:
+            flag = get_shutdown_flag_path()
+            # Clear any stale flag from a previous run.
+            try:
+                if flag.exists():
+                    flag.unlink()
+            except OSError:
+                pass
+            while self._running:
+                try:
+                    if flag.exists():
+                        self._logger.info("Shutdown sentinel detected at %s", flag)
+                        try:
+                            flag.unlink()
+                        except OSError:
+                            pass
+                        self._running = False
+                        return
+                except OSError:
+                    pass
+                time.sleep(1.0)
+
+        threading.Thread(target=_serve_pipe, name="cld-ipc-pipe", daemon=True).start()
+        threading.Thread(target=_watch_flag_file, name="cld-ipc-flag", daemon=True).start()
+
     def _on_power_resume(self):
         """Called when system resumes from sleep/hibernate.
 
-        Recovers all components that break across sleep/wake: audio stream,
-        hotkey listener, tray icon, and overlay state.
-
-        May be triggered by both WM_POWERBROADCAST and time-gap detection;
-        the debounce guard prevents redundant recovery within 10 seconds.
+        Dispatches the heavy recovery work to a background thread so the
+        main loop keeps draining ``_main_thread_queue`` (tray menu actions,
+        Exit) while a slow Vulkan model reload runs. Previously this ran
+        inline and could pin the main loop for 10+ seconds, during which
+        every tray menu click looked broken.
         """
         now = time.monotonic()
         if now - self._last_resume_time < 10.0:
@@ -697,53 +793,101 @@ class STTDaemon:
             return
         self._last_resume_time = now
 
-        self._logger.info("System resumed from sleep, recovering components")
-        self._suspended = False
+        with self._resume_lock:
+            if self._resume_in_progress:
+                self._logger.debug("Resume worker already running, skipping new trigger")
+                return
+            self._resume_in_progress = True
 
-        # If suspend callback was missed (common - Windows suspends before
-        # tkinter processes the after() callback), do the suspend cleanup now.
-        # The model must be unloaded before any access to avoid Vulkan segfaults.
-        if self._engine and hasattr(self._engine, 'unload_model'):
-            self._engine.unload_model()
+        self._logger.info("System resumed from sleep, dispatching recovery worker")
+        threading.Thread(
+            target=self._do_power_resume,
+            name="cld-resume-worker",
+            daemon=True,
+        ).start()
 
-        # 1. Audio recovery: shutdown old handles, wait for PortAudio, re-prime
-        if self._recorder:
-            self._recorder.shutdown()
-            time.sleep(0.5)  # Let PortAudio release device handles
-            if not self._recorder.prime():
-                self._logger.warning("Failed to re-prime audio after resume; will retry on next recording")
+    def _do_power_resume(self):
+        """Run resume recovery on a worker thread. See _on_power_resume."""
+        try:
+            self._suspended = False
 
-        # 2. Hotkey recovery: restart pynput listener
-        if self._hotkey:
-            self._hotkey.stop()
-            if not self._hotkey.start():
-                self._logger.warning("Failed to restart hotkey, recreating listener")
+            # If suspend callback was missed (common - Windows suspends before
+            # tkinter processes the after() callback), do the suspend cleanup
+            # now. Model must be unloaded before any access to avoid Vulkan
+            # segfaults on stale GPU handles.
+            if self._engine and hasattr(self._engine, 'unload_model'):
                 try:
-                    self._hotkey = HotkeyListener(
-                        hotkey=self.config.hotkey,
-                        on_start=self._on_recording_start,
-                        on_stop=self._on_recording_stop,
-                        mode=self.config.mode,
-                    )
-                    self._hotkey.start()
+                    self._engine.unload_model()
                 except Exception:
-                    self._logger.error("Failed to recreate hotkey listener", exc_info=True)
+                    self._logger.error("unload_model failed during resume", exc_info=True)
 
-        # 3. Reload whisper model (Vulkan GPU context was freed on suspend)
-        if self._engine and hasattr(self._engine, 'load_model'):
-            self._logger.info("Reloading STT model after resume")
-            if not self._engine.load_model():
-                self._logger.error("Failed to reload STT model after resume")
+            # 1. Audio recovery: shutdown old handles, wait for PortAudio, re-prime
+            if self._recorder:
+                try:
+                    self._recorder.shutdown()
+                    time.sleep(0.5)  # Let PortAudio release device handles
+                    if not self._recorder.prime():
+                        self._logger.warning("Failed to re-prime audio after resume; will retry on next recording")
+                except Exception:
+                    self._logger.error("Audio recovery failed during resume", exc_info=True)
 
-        # 4. Tray recovery (existing logic)
-        if self._tray:
-            self._tray.restart()
+            # 2. Hotkey recovery: restart pynput listener, then probe it.
+            # Without the liveness probe the listener can be "started" but
+            # already dead (pynput's thread silently exits on some sleep
+            # transitions), leaving Ctrl+Shift+Space inert.
+            # Honour config.activation.enabled here so toggling the setting
+            # off doesn't get silently re-enabled on every wake.
+            if self._hotkey:
+                try:
+                    self._hotkey.stop()
+                    if not self.config.activation.enabled:
+                        self._logger.info("Hotkey stays stopped after resume (activation.enabled=False)")
+                    else:
+                        started = self._hotkey.start()
+                        if not started or not self._hotkey.is_running():
+                            self._logger.warning("Hotkey listener not alive after restart, recreating")
+                            try:
+                                self._hotkey = HotkeyListener(
+                                    hotkey=self.config.hotkey,
+                                    on_start=self._on_recording_start,
+                                    on_stop=self._on_recording_stop,
+                                    mode=self.config.mode,
+                                )
+                                self._hotkey.start()
+                                if not self._hotkey.is_running():
+                                    self._logger.error("Recreated hotkey listener also not alive")
+                            except Exception:
+                                self._logger.error("Failed to recreate hotkey listener", exc_info=True)
+                except Exception:
+                    self._logger.error("Hotkey recovery failed during resume", exc_info=True)
 
-        # 5. Reset overlay recreation counter
-        self._overlay_recreate_attempts = 0
+            # 3. Reload whisper model (Vulkan GPU context was freed on suspend)
+            if self._engine and hasattr(self._engine, 'load_model'):
+                try:
+                    self._logger.info("Reloading STT model after resume")
+                    if not self._engine.load_model():
+                        self._logger.error("Failed to reload STT model after resume")
+                except Exception:
+                    self._logger.error("Model reload failed during resume", exc_info=True)
 
-        # 6. Update status
-        self._print_status("Ready")
+            # 4. Tray recovery - hardened stop()/start() now force-removes
+            # ghost icons via Shell_NotifyIcon(NIM_DELETE) even when
+            # pystray's mainloop thread is wedged.
+            if self._tray:
+                try:
+                    self._tray.restart()
+                except Exception:
+                    self._logger.error("Tray restart failed during resume", exc_info=True)
+
+            # 5. Reset overlay recreation counter
+            self._overlay_recreate_attempts = 0
+
+            # 6. Update status
+            self._print_status("Ready")
+            self._logger.info("Resume recovery complete")
+        finally:
+            with self._resume_lock:
+                self._resume_in_progress = False
 
     def _show_model_setup_dialog(self, model_manager: ModelManager) -> bool:
         """Show model setup dialog.
@@ -859,12 +1003,23 @@ class STTDaemon:
             if not self._recorder.prime():
                 self._logger.warning("Failed to prime audio recorder; may miss first syllables")
 
-        # Start hotkey listener
-        if not self._hotkey.start():
-            self._logger.error("Failed to start hotkey listener")
-            raise SystemExit(1)
+        # Start hotkey listener only if activation is enabled in config.
+        # Previously the daemon always started the listener regardless of the
+        # config flag, so toggling "Hotkey enabled" off in the UI had no
+        # effect until the next manual restart of the host process.
+        if self.config.activation.enabled:
+            if not self._hotkey.start():
+                self._logger.error("Failed to start hotkey listener")
+                raise SystemExit(1)
+        else:
+            self._logger.info("Hotkey listener not started (activation.enabled=False)")
 
         self._running = True
+
+        # Start IPC shutdown listener so `cld stop` can ask the daemon to
+        # exit gracefully without taskkill interrupting transcription /
+        # config writes.
+        self._start_shutdown_ipc()
 
         # Create tray icon if enabled
         if self._enable_tray:
@@ -894,6 +1049,16 @@ class STTDaemon:
                     on_power_suspend=self._on_power_suspend,
                 )
                 self._overlay.show()
+                # Honour config.ui.show_on_startup: when False, build the
+                # overlay (so it can still be summoned via the tray menu)
+                # but keep it hidden on launch.
+                if not self.config.ui.show_on_startup:
+                    try:
+                        self._overlay.hide()
+                        if self._tray is not None:
+                            self._tray.set_overlay_visible(False)
+                    except Exception:
+                        self._logger.debug("Could not honour show_on_startup", exc_info=True)
             except Exception as e:
                 self._logger.warning("Failed to create overlay: %s", e)
                 self._overlay = None
@@ -965,15 +1130,13 @@ class STTDaemon:
                         self._overlay = None
                         self._try_recreate_overlay()
 
-                # Update settings dialog if active (has its own temp_root)
+                # Update settings dialog if active (has its own temp_root).
+                # `pump()` returns False when the underlying window is gone,
+                # so we drop our reference cleanly.
                 if self._settings_dialog and self._settings_dialog.is_visible():
                     try:
-                        if self._settings_dialog._temp_root:
-                            self._settings_dialog._temp_root.update()
-                        elif self._settings_dialog._window:
-                            self._settings_dialog._window.update()
-                    except tk.TclError:
-                        self._settings_dialog = None
+                        if not self._settings_dialog.pump():
+                            self._settings_dialog = None
                     except Exception:
                         self._logger.debug("Settings dialog update failed", exc_info=True)
 

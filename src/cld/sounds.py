@@ -2,22 +2,22 @@
 
 import logging
 import sys
-import winsound
 from pathlib import Path
 from typing import Literal
+
+# winsound is a Windows-only stdlib module. Guard the import so that
+# importing this module on non-Windows (tests, packaging tools, lint)
+# doesn't blow up; play_sound() becomes a no-op when winsound is missing.
+if sys.platform == "win32":
+    import winsound  # type: ignore[import-not-found]
+else:  # pragma: no cover - non-windows
+    winsound = None  # type: ignore[assignment]
 
 SoundEvent = Literal["start", "stop", "complete", "error", "warning"]
 _logger = logging.getLogger(__name__)
 
 
-def _is_frozen() -> bool:
-    """Check if running as frozen exe (PyInstaller or Nuitka)."""
-    # PyInstaller sets sys.frozen
-    if getattr(sys, 'frozen', False):
-        return True
-    # Nuitka sets __compiled__ on __main__
-    main_mod = sys.modules.get('__main__', object())
-    return '__compiled__' in dir(main_mod)
+from cld.runtime import is_frozen as _is_frozen  # noqa: E402
 
 
 def _get_exe_dir() -> Path:
@@ -52,15 +52,19 @@ def play_sound(event: SoundEvent) -> None:
     Args:
         event: The type of sound event to play.
     """
+    if winsound is None:
+        # Non-Windows platforms have no winsound; skip silently. Cosmetic
+        # path only - logged at debug level so we keep a trace for support
+        # rather than swallowing every audio-feedback failure invisibly.
+        _logger.debug("play_sound(%s): winsound unavailable on this platform", event)
+        return
     try:
-        # Check for custom sound files first
         sounds_dir = _get_sounds_dir()
         sound_file = sounds_dir / f"{event}.wav"
         if sound_file.exists():
             winsound.PlaySound(str(sound_file), winsound.SND_FILENAME | winsound.SND_ASYNC)
             return
 
-        # Fallback to Windows system sounds
         sound_map = {
             "start": winsound.MB_OK,
             "stop": winsound.MB_OK,
@@ -71,4 +75,4 @@ def play_sound(event: SoundEvent) -> None:
         sound_type = sound_map.get(event, winsound.MB_OK)
         winsound.MessageBeep(sound_type)
     except Exception:
-        pass  # Silently fail
+        _logger.debug("play_sound(%s) failed", event, exc_info=True)

@@ -1032,6 +1032,41 @@ class SettingsDialog:
                     pass
                 self._temp_root = None
 
+    def bring_to_front(self) -> bool:
+        """Raise and refocus the dialog if it's currently shown.
+
+        Public API for callers (the daemon) that previously reached into
+        ``self._window`` directly. Returns True when there was a window to
+        raise.
+        """
+        win = self._window
+        if win is None:
+            return False
+        try:
+            win.lift()
+            win.focus_force()
+            return True
+        except tk.TclError:
+            return False
+
+    def pump(self) -> bool:
+        """Process any pending Tk events for this dialog.
+
+        Called from the main loop instead of the daemon reaching into
+        ``self._temp_root`` / ``self._window`` itself. Returns False if the
+        dialog window has been destroyed (caller should drop its reference).
+        """
+        root = self._temp_root
+        win = self._window
+        target = root if root is not None else win
+        if target is None:
+            return False
+        try:
+            target.update()
+            return True
+        except tk.TclError:
+            return False
+
     def is_visible(self) -> bool:
         """Check if dialog is visible."""
         return self._window is not None

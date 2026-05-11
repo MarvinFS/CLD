@@ -148,10 +148,10 @@ def output_text(
     if mode == "injection":
         if not _PYNPUT_AVAILABLE:
             _warn_pynput_missing()
-            return _output_via_clipboard(text, config)
+            return _output_via_clipboard(text, config, window_info)
         return _output_via_injection(text, window_info, config)
     else:
-        return _output_via_clipboard(text, config)
+        return _output_via_clipboard(text, config, window_info)
 
 
 def _output_via_injection(
@@ -172,7 +172,7 @@ def _output_via_injection(
     try:
         if not _PYNPUT_AVAILABLE:
             _warn_pynput_missing()
-            return _output_via_clipboard(text, config)
+            return _output_via_clipboard(text, config, window_info)
 
         # Try Claude Code window first (from statusline's window.json)
         claude_hwnd = _read_claude_code_window()
@@ -189,12 +189,12 @@ def _output_via_injection(
         # If no window was captured, fall back to clipboard
         if window_info is None:
             _logger.info("No target window captured; using clipboard")
-            return _output_via_clipboard(text, config)
+            return _output_via_clipboard(text, config, window_info)
 
         # Restore focus to original window
         if not restore_focus(window_info):
             _logger.warning("Focus restore failed; falling back to clipboard")
-            return _output_via_clipboard(text, config)
+            return _output_via_clipboard(text, config, window_info)
 
         kb = get_keyboard()
 
@@ -217,15 +217,33 @@ def _output_via_injection(
         return _output_via_clipboard(text, config)
 
 
-def _output_via_clipboard(text: str, config: Config) -> bool:
-    """Output text by copying to clipboard.
+def _output_via_clipboard(
+    text: str,
+    config: Config,
+    window_info: Optional[WindowInfo] = None,
+    paste: bool = True,
+) -> bool:
+    """Output text via the clipboard, optionally pasting into target window.
+
+    Behaviour:
+      * ``text`` is copied to the clipboard.
+      * If a target window is available AND pynput is available AND
+        ``paste=True``, focus is restored and ``Ctrl+V`` is sent so the
+        text actually lands in the user's app instead of just sitting on
+        the clipboard. The previous clipboard contents are restored after
+        a short delay so the paste doesn't permanently clobber whatever
+        the user had copied.
+      * If pasting isn't possible, falls back to copy-only (the prior
+        behaviour) so users at least don't lose the transcription.
 
     Args:
-        text: The text to copy.
+        text: The text to output.
         config: Configuration.
+        window_info: Original window to restore focus to before pasting.
+        paste: If False, skip the auto-paste step (copy-only mode).
 
     Returns:
-        True if successful, False otherwise.
+        True if the text was at least copied to the clipboard.
     """
     try:
         try:
@@ -234,13 +252,54 @@ def _output_via_clipboard(text: str, config: Config) -> bool:
             _logger.error("pyperclip not installed; clipboard output unavailable")
             return False
 
-        # Just try to copy - Windows native clipboard should always work
-        # The is_available() check can give false negatives on Windows
+        # Save existing clipboard so we can restore it once the paste lands.
+        previous: Optional[str] = None
+        try:
+            previous = pyperclip.paste()
+        except Exception:
+            previous = None
+
         pyperclip.copy(text)
         _logger.info("Text copied to clipboard (%d chars)", len(text))
 
+        pasted = False
+        if paste and _PYNPUT_AVAILABLE:
+            target_hwnd = _read_claude_code_window()
+            focused = False
+            if target_hwnd and focus_window_by_hwnd(target_hwnd):
+                focused = True
+            elif window_info is not None and restore_focus(window_info):
+                focused = True
+            if focused:
+                try:
+                    kb = get_keyboard()
+                    # Dismiss any menus that may have opened due to Alt release
+                    # while we were the foreground (see _output_via_injection).
+                    kb.press(Key.esc)
+                    kb.release(Key.esc)
+                    time.sleep(0.05)
+                    with kb.pressed(Key.ctrl):
+                        kb.press("v")
+                        kb.release("v")
+                    pasted = True
+                except Exception:
+                    _logger.warning("Clipboard paste failed; text remains on clipboard", exc_info=True)
+
         if config.sound_effects:
             play_sound("complete")
+
+        # Restore the user's previous clipboard once Windows has had a
+        # moment to deliver the paste. If we didn't paste, leave our text
+        # on the clipboard so the user can paste it manually.
+        if pasted and previous is not None and previous != text:
+            def _restore_clipboard() -> None:
+                try:
+                    time.sleep(0.4)
+                    pyperclip.copy(previous)
+                except Exception:
+                    _logger.debug("Failed to restore previous clipboard", exc_info=True)
+            import threading
+            threading.Thread(target=_restore_clipboard, name="cld-clip-restore", daemon=True).start()
 
         return True
     except Exception:

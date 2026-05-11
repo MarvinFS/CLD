@@ -54,6 +54,21 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=True,
-    upx_exclude=[],
+    # UPX must NOT touch the whisper.cpp / ggml-vulkan binaries:
+    # ggml-vulkan.dll embeds precompiled SPIR-V shader blobs whose
+    # internal layout UPX rewrites, producing 0xC0000005 access
+    # violations the moment whisper.cpp tries to load a Vulkan
+    # kernel after device enumeration. Without this exclusion
+    # ggml-vulkan.dll shrinks from ~55 MB to ~5 MB and the
+    # resulting exe crashes during model load.
+    upx_exclude=[
+        'ggml.dll',
+        'ggml-base.dll',
+        'ggml-cpu.dll',
+        'ggml-vulkan.dll',
+        'whisper.dll',
+        '_pywhispercpp.cp312-win_amd64.pyd',
+        'vulkan-1.dll',
+    ],
     name='CLD',
 )

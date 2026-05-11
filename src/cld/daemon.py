@@ -2,6 +2,8 @@
 
 import argparse
 import ctypes
+import getpass
+import hashlib
 import logging
 import os
 import subprocess
@@ -17,21 +19,69 @@ from cld.hotkey import HotkeyListener
 from cld.keyboard import test_injection
 from cld.daemon_service import STTDaemon
 
-# Windows mutex name for single instance
-MUTEX_NAME = "CLD_SingleInstance_Mutex"
+# Stable app GUID for namespacing kernel objects across CLD releases.
+_CLD_APP_GUID = "{8B9E2A4D-3F12-4C7C-9F1A-2F3D9F0B0001}"
+
+
+def _user_scope() -> str:
+    """Return a stable per-user scope tag for kernel-object names.
+
+    Uses the SID hash when available (uniqueness even with same username on
+    different machines), otherwise falls back to a hash of the username.
+    Two different local users cannot accidentally fight over the same
+    mutex / pipe, and a hostile process cannot guess the name without
+    knowing the SID/username.
+    """
+    sid: Optional[str] = None
+    try:
+        import ctypes.wintypes as wintypes
+        OpenProcessToken = ctypes.windll.advapi32.OpenProcessToken
+        GetTokenInformation = ctypes.windll.advapi32.GetTokenInformation
+        ConvertSidToStringSidW = ctypes.windll.advapi32.ConvertSidToStringSidW
+        LocalFree = ctypes.windll.kernel32.LocalFree
+        TOKEN_QUERY = 0x0008
+        TokenUser = 1
+
+        h_proc = ctypes.windll.kernel32.GetCurrentProcess()
+        h_token = wintypes.HANDLE()
+        if OpenProcessToken(h_proc, TOKEN_QUERY, ctypes.byref(h_token)):
+            try:
+                size = wintypes.DWORD(0)
+                GetTokenInformation(h_token, TokenUser, None, 0, ctypes.byref(size))
+                if size.value > 0:
+                    buf = (ctypes.c_byte * size.value)()
+                    if GetTokenInformation(
+                        h_token, TokenUser, buf, size.value, ctypes.byref(size)
+                    ):
+                        # TOKEN_USER starts with SID_AND_ATTRIBUTES whose first
+                        # field is a PSID pointer.
+                        psid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+                        str_sid_ptr = ctypes.c_wchar_p()
+                        if ConvertSidToStringSidW(psid, ctypes.byref(str_sid_ptr)):
+                            sid = str_sid_ptr.value
+                            LocalFree(ctypes.cast(str_sid_ptr, ctypes.c_void_p))
+            finally:
+                ctypes.windll.kernel32.CloseHandle(h_token)
+    except Exception:
+        sid = None
+
+    seed = sid or getpass.getuser() or "default"
+    return hashlib.sha1(seed.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+# Per-user kernel-object names. ``Local\`` confines them to the current
+# Terminal Services session so RDP and fast-user-switching users get their
+# own namespace; ``{guid}-{user_hash}`` makes the name unpredictable enough
+# that a hostile local process can't trivially squat the mutex to lock out CLD.
+_USER_SCOPE = _user_scope()
+MUTEX_NAME = f"Local\\CLD-{_CLD_APP_GUID}-{_USER_SCOPE}-SingleInstance"
+SHUTDOWN_PIPE_NAME = f"\\\\.\\pipe\\CLD-{_USER_SCOPE}-shutdown"
 
 # Global mutex handle (kept alive while running)
 _mutex_handle = None
 
 
-def _is_frozen() -> bool:
-    """Check if running as frozen exe (PyInstaller or Nuitka)."""
-    # PyInstaller sets sys.frozen
-    if getattr(sys, "frozen", False):
-        return True
-    # Nuitka sets __compiled__ on __main__
-    main_mod = sys.modules.get("__main__", object())
-    return "__compiled__" in dir(main_mod)
+from cld.runtime import is_frozen as _is_frozen  # noqa: E402
 
 
 def _get_plugin_root() -> Path:
@@ -94,6 +144,66 @@ def is_daemon_running() -> bool:
 
     # If ERROR_ALREADY_EXISTS, another instance holds it
     return last_error == ERROR_ALREADY_EXISTS
+
+
+# Shared shutdown signal: a daemon thread writes its PID to this file and
+# polls it; once removed, the file disappearing is interpreted as "please
+# shut down". The IPC pipe (preferred path) is set up by the daemon service.
+_SHUTDOWN_FLAG_NAME = "daemon.shutdown"
+
+
+def get_shutdown_flag_path() -> Path:
+    """Path of the on-disk shutdown sentinel."""
+    localappdata = os.environ.get("LOCALAPPDATA", "")
+    base = Path(localappdata) / "CLD" if localappdata else Path.home() / ".cld"
+    return base / _SHUTDOWN_FLAG_NAME
+
+
+def request_shutdown_via_ipc(timeout: float = 3.0) -> bool:
+    """Politely ask the running daemon to shut itself down.
+
+    Tries the named pipe first (fast, in-process notification), then falls
+    back to a filesystem sentinel that the daemon's poll loop notices. Only
+    if neither produces a clean shutdown does ``stop_daemon()`` resort to
+    ``taskkill``.
+
+    Args:
+        timeout: Seconds to wait for the daemon to actually exit (observed
+            by the mutex being released).
+
+    Returns:
+        True if the daemon was running and exited within ``timeout``.
+    """
+    logger = logging.getLogger(__name__)
+    if not is_daemon_running():
+        return False
+
+    delivered = False
+    try:
+        # Pipe path: writes a single line "shutdown\n" and closes.
+        with open(SHUTDOWN_PIPE_NAME, "wb") as fh:
+            fh.write(b"shutdown\n")
+            fh.flush()
+        delivered = True
+    except OSError as e:
+        logger.debug("Shutdown pipe unavailable (%s); using flag file", e)
+
+    if not delivered:
+        try:
+            flag = get_shutdown_flag_path()
+            flag.parent.mkdir(parents=True, exist_ok=True)
+            flag.write_text(str(int(time.time())), encoding="utf-8")
+            delivered = True
+        except OSError as e:
+            logger.debug("Could not write shutdown flag: %s", e)
+            return False
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not is_daemon_running():
+            return True
+        time.sleep(0.1)
+    return False
 
 
 def _get_pid_file_path() -> Path:
@@ -227,7 +337,7 @@ def _spawn_background(enable_overlay: bool = False) -> bool:
 
     try:
         # Run without log file - daemon runs silently in normal mode
-        subprocess.Popen(
+        proc = subprocess.Popen(
             cmd,
             env=env,
             stdout=subprocess.DEVNULL,
@@ -236,16 +346,40 @@ def _spawn_background(enable_overlay: bool = False) -> bool:
             creationflags=creationflags,
         )
 
-        # Wait for daemon to acquire mutex
-        for _ in range(30):
-            if is_daemon_running():
-                logging.getLogger(__name__).info("Daemon started in background.")
-                return True
+        # Wait for daemon to acquire the mutex AND for the PID file to
+        # report our newly-spawned child's PID. The child's startup
+        # ordering is: _acquire_mutex() -> _write_pid_file() ->
+        # STTDaemon.run(). The PID file therefore appears slightly AFTER
+        # the mutex, so we keep polling until the PID file catches up or
+        # the deadline expires - bailing the moment they disagree would
+        # produce a false negative on every fast spawn.
+        logger = logging.getLogger(__name__)
+        deadline = time.monotonic() + 5.0  # 5s total
+        mutex_first_seen: Optional[float] = None
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                logger.error("Spawned daemon exited prematurely (code %s)", proc.returncode)
+                return False
+            mutex_held = is_daemon_running()
+            if mutex_held:
+                pid_in_file = _read_pid_file()
+                if pid_in_file == proc.pid:
+                    logger.info("Daemon started in background (PID %d).", proc.pid)
+                    return True
+                if mutex_first_seen is None:
+                    mutex_first_seen = time.monotonic()
+                # If the mutex has been held for >2s but the PID file still
+                # doesn't point at us, something else holds it (zombie /
+                # other instance). Bail out so the caller can clean up.
+                if time.monotonic() - mutex_first_seen > 2.0 and pid_in_file is not None:
+                    logger.warning(
+                        "Mutex held by PID %s for >2s (we spawned %s); refusing to claim success",
+                        pid_in_file, proc.pid,
+                    )
+                    return False
             time.sleep(0.1)
 
-        logging.getLogger(__name__).warning(
-            "Daemon did not start within 3 seconds."
-        )
+        logger.warning("Daemon did not start within 5 seconds.")
         return False
     except Exception:
         logging.getLogger(__name__).exception("Failed to spawn background daemon")
@@ -322,14 +456,32 @@ def start_daemon(background: bool = False, enable_overlay: bool = False):
 
 
 def stop_daemon():
-    """Stop the running daemon."""
+    """Stop the running daemon.
+
+    Prefers graceful IPC shutdown (named pipe, then on-disk sentinel) so the
+    daemon can drain in-flight transcription, save config, and free Vulkan
+    handles cleanly. ``taskkill`` is only used as a last resort when the
+    daemon doesn't honour the shutdown request within a deadline.
+    """
     logger = logging.getLogger(__name__)
 
     if not is_daemon_running():
         logger.info("Daemon is not running.")
         return
 
-    # Find and kill CLD processes
+    # 1. Graceful: poke the IPC channel and wait briefly for the mutex to
+    # drop on its own.
+    if request_shutdown_via_ipc(timeout=5.0):
+        # Clean up any leftover shutdown flag the daemon didn't get to.
+        try:
+            get_shutdown_flag_path().unlink()
+        except OSError:
+            pass
+        logger.info("Daemon stopped.")
+        return
+
+    logger.warning("Graceful shutdown did not complete; falling back to taskkill")
+
     pids = _find_cld_processes()
     if not pids:
         logger.warning("Daemon appears running but no CLD process found.")
@@ -382,6 +534,10 @@ def stop_daemon():
             pass
 
     _remove_pid_file()
+    try:
+        get_shutdown_flag_path().unlink()
+    except OSError:
+        pass
     logger.info("Daemon stopped.")
 
 
