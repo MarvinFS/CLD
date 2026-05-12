@@ -386,6 +386,56 @@ def _spawn_background(enable_overlay: bool = False) -> bool:
         return False
 
 
+def _cleanup_stale_state() -> None:
+    """Remove orphan state files left by a previously-crashed daemon.
+
+    When the daemon crashes (e.g., native segfault during sleep/wake recovery),
+    Windows auto-releases its mutex but leaves behind disk artifacts:
+      - daemon.pid pointing to a dead PID
+      - settings.json.lock from a config write that never finished
+      - daemon.shutdown sentinel from an aborted shutdown request
+
+    These do not block a fresh daemon from starting (mutex is the real gate),
+    but they can confuse external tooling and surface as "ghost state" in
+    diagnostics. Clean them up proactively if no live daemon owns them.
+
+    Safe to call before _acquire_mutex(): only removes files whose referenced
+    process is provably dead, so a live daemon's files are never touched.
+    """
+    logger = logging.getLogger(__name__)
+    localappdata = os.environ.get("LOCALAPPDATA", "")
+    base = Path(localappdata) / "CLD" if localappdata else Path.home() / ".cld"
+    if not base.exists():
+        return
+
+    pid_path = base / "daemon.pid"
+    if pid_path.exists():
+        live_pid = _read_pid_file()  # returns None if process is dead
+        if live_pid is None:
+            try:
+                stale = pid_path.read_text().strip()
+            except Exception:
+                stale = "?"
+            try:
+                pid_path.unlink()
+                logger.info("Removed stale daemon.pid (PID %s no longer alive)", stale)
+            except OSError:
+                logger.debug("Failed to remove stale daemon.pid", exc_info=True)
+
+    for orphan_name in ("settings.json.lock", "daemon.shutdown"):
+        orphan = base / orphan_name
+        if not orphan.exists():
+            continue
+        if is_daemon_running():
+            # A live daemon may legitimately hold these; do not touch.
+            continue
+        try:
+            orphan.unlink()
+            logger.info("Removed orphan %s (no live daemon)", orphan_name)
+        except OSError:
+            logger.debug("Failed to remove orphan %s", orphan_name, exc_info=True)
+
+
 def start_daemon(background: bool = False, enable_overlay: bool = False):
     """Start the daemon.
 
@@ -393,6 +443,7 @@ def start_daemon(background: bool = False, enable_overlay: bool = False):
         background: If True, daemonize the process.
         enable_overlay: If True, show GUI overlay.
     """
+    _cleanup_stale_state()
     if is_daemon_running():
         logger = logging.getLogger(__name__)
         # Check if the existing instance might be a zombie (e.g., survived sleep/wake

@@ -6,6 +6,7 @@ import logging
 import math
 import queue
 import sys
+import threading
 import time
 import tkinter as tk
 from pathlib import Path
@@ -17,6 +18,24 @@ if TYPE_CHECKING:
     from cld.config import Config
 
 logger = logging.getLogger(__name__)
+
+
+def _delayed_resume(callback: Callable) -> None:
+    """Sleep 1s, then call the resume callback on this thread.
+
+    Worker target for the thread spawned from the wndproc on PBT_APMRESUME*.
+    Running the resume on a plain OS thread (instead of via Tcl's after()
+    timer) avoids the Tcl event-pump callback that crashed CPython with
+    Py_FatalError(0xc0000409) immediately after wake. callback itself
+    dispatches the heavy work to its own worker thread, so this thread
+    exits quickly.
+    """
+    try:
+        time.sleep(1.0)
+        callback()
+    except Exception:
+        logger.error("delayed resume callback failed", exc_info=True)
+
 
 # Windows power event constants
 WM_POWERBROADCAST = 0x218
@@ -340,12 +359,13 @@ class STTOverlay:
                     if wparam == PBT_APMSUSPEND:
                         logger.info("Power suspend detected")
                         if self.on_power_suspend:
-                            # Call DIRECTLY - not via after(). Windows waits for
-                            # the wndproc to return before actually suspending.
-                            # Using after() would schedule it for the next event
-                            # loop iteration, which never runs because the system
-                            # is already asleep. We must free Vulkan/GPU resources
-                            # NOW before handles become corrupted.
+                            # Call DIRECTLY - not via after(). Windows waits
+                            # for the wndproc to return before actually
+                            # suspending. Using after() would schedule it
+                            # for the next event loop iteration, which never
+                            # runs because the system is already asleep.
+                            # We must free Vulkan/GPU resources NOW before
+                            # handles become corrupted.
                             try:
                                 self.on_power_suspend()
                             except Exception:
@@ -353,8 +373,27 @@ class STTOverlay:
                     elif wparam in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND):
                         logger.info("Power resume detected (wparam=%s)", hex(wparam))
                         if self.on_power_resume:
-                            # Schedule callback with 1 second delay to let Windows stabilize
-                            self._root.after(1000, self.on_power_resume)
+                            # Run the resume callback on a plain OS thread
+                            # after a 1s settle delay. Previously we used
+                            # self._root.after(1000, ...) here, but Tcl's
+                            # after-timer fired by Tcl_DoOneEvent while
+                            # processing the wake-time backlog crashed the
+                            # process inside the _tkinter Tcl->Python
+                            # callback bridge (Py_FatalError -> abort,
+                            # 0xc0000409). A plain thread sidesteps Tcl's
+                            # timer system; on_power_resume itself already
+                            # dispatches the heavy recovery work to its own
+                            # worker thread, so this delay-thread is short-
+                            # lived.
+                            try:
+                                threading.Thread(
+                                    target=_delayed_resume,
+                                    args=(self.on_power_resume,),
+                                    name="cld-power-resume-delay",
+                                    daemon=True,
+                                ).start()
+                            except Exception:
+                                logger.error("Failed to spawn resume delay thread", exc_info=True)
 
                 # Call original window procedure
                 return CallWindowProcW(
