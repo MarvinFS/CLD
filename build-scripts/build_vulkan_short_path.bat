@@ -10,7 +10,7 @@ echo === Setting up Visual Studio build environment ===
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64
 
 echo === Setting up Python 3.12 environment ===
-set PATH=D:\claudecli-dictate2\.venv\Scripts;C:\Program Files\Python312;%PATH%
+set PATH=%USERPROFILE%\CLD\.venv\Scripts;C:\Program Files\Python312;%PATH%
 REM Use all CPU cores for parallel compilation
 set CMAKE_BUILD_PARALLEL_LEVEL=16
 REM CMAKE_ARGS is passed through environment to CMake - use Ninja for faster builds
@@ -26,8 +26,8 @@ REM Remove any existing X: mapping
 subst X: /d 2>nul
 
 REM Map X: to pywhispercpp-src folder
-echo === Creating short path mapping X: -^> D:\claudecli-dictate2\pywhispercpp-src ===
-subst X: D:\claudecli-dictate2\pywhispercpp-src
+echo === Creating short path mapping X: -^> %USERPROFILE%\CLD\pywhispercpp-src ===
+subst X: %USERPROFILE%\CLD\pywhispercpp-src
 if errorlevel 1 (
     echo ERROR: Failed to create subst mapping. Try running as admin or use a different letter.
     exit /b 1
@@ -58,8 +58,8 @@ if %BUILD_RESULT% neq 0 (
 echo.
 echo === Checking results ===
 echo DLLs in site-packages:
-dir /b D:\claudecli-dictate2\.venv\Lib\site-packages\*.dll 2>nul
-dir /b D:\claudecli-dictate2\.venv\Lib\site-packages\*pywhispercpp*.pyd 2>nul
+dir /b %USERPROFILE%\CLD\.venv\Lib\site-packages\*.dll 2>nul
+dir /b %USERPROFILE%\CLD\.venv\Lib\site-packages\*pywhispercpp*.pyd 2>nul
 
 echo.
 echo === Verifying Vulkan support ===

@@ -9,7 +9,13 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable, Optional
 
-from cld.model_manager import ModelManager, WHISPER_MODELS
+from cld.model_manager import (
+    ModelManager,
+    WHISPER_MODELS,
+    get_models,
+    get_spec,
+    has_spec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,12 +79,21 @@ class ModelSetupDialog:
         parent: Optional[tk.Tk] = None,
         on_success: Optional[Callable[[], None]] = None,
         on_exit: Optional[Callable[[], None]] = None,
+        engine: str = "whisper",
+        persist_config: bool = True,
     ):
         self._manager = model_manager
         self._model_name = model_name
         self._parent = parent
         self._on_success = on_success
         self._on_exit = on_exit
+        # Engine this dialog installs a model for. When ``persist_config`` is
+        # False (transactional engine-switch path) the dialog does NOT write
+        # config; the caller reads ``selected_model`` and persists after the
+        # new engine loads.
+        self._engine = engine
+        self._persist_config = persist_config
+        self.selected_model: Optional[str] = None
 
         self._window: Optional[tk.Tk] = None
         self._root: Optional[tk.Tk] = None
@@ -215,7 +230,11 @@ class ModelSetupDialog:
         try:
             from cld.ui.hardware import detect_hardware
             hw = detect_hardware()
-            self._model_name = hw.recommended_model
+            # Only adopt the hardware recommendation for Whisper. Nemotron has
+            # a single pinned model; never overwrite the requested name with a
+            # Whisper GGML recommendation.
+            if self._engine == "whisper":
+                self._model_name = hw.recommended_model
             self._hw_info = {
                 "has_cuda": hw.has_cuda,
                 "gpu_name": hw.gpu_name,
@@ -322,9 +341,13 @@ class ModelSetupDialog:
             justify="left",
         ).pack(anchor="w", pady=(0, 6))
 
+        recommended = (
+            self._model_name if self._engine == "nemotron"
+            else self._hw_info["recommended"]
+        )
         tk.Label(
             hw_inner,
-            text=f"Recommended model: {self._hw_info['recommended']}",
+            text=f"Recommended model: {recommended}",
             font=("Segoe UI Semibold", 9),
             fg=self._green,
             bg=self._surface,
@@ -395,8 +418,8 @@ class ModelSetupDialog:
         )
         self._model_dropdown["menu"] = self._model_menu
 
-        # Populate models
-        model_names = list(WHISPER_MODELS.keys())
+        # Populate models from the matching engine registry.
+        model_names = list(get_models(self._engine).keys())
         for name in model_names:
             self._model_menu.add_command(
                 label=name,
@@ -494,23 +517,25 @@ class ModelSetupDialog:
     def _update_model_info(self):
         """Update model info display."""
         model_name = self._model_var.get() if self._model_var else self._model_name
-        info = WHISPER_MODELS.get(model_name)
+        info = get_spec(self._engine, model_name) if has_spec(self._engine, model_name) else None
 
         if info:
-            _compatible, warning = self._manager.check_hardware_compatibility(model_name)
-
             text = f"{info['description']}\n"
-            text += f"Size: {info['size']} | RAM: {info['ram']} | CPU: {info['cores']}+ cores"
+            text += f"Size: {info.get('size', '?')} | RAM: {info['ram']} | CPU: {info['cores']}+ cores"
 
-            if warning:
-                text += f"\n{warning}"
+            # Whisper has a CPU-instruction compatibility check; Nemotron runs
+            # on any CPU via onnxruntime, so skip it there.
+            if self._engine == "whisper":
+                _compatible, warning = self._manager.check_hardware_compatibility(model_name)
+                if warning:
+                    text += f"\n{warning}"
 
             if self._info_label:
                 self._info_label.config(text=text)
 
         # Update URL
         if self._url_label:
-            url = self._manager.get_download_url(model_name)
+            url = self._manager.get_engine_download_url(self._engine, model_name)
             if url:
                 self._url_label.config(text=url)
 
@@ -553,7 +578,9 @@ class ModelSetupDialog:
                     text = f"{downloaded / (1024*1024):.1f} MB downloaded"
                 self._post_to_ui(lambda p=pct, t=text: self._update_progress(p, t))
 
-            success, error = self._manager.download_model(self._model_name, progress_callback)
+            success, error = self._manager.download_engine_model(
+                self._engine, self._model_name, progress_callback
+            )
             self._post_to_ui(lambda s=success, e=error: self._on_download_complete(s, e))
 
         self._download_thread = threading.Thread(target=download, daemon=True)
@@ -572,19 +599,26 @@ class ModelSetupDialog:
         self._progress_bar.stop()
 
         if success:
-            valid, verr = self._manager.validate_model(self._model_name)
+            valid, verr = self._manager.validate_engine_model(self._engine, self._model_name)
             if valid:
                 self._progress_bar.config(mode="determinate", value=100)
                 self._progress_label.config(text="Download complete!", fg=self._green)
-                # Save selected model to config
-                try:
-                    from cld.config import Config
-                    config = Config.load()
-                    config.engine.whisper_model = self._model_name
-                    config.save()
-                    logger.info("Saved selected model to config: %s", self._model_name)
-                except Exception as e:
-                    logger.warning("Failed to save model selection: %s", e)
+                self.selected_model = self._model_name
+                # Persist only on the first-run path. The transactional
+                # engine-switch path passes persist_config=False and reads
+                # ``selected_model`` after its own engine load succeeds.
+                if self._persist_config:
+                    try:
+                        from cld.config import Config
+                        config = Config.load()
+                        if self._engine == "nemotron":
+                            config.engine.nemotron_model = self._model_name
+                        else:
+                            config.engine.whisper_model = self._model_name
+                        config.save()
+                        logger.info("Saved selected model to config: %s", self._model_name)
+                    except Exception as e:
+                        logger.warning("Failed to save model selection: %s", e)
                 self._result = True
                 self._window.after(500, self._close)
                 return
@@ -647,7 +681,7 @@ class ModelSetupDialog:
             bg=self._surface,
         ).pack(anchor="w", pady=(0, 6))
 
-        url = self._manager.get_download_url(self._model_name) or ""
+        url = self._manager.get_engine_download_url(self._engine, self._model_name) or ""
         url_label = tk.Label(
             step1_inner,
             text=url,
@@ -682,7 +716,29 @@ class ModelSetupDialog:
             command=copy_url,
         ).pack(anchor="w")
 
-        # Step 2: Download files
+        if self._engine == "nemotron":
+            self._build_manual_nemotron_steps(container, manual_win, url)
+        else:
+            self._build_manual_whisper_steps(container, manual_win)
+
+        # Close button
+        tk.Button(
+            container,
+            text="Close",
+            font=("Segoe UI", 10),
+            bg=self._surface,
+            fg=self._text,
+            activebackground=self._border,
+            activeforeground=self._text,
+            bd=0,
+            padx=20,
+            pady=10,
+            cursor="hand2",
+            command=manual_win.destroy,
+        ).pack(side=tk.RIGHT)
+
+    def _build_manual_whisper_steps(self, container, manual_win) -> None:
+        """Whisper manual steps: download single .bin, copy to models folder."""
         step2_frame = tk.Frame(container, bg=self._surface)
         step2_frame.pack(fill=tk.X, pady=(0, 12))
         step2_inner = tk.Frame(step2_frame, bg=self._surface)
@@ -700,15 +756,13 @@ class ModelSetupDialog:
         model_file = model_info.get("file", f"ggml-{self._model_name}.bin")
         tk.Label(
             step2_inner,
-            text=f"Click the URL above to download the single .bin file:\n"
-                 f"  - {model_file}",
+            text=f"Click the URL above to download the single .bin file:\n  - {model_file}",
             font=("Segoe UI", 9),
             fg=self._text_dim,
             bg=self._surface,
             justify="left",
         ).pack(anchor="w")
 
-        # Step 3: Copy to folder
         step3_frame = tk.Frame(container, bg=self._surface)
         step3_frame.pack(fill=tk.X, pady=(0, 12))
         step3_inner = tk.Frame(step3_frame, bg=self._surface)
@@ -722,9 +776,7 @@ class ModelSetupDialog:
             bg=self._surface,
         ).pack(anchor="w", pady=(0, 6))
 
-        # GGML models are single .bin files stored flat in the models directory
         target_dir = self._manager._models_dir
-
         tk.Label(
             step3_inner,
             text="Copy the downloaded .bin file to:",
@@ -753,46 +805,106 @@ class ModelSetupDialog:
             manual_win.after(1500, lambda: folder_label.config(text=folder_path))
 
         folder_label.bind("<Button-1>", lambda e: copy_path())
-
         tk.Button(
-            step3_inner,
-            text="Copy Path",
-            font=("Segoe UI", 9),
-            bg=self._border,
-            fg=self._text,
-            activebackground=self._accent,
-            activeforeground=self._text,
-            bd=0,
-            padx=12,
-            pady=4,
-            cursor="hand2",
+            step3_inner, text="Copy Path", font=("Segoe UI", 9),
+            bg=self._border, fg=self._text, activebackground=self._accent,
+            activeforeground=self._text, bd=0, padx=12, pady=4, cursor="hand2",
             command=copy_path,
         ).pack(anchor="w")
 
-        # Note
         tk.Label(
             container,
             text="Note: Create the folder if it doesn't exist. Keep the original filename.",
-            font=("Segoe UI", 9),
-            fg=self._text_dim,
-            bg=self._bg,
+            font=("Segoe UI", 9), fg=self._text_dim, bg=self._bg,
         ).pack(anchor="w", pady=(0, 12))
 
-        # Close button
-        tk.Button(
-            container,
-            text="Close",
-            font=("Segoe UI", 10),
+    def _build_manual_nemotron_steps(self, container, manual_win, url) -> None:
+        """Nemotron manual: download the .tar.bz2, then CLD verifies + installs it.
+
+        The marker/pointer is only written by ``install_nemotron_from_archive``
+        after the archive SHA-256 and every member hash validate - a
+        user-hand-created marker is never trusted.
+        """
+        step2_frame = tk.Frame(container, bg=self._surface)
+        step2_frame.pack(fill=tk.X, pady=(0, 12))
+        step2_inner = tk.Frame(step2_frame, bg=self._surface)
+        step2_inner.pack(fill=tk.X, padx=16, pady=12)
+
+        tk.Label(
+            step2_inner,
+            text="Step 2: Download the archive (~474MB)",
+            font=("Segoe UI Semibold", 10),
+            fg=self._accent,
             bg=self._surface,
-            fg=self._text,
-            activebackground=self._border,
-            activeforeground=self._text,
-            bd=0,
-            padx=20,
-            pady=10,
-            cursor="hand2",
-            command=manual_win.destroy,
-        ).pack(side=tk.RIGHT)
+        ).pack(anchor="w", pady=(0, 6))
+        archive_name = self._manager.get_nemotron_archive_name(self._model_name) or ""
+        tk.Label(
+            step2_inner,
+            text=f"Click the URL above to download:\n  - {archive_name}",
+            font=("Segoe UI", 9), fg=self._text_dim, bg=self._surface, justify="left",
+        ).pack(anchor="w")
+
+        step3_frame = tk.Frame(container, bg=self._surface)
+        step3_frame.pack(fill=tk.X, pady=(0, 12))
+        step3_inner = tk.Frame(step3_frame, bg=self._surface)
+        step3_inner.pack(fill=tk.X, padx=16, pady=12)
+
+        tk.Label(
+            step3_inner,
+            text="Step 3: Install (CLD verifies SHA-256 + extracts)",
+            font=("Segoe UI Semibold", 10),
+            fg=self._accent,
+            bg=self._surface,
+        ).pack(anchor="w", pady=(0, 6))
+        tk.Label(
+            step3_inner,
+            text="Pick the downloaded .tar.bz2 - CLD checks its hash and every\n"
+                 "extracted file before activating it.",
+            font=("Segoe UI", 9), fg=self._text_dim, bg=self._surface, justify="left",
+        ).pack(anchor="w", pady=(0, 6))
+
+        status_label = tk.Label(
+            step3_inner, text="", font=("Segoe UI", 9), fg=self._text_dim, bg=self._surface,
+            wraplength=480, justify="left",
+        )
+        status_label.pack(anchor="w", pady=(6, 0))
+
+        def install_from_file():
+            from tkinter import filedialog
+            path = filedialog.askopenfilename(
+                parent=manual_win, title="Select downloaded Nemotron archive",
+                filetypes=[("Archive", "*.bz2"), ("All files", "*.*")],
+            )
+            if not path:
+                return
+            # ponytail: synchronous hash of ~474MB freezes this dialog ~10s;
+            # acceptable for the rarely-used manual fallback. update() repaints
+            # the status first.
+            status_label.config(text="Verifying + installing (hashing ~474MB)...", fg=self._yellow)
+            manual_win.update()
+            ok, err = self._manager.install_nemotron_from_archive(path, self._model_name)
+            if ok:
+                self.selected_model = self._model_name
+                if self._persist_config:
+                    try:
+                        from cld.config import Config
+                        c = Config.load()
+                        c.engine.nemotron_model = self._model_name
+                        c.save()
+                    except Exception as e:
+                        logger.warning("Failed to persist nemotron model: %s", e)
+                self._result = True
+                status_label.config(text="Installed and verified!", fg=self._green)
+                manual_win.after(700, lambda: (manual_win.destroy(), self._close()))
+            else:
+                status_label.config(text=f"Failed: {err}", fg=self._red)
+
+        tk.Button(
+            step3_inner, text="Install from file...", font=("Segoe UI Semibold", 9),
+            bg=self._accent, fg=self._text, activebackground="#3a8eef",
+            activeforeground=self._text, bd=0, padx=12, pady=6, cursor="hand2",
+            command=install_from_file,
+        ).pack(anchor="w", pady=(8, 0))
 
     def _on_exit_click(self):
         """Handle exit."""

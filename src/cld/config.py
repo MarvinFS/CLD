@@ -14,6 +14,18 @@ logger = logging.getLogger(__name__)
 # Configuration schema version for migrations
 CONFIG_VERSION = 1
 
+# Default Nemotron model (the one pinned sherpa-onnx package in v1).
+DEFAULT_NEMOTRON_MODEL = "nemotron-3.5-streaming-0.6b-1120ms-int8"
+
+# Nemotron per-stream language codes (passed to stream.set_option("language", X)).
+# "auto" lets the model detect; the rest are the 36 unique ISO codes (40 locales)
+# from the NVIDIA nemotron-3.5-asr-streaming-0.6b model card.
+NEMOTRON_LANGUAGES = (
+    "auto", "en", "es", "fr", "it", "pt", "nl", "de", "tr", "ru", "ar", "hi",
+    "ja", "ko", "vi", "uk", "pl", "sv", "cs", "nb", "da", "bg", "fi", "hr",
+    "sk", "zh", "hu", "ro", "et", "el", "lt", "lv", "mt", "sl", "he", "th", "nn",
+)
+
 
 @dataclass
 class ActivationConfig:
@@ -28,11 +40,13 @@ class ActivationConfig:
 @dataclass
 class EngineConfig:
     """STT engine settings."""
-    type: Literal["whisper"] = "whisper"  # Whisper for multilingual support
+    type: Literal["whisper", "nemotron"] = "nemotron"  # Active STT engine (default; Whisper is the optional GPU engine)
     whisper_model: str = "medium-q5_0"  # ~1.5GB, good accuracy
-    force_cpu: bool = False  # Force CPU-only mode (ignore GPU)
-    gpu_device: int = -1  # -1=auto-select, 0=first GPU, 1=second GPU, etc.
-    translate_to_english: bool = False  # Translate non-English speech to English
+    force_cpu: bool = False  # Force CPU-only mode (ignore GPU) [whisper only]
+    gpu_device: int = -1  # -1=auto-select, 0=first GPU, etc. [whisper only]
+    translate_to_english: bool = False  # Translate to English [whisper only]
+    nemotron_model: str = DEFAULT_NEMOTRON_MODEL  # Nemotron model name
+    nemotron_language: str = "auto"  # Per-stream language for Nemotron
 
 
 @dataclass
@@ -235,12 +249,16 @@ class Config:
             if not force_cpu and eng.get("device") == "cpu":
                 force_cpu = True
             config.engine = EngineConfig(
-                type="whisper",
+                type=eng.get("type", config.engine.type),
                 whisper_model=eng.get("whisper_model", config.engine.whisper_model),
                 force_cpu=force_cpu,
                 gpu_device=eng.get("gpu_device", config.engine.gpu_device),
                 translate_to_english=eng.get(
                     "translate_to_english", config.engine.translate_to_english
+                ),
+                nemotron_model=eng.get("nemotron_model", config.engine.nemotron_model),
+                nemotron_language=eng.get(
+                    "nemotron_language", config.engine.nemotron_language
                 ),
             )
         elif eng is not None:
@@ -419,10 +437,24 @@ class Config:
             logger.warning("Invalid activation.scancode; resetting to 0")
             self.activation.scancode = 0
 
-        # Validate engine (whisper only).
-        if self.engine.type != "whisper":
-            logger.warning("Invalid engine '%s'; defaulting to 'whisper'", self.engine.type)
-            self.engine.type = "whisper"
+        # Validate engine selection.
+        if self.engine.type not in ("whisper", "nemotron"):
+            logger.warning("Invalid engine '%s'; defaulting to 'nemotron'", self.engine.type)
+            self.engine.type = "nemotron"
+
+        # Validate nemotron model name + language (default invalid -> safe).
+        if not isinstance(self.engine.nemotron_model, str) or not self.engine.nemotron_model:
+            logger.warning("Invalid nemotron_model; defaulting to %r", DEFAULT_NEMOTRON_MODEL)
+            self.engine.nemotron_model = DEFAULT_NEMOTRON_MODEL
+        if (
+            not isinstance(self.engine.nemotron_language, str)
+            or self.engine.nemotron_language not in NEMOTRON_LANGUAGES
+        ):
+            logger.warning(
+                "Invalid nemotron_language '%s'; defaulting to 'auto'",
+                self.engine.nemotron_language,
+            )
+            self.engine.nemotron_language = "auto"
 
         # Engine booleans + gpu_device range.
         self.engine.force_cpu = bool(self.engine.force_cpu)

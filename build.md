@@ -41,7 +41,7 @@ Download from https://vulkan.lunarg.com/sdk/home (~2GB). Required for compiling 
 This is the recommended build script. Open a regular Command Prompt:
 
 ```batch
-cd D:\claudecli-dictate2
+cd %USERPROFILE%\CLD
 build-scripts\build_vulkan_no_repair.bat
 ```
 
@@ -57,7 +57,7 @@ The script:
 Before first build, initialize git in pywhispercpp-src (required for setuptools_scm):
 
 ```batch
-cd D:\claudecli-dictate2\pywhispercpp-src
+cd %USERPROFILE%\CLD\pywhispercpp-src
 git init
 git add -A
 git commit -m "Initial commit"
@@ -126,7 +126,7 @@ Python version mismatch. Always use `.venv\Scripts\python.exe -m PyInstaller`, n
 ## File Structure
 
 ```
-D:\claudecli-dictate2\
+%USERPROFILE%\CLD\
 ├── pywhispercpp-src/           # Source with GPU device selection modifications
 │   └── src/main.cpp            # Modified: whisper_init_from_file_with_params
 ├── build-scripts/

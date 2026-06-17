@@ -4,10 +4,10 @@ import ctypes
 import logging
 import platform
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 from typing import Callable, Optional
 
-from cld.config import Config
+from cld.config import Config, NEMOTRON_LANGUAGES
 from cld.ui.hardware import get_available_models, detect_hardware, enumerate_gpus, GPUDeviceInfo
 from cld.ui.key_scanner import KeyScanner, KeyCapture, KEY_DISPLAY_NAMES
 
@@ -101,7 +101,19 @@ class SettingsDialog:
         # Widgets that need updating
         self._key_label: Optional[tk.Label] = None
         self._engine_var: Optional[tk.StringVar] = None
+        self._engine_combo: Optional[ttk.Combobox] = None
+        self._engine_values: list[str] = ["whisper", "nemotron"]
+        self._engine_labels: dict[str, str] = {
+            "whisper": "Whisper (GGML)", "nemotron": "Nemotron (sherpa-onnx)"
+        }
         self._model_combo: Optional[ttk.Combobox] = None
+        self._models_status_label: Optional[tk.Label] = None
+        # Engine-specific rows/controls toggled by _apply_engine_visibility.
+        self._translate_row: Optional[tk.Frame] = None
+        self._language_row: Optional[tk.Frame] = None
+        self._language_var: Optional[tk.StringVar] = None
+        self._language_combo: Optional[ttk.Combobox] = None
+        self._force_cpu_cb: Optional[tk.Checkbutton] = None
 
         # Hardware section state
         self._force_cpu_var: Optional[tk.BooleanVar] = None
@@ -193,9 +205,13 @@ class SettingsDialog:
         # Build sections
         self._build_activation_section(content)
         self._build_engine_section(content)
+        self._build_models_section(content)
         self._build_hardware_section(content)
         self._build_output_section(content)
         self._build_recording_section(content)
+
+        # Apply engine-specific control visibility now that all sections exist.
+        self._apply_engine_visibility()
 
         # Button bar
         btn_frame = tk.Frame(self._window, bg=self._bg)
@@ -499,7 +515,7 @@ class SettingsDialog:
         """Build the engine settings section."""
         section = self._build_section(parent, "STT Engine")
 
-        # Engine row
+        # Engine row - dropdown (Whisper / Nemotron)
         engine_row = tk.Frame(section, bg=self._surface)
         engine_row.pack(fill=tk.X, padx=12, pady=8)
 
@@ -511,16 +527,22 @@ class SettingsDialog:
             bg=self._surface,
         ).pack(side=tk.LEFT)
 
-        # Whisper engine (multilingual support)
-        self._engine_var = tk.StringVar(value="whisper")
-        engine_label = tk.Label(
+        self._engine_values = ["whisper", "nemotron"]
+        self._engine_labels = {"whisper": "Whisper (GGML)", "nemotron": "Nemotron (sherpa-onnx)"}
+        self._engine_var = tk.StringVar(value=self._config.engine.type)
+        engine_combo = ttk.Combobox(
             engine_row,
-            text="Whisper (multilingual)",
-            font=("Segoe UI", 10),
-            fg=self._green,
-            bg=self._surface,
+            textvariable=self._engine_var,
+            values=[self._engine_labels[e] for e in self._engine_values],
+            state="readonly",
+            width=25,
+            style="Dark.TCombobox",
         )
-        engine_label.pack(side=tk.RIGHT)
+        engine_combo.pack(side=tk.RIGHT)
+        if self._config.engine.type in self._engine_values:
+            engine_combo.current(self._engine_values.index(self._config.engine.type))
+        engine_combo.bind("<<ComboboxSelected>>", self._on_engine_change)
+        self._engine_combo = engine_combo
 
         # Model row
         model_row = tk.Frame(section, bg=self._surface)
@@ -534,7 +556,7 @@ class SettingsDialog:
             bg=self._surface,
         ).pack(side=tk.LEFT)
 
-        current_model = self._get_model_for_engine(self._config.engine.type)
+        current_model = self._get_model_for_engine(self._selected_engine())
         self._model_var = tk.StringVar(value=current_model)
         self._model_combo = ttk.Combobox(
             model_row,
@@ -546,12 +568,12 @@ class SettingsDialog:
         self._model_combo.pack(side=tk.RIGHT)
         self._update_model_options()
 
-        # Translate to English checkbox
-        translate_row = tk.Frame(section, bg=self._surface)
-        translate_row.pack(fill=tk.X, padx=12, pady=8)
+        # Translate to English checkbox (Whisper only)
+        self._translate_row = tk.Frame(section, bg=self._surface)
+        self._translate_row.pack(fill=tk.X, padx=12, pady=8)
 
         tk.Label(
-            translate_row,
+            self._translate_row,
             text="Translate to English",
             font=("Segoe UI", 10),
             fg=self._text,
@@ -560,7 +582,7 @@ class SettingsDialog:
 
         self._translate_var = tk.BooleanVar(value=self._config.engine.translate_to_english)
         translate_cb = tk.Checkbutton(
-            translate_row,
+            self._translate_row,
             variable=self._translate_var,
             bg=self._surface,
             fg=self._text,
@@ -571,6 +593,30 @@ class SettingsDialog:
             bd=0,
         )
         translate_cb.pack(side=tk.RIGHT)
+
+        # Language selector (Nemotron only) - built now, shown/hidden per engine
+        self._language_row = tk.Frame(section, bg=self._surface)
+        tk.Label(
+            self._language_row,
+            text="Language",
+            font=("Segoe UI", 10),
+            fg=self._text,
+            bg=self._surface,
+        ).pack(side=tk.LEFT)
+        self._language_var = tk.StringVar(value=self._config.engine.nemotron_language)
+        self._language_combo = ttk.Combobox(
+            self._language_row,
+            textvariable=self._language_var,
+            values=list(NEMOTRON_LANGUAGES),
+            state="readonly",
+            width=25,
+            style="Dark.TCombobox",
+        )
+        self._language_combo.pack(side=tk.RIGHT)
+        if self._config.engine.nemotron_language in NEMOTRON_LANGUAGES:
+            self._language_combo.current(
+                list(NEMOTRON_LANGUAGES).index(self._config.engine.nemotron_language)
+            )
 
         # Hardware info row (shows specs when model selected)
         hw_row = tk.Frame(section, bg=self._surface)
@@ -592,6 +638,119 @@ class SettingsDialog:
             bg=self._surface,
         )
         self._hw_info_label.pack(side=tk.LEFT)
+
+    def _build_models_section(self, parent: tk.Frame):
+        """Models section: install status + size per model, with download/remove.
+
+        Read-only status comes straight from ModelManager (LOCALAPPDATA). The
+        buttons act on the model picked in the Engine section's Model dropdown:
+        Download/Verify opens the existing setup dialog (progress + SHA-256),
+        Remove deletes the files after a confirm (never the model in use).
+        """
+        section = self._build_section(parent, "Models")
+
+        self._models_status_label = tk.Label(
+            section, text="", font=("Segoe UI", 9), fg=self._text_dim,
+            bg=self._surface, justify="left", anchor="w", wraplength=340,
+        )
+        self._models_status_label.pack(fill=tk.X, padx=12, pady=(8, 4))
+
+        btn_row = tk.Frame(section, bg=self._surface)
+        btn_row.pack(fill=tk.X, padx=12, pady=(0, 10))
+
+        tk.Button(
+            btn_row, text="Download / Verify…", font=("Segoe UI", 9),
+            bg=self._border, fg=self._text, activebackground=self._accent,
+            activeforeground=self._text, bd=0, padx=10, pady=4, cursor="hand2",
+            command=self._download_selected_model,
+        ).pack(side=tk.LEFT)
+
+        tk.Button(
+            btn_row, text="Remove", font=("Segoe UI", 9),
+            bg=self._border, fg=self._text, activebackground="#aa4444",
+            activeforeground=self._text, bd=0, padx=10, pady=4, cursor="hand2",
+            command=self._remove_selected_model,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+        self._refresh_models_status()
+
+    def _selected_model_name(self) -> str:
+        """Model picked in the Engine-section dropdown (or the configured one)."""
+        engine = self._selected_engine()
+        if self._model_var and self._model_var.get():
+            return self._model_var.get()
+        return self._get_model_for_engine(engine)
+
+    def _refresh_models_status(self):
+        """Repaint the per-model installed/size list for the current engine."""
+        if not self._models_status_label:
+            return
+        from cld.model_manager import ModelManager, get_models
+        engine = self._selected_engine()
+        try:
+            mm = ModelManager()
+            active = self._get_model_for_engine(engine)
+            is_active_engine = engine == self._config.engine.type
+            lines = []
+            for name, info in get_models(engine).items():
+                installed = mm.is_engine_model_available(engine, name, verify_hash=False)
+                mark = "✓" if installed else "–"
+                size = info.get("size", "?")
+                tag = "  (in use)" if (is_active_engine and name == active) else ""
+                lines.append(f"{mark} {name} — {size}{tag}")
+            text = "\n".join(lines) if lines else "No models for this engine."
+        except Exception as e:
+            logger.debug("refresh models status failed: %s", e)
+            text = ""
+        self._models_status_label.config(text=text)
+
+    def _download_selected_model(self):
+        """Open the setup dialog to download/verify the selected model."""
+        from cld.model_manager import ModelManager
+        from cld.ui.model_dialog import ModelSetupDialog
+        engine = self._selected_engine()
+        model = self._selected_model_name()
+        try:
+            ModelSetupDialog(
+                model_manager=ModelManager(), model_name=model, engine=engine,
+                persist_config=False, parent=self._window,
+            ).show()
+        except Exception as e:
+            logger.error("Model download dialog failed: %s", e, exc_info=True)
+        # The child released the grab on close; reclaim it for Settings.
+        try:
+            if self._window:
+                self._window.grab_set()
+        except tk.TclError:
+            pass
+        self._refresh_models_status()
+
+    def _remove_selected_model(self):
+        """Delete the selected model from disk (never the active one)."""
+        from cld.model_manager import ModelManager
+        engine = self._selected_engine()
+        model = self._selected_model_name()
+        if engine == self._config.engine.type and model == self._get_model_for_engine(engine):
+            messagebox.showwarning(
+                "Model in use",
+                f"'{model}' is the active model and can't be removed.\n"
+                "Switch to a different model first.",
+                parent=self._window,
+            )
+            return
+        mm = ModelManager()
+        if not mm.is_engine_model_available(engine, model, verify_hash=False):
+            messagebox.showinfo("Not installed", f"'{model}' is not installed.",
+                                parent=self._window)
+            return
+        if not messagebox.askyesno("Remove model", f"Delete '{model}' from disk?",
+                                   parent=self._window):
+            return
+        ok, err = mm.remove_engine_model(engine, model)
+        if not ok:
+            messagebox.showerror("Remove failed", err or "Unknown error",
+                                 parent=self._window)
+        self._refresh_models_status()
 
     def _build_hardware_section(self, parent: tk.Frame):
         """Build the hardware/GPU settings section."""
@@ -633,6 +792,7 @@ class SettingsDialog:
             bd=0,
         )
         cpu_cb.pack(side=tk.RIGHT)
+        self._force_cpu_cb = cpu_cb
 
         # GPU Device dropdown (if GPUs detected or GPU backend available)
         if self._gpu_devices or hw_info.has_gpu:
@@ -889,34 +1049,82 @@ class SettingsDialog:
         )
         dur_scale.pack(side=tk.RIGHT, padx=(0, 8))
 
+    def _selected_engine(self) -> str:
+        """Return the engine code ('whisper'/'nemotron') from the dropdown label."""
+        if not self._engine_var:
+            return self._config.engine.type
+        label = self._engine_var.get()
+        for code, lbl in self._engine_labels.items():
+            if lbl == label:
+                return code
+        # Fallback: maybe the var already holds a code
+        if label in self._engine_values:
+            return label
+        return self._config.engine.type
+
     def _get_model_for_engine(self, engine: str) -> str:
-        """Get the configured model name (Whisper only)."""
+        """Get the configured model name for the given engine."""
+        if engine == "nemotron":
+            return self._config.engine.nemotron_model
         return self._config.engine.whisper_model
 
     def _on_engine_change(self, event=None):
-        """Handle engine selection change (kept for compatibility)."""
+        """Handle engine selection change: refresh model list + control visibility."""
         self._update_model_options()
+        self._apply_engine_visibility()
+        self._refresh_models_status()
 
     def _update_model_options(self):
-        """Update model dropdown - Whisper only (multilingual)."""
+        """Populate the model dropdown for the currently selected engine."""
         if not self._model_combo:
             return
 
-        # Only Whisper models (multilingual support)
-        models = get_available_models("whisper")
+        engine = self._selected_engine()
+        models = get_available_models(engine)
         values = [m[0] for m in models]
-
         self._model_combo["values"] = values
 
-        current = self._config.engine.whisper_model
+        current = self._get_model_for_engine(engine)
         if current in values:
             self._model_var.set(current)
             self._model_combo.current(values.index(current))
         elif values:
-            # Default to medium for best multilingual support
-            default = "medium" if "medium" in values else values[0]
+            if engine == "whisper":
+                default = "medium" if "medium" in values else values[0]
+            else:
+                default = values[0]
             self._model_var.set(default)
             self._model_combo.current(values.index(default))
+
+    def _apply_engine_visibility(self) -> None:
+        """Show/hide engine-specific controls. Whisper: translate + GPU/CPU.
+        Nemotron: language selector; GPU/CPU controls disabled (CPU-only v1)."""
+        engine = self._selected_engine()
+        is_nemotron = engine == "nemotron"
+
+        # Translate (whisper) vs language (nemotron) rows
+        if self._translate_row is not None:
+            if is_nemotron:
+                self._translate_row.pack_forget()
+            else:
+                self._translate_row.pack(fill=tk.X, padx=12, pady=8)
+        if self._language_row is not None:
+            if is_nemotron:
+                self._language_row.pack(fill=tk.X, padx=12, pady=8)
+            else:
+                self._language_row.pack_forget()
+
+        # Hardware (GPU/CPU) controls are Whisper-only; disable for Nemotron.
+        new_state = "disabled" if is_nemotron else "readonly"
+        if self._gpu_combo is not None:
+            # Keep disabled when whisper+force_cpu; otherwise readonly.
+            if is_nemotron:
+                self._gpu_combo.config(state="disabled")
+            else:
+                force_cpu = bool(self._force_cpu_var and self._force_cpu_var.get())
+                self._gpu_combo.config(state="disabled" if force_cpu else "readonly")
+        if getattr(self, "_force_cpu_cb", None) is not None:
+            self._force_cpu_cb.config(state="disabled" if is_nemotron else "normal")
 
     def _on_window_resize(self, event=None):
         """Handle window resize - update canvas and scrollbar visibility."""
@@ -976,16 +1184,21 @@ class SettingsDialog:
             modifiers.append("alt")
         self._config.activation.modifiers = modifiers
 
-        # Always use Whisper (multilingual)
-        self._config.engine.type = "whisper"
-        self._config.engine.whisper_model = self._model_var.get()
-        self._config.engine.translate_to_english = self._translate_var.get() if self._translate_var else False
-
-        # Save GPU settings
-        if self._force_cpu_var and self._force_cpu_var.get():
-            self._config.engine.force_cpu = True
+        # Engine selection (engine-aware).
+        engine = self._selected_engine()
+        self._config.engine.type = engine
+        if engine == "nemotron":
+            self._config.engine.nemotron_model = self._model_var.get()
+            if self._language_var:
+                self._config.engine.nemotron_language = self._language_var.get()
         else:
-            self._config.engine.force_cpu = False
+            self._config.engine.whisper_model = self._model_var.get()
+            self._config.engine.translate_to_english = (
+                self._translate_var.get() if self._translate_var else False
+            )
+
+        # GPU settings (Whisper-only, but harmless to persist for Nemotron).
+        self._config.engine.force_cpu = bool(self._force_cpu_var and self._force_cpu_var.get())
         self._config.engine.gpu_device = self._get_selected_gpu_index()
 
         self._config.output.mode = self._output_mode_var.get()
@@ -993,11 +1206,13 @@ class SettingsDialog:
 
         self._config.recording.max_seconds = self._duration_var.get()
 
-        # Validate and save
+        # Validate, but do NOT persist here. The daemon (on_save) owns the
+        # transaction: it rebuilds/loads the engine and only persists this
+        # config after the new engine loads (rollback-safe). This dialog
+        # receives a deep copy of the config, so mutating it can't corrupt
+        # the live daemon config if the switch fails.
         self._config.validate()
-        self._config.save()
 
-        # Notify and close
         if self._on_save:
             self._on_save(self._config)
 
@@ -1070,6 +1285,15 @@ class SettingsDialog:
     def is_visible(self) -> bool:
         """Check if dialog is visible."""
         return self._window is not None
+
+    def get_window(self):
+        """Return the dialog's Toplevel window (or None), for use as a parent.
+
+        Lets the daemon parent a nested dialog (the model-setup download
+        prompt during an engine switch) to this window instead of creating a
+        second ``tk.Tk()`` root + nested mainloop.
+        """
+        return self._window
 
 
 def show_settings(

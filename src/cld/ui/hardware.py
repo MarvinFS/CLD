@@ -382,14 +382,13 @@ def get_max_supported_model(info: Optional[HardwareInfo] = None) -> str:
 
 
 def get_available_models(engine: str = "whisper") -> list[tuple[str, str]]:
-    """Get available GGML Whisper models.
-
-    Args:
-        engine: Engine type (only "whisper" supported).
-
-    Returns:
-        List of (value, display_name) tuples.
-    """
+    """Get available models for an engine as (value, display_name) tuples."""
+    if engine == "nemotron":
+        from cld.model_manager import get_models
+        out = []
+        for name, spec in get_models("nemotron").items():
+            out.append((name, f"{name} ({spec.get('size', '?')})"))
+        return out
     return [
         ("small", "Small (~488MB) - Good accuracy"),
         ("medium-q5_0", "Medium Q5 (~539MB) - Recommended"),

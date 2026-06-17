@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import queue
 import threading
 import time
+from dataclasses import asdict
 from typing import Callable, Optional
 
 from cld.config import Config
@@ -389,9 +391,13 @@ class STTDaemon:
         parent = self._overlay.get_root() if self._overlay else None
         self._logger.info("Creating SettingsDialog with parent=%s", parent)
         try:
+            # Hand the dialog a DEEP COPY of the config. It mutates that copy
+            # and returns it via on_save; the daemon performs the transaction
+            # and persists. A failed engine switch can therefore never corrupt
+            # the live self.config.
             self._settings_dialog = SettingsDialog(
                 parent=parent,
-                config=self.config,
+                config=copy.deepcopy(self.config),
                 on_save=self._on_config_change,
                 on_hotkey_suppress=self._suppress_hotkey,
                 on_hotkey_restore=self._restore_hotkey,
@@ -432,22 +438,135 @@ class STTDaemon:
         self._logger.info("Settings dialog queued, queue size: %d", self._main_thread_queue.qsize())
 
     def _on_config_change(self, new_config: Config):
-        """Called when configuration changes."""
-        self._logger.info("Configuration changed, reloading...")
-        self.config = new_config
+        """Apply a configuration change transactionally.
 
-        # Update hotkey if needed
-        if self._hotkey:
-            # Restart hotkey listener with new settings
-            self._hotkey.stop()
-            self._hotkey = HotkeyListener(
-                hotkey=self.config.hotkey,
-                on_start=self._on_recording_start,
-                on_stop=self._on_recording_stop,
-                mode=self.config.mode,
+        If the engine config changed (type/model/language or Whisper hardware
+        flags), the new engine is built and loaded FIRST; only on success do
+        we swap ``_engine``, unload the old one, and persist the new config.
+        On any failure the old engine and old config stay active (nothing is
+        persisted, ``_engine`` is never left unloaded).
+
+        Non-engine changes (hotkey, output, recording) are adopted + persisted
+        directly. The hotkey listener is always restarted with the now-active
+        config.
+        """
+        self._logger.info("Configuration change requested")
+        new_config = new_config.validate()
+
+        if self._engine_config_differs(self.config, new_config):
+            if not self._switch_engine(new_config):
+                # Keep old engine + old config. Restart hotkey with the still
+                # unchanged config so the listener stays alive.
+                self._logger.error(
+                    "Engine switch failed; keeping previous engine and config"
+                )
+                self._print_status("Engine switch failed")
+                self._notify("Engine switch failed - kept the previous engine.", "CLD")
+                self._restart_hotkey()
+                return
+            # _switch_engine set self._engine, self.config, and persisted.
+        else:
+            self.config = new_config
+            new_config.save()
+
+        self._restart_hotkey()
+
+    @staticmethod
+    def _engine_config_differs(old: Config, new: Config) -> bool:
+        """True if any engine-affecting field changed (requires rebuild)."""
+        return asdict(old.engine) != asdict(new.engine)
+
+    def _restart_hotkey(self) -> None:
+        """Recreate the hotkey listener from the active config."""
+        if not self._hotkey:
+            return
+        self._hotkey.stop()
+        self._hotkey = HotkeyListener(
+            hotkey=self.config.hotkey,
+            on_start=self._on_recording_start,
+            on_stop=self._on_recording_stop,
+            mode=self.config.mode,
+        )
+        if self.config.activation.enabled:
+            self._hotkey.start()
+
+    _ENGINE_LABELS = {"whisper": "Whisper", "nemotron": "Nemotron"}
+
+    def _notify(self, message: str, title: str = "CLD") -> None:
+        """Best-effort tray balloon. No-op if the tray isn't up.
+
+        TrayIcon.notify already swallows backend errors, so no guard here.
+        """
+        if self._tray is not None:
+            self._tray.notify(message, title)
+
+    def _switch_engine(self, new_config: Config) -> bool:
+        """Build + load the new engine, then swap, unload old, and persist.
+
+        Returns True on success. On any failure the previous engine stays
+        loaded and active and nothing is persisted.
+        """
+        engine_type = new_config.engine.type
+        model_name = (
+            new_config.engine.nemotron_model if engine_type == "nemotron"
+            else new_config.engine.whisper_model
+        )
+
+        # 1. Ensure the new engine's model is installed; offer download first.
+        mm = ModelManager()
+        if not mm.is_engine_model_available(engine_type, model_name):
+            self._logger.info(
+                "Model %s/%s not installed; offering setup dialog", engine_type, model_name
             )
-            if self.config.activation.enabled:
-                self._hotkey.start()
+            if not self._show_model_setup_dialog(
+                mm, engine=engine_type, model_name=model_name, persist=False,
+                parent=self._active_tk_parent(),
+            ):
+                self._logger.warning("Model not installed; aborting engine switch")
+                return False
+
+        # 2. Build the new engine.
+        try:
+            new_engine = build_engine(new_config)
+        except Exception:
+            self._logger.exception("build_engine failed during switch")
+            return False
+        if not new_engine.is_available():
+            err = new_engine.get_last_error() if hasattr(new_engine, "get_last_error") else None
+            self._logger.error("New engine not available: %s", err)
+            return False
+
+        # 3. Load the new engine BEFORE touching the running one.
+        try:
+            if not new_engine.load_model():
+                err = (
+                    new_engine.get_last_error()
+                    if hasattr(new_engine, "get_last_error") else None
+                )
+                self._logger.error("New engine failed to load: %s", err)
+                return False
+        except Exception:
+            self._logger.exception("New engine load_model raised during switch")
+            return False
+
+        # 4. Commit: swap, unload old, persist new config.
+        old_engine = self._engine
+        self._engine = new_engine
+        self.config = new_config
+        if old_engine is not None and hasattr(old_engine, "unload_model"):
+            try:
+                old_engine.unload_model()
+            except Exception:
+                self._logger.debug("Old engine unload failed", exc_info=True)
+        new_config.save()
+        self._logger.info("Engine switched to %s/%s and config persisted",
+                          engine_type, model_name)
+        self._print_status("✓ Ready")
+        # Visible confirmation - the switch is otherwise silent when the model
+        # was already on disk (no download dialog shown).
+        label = self._ENGINE_LABELS.get(engine_type, engine_type)
+        self._notify(f"Now using {label}  ·  {model_name}", "CLD engine switched")
+        return True
 
     def _on_tray_show_overlay(self):
         """Show the overlay from tray menu."""
@@ -595,7 +714,7 @@ class STTDaemon:
             # Description
             tk.Label(
                 content,
-                text="Local multilingual speech-to-text\nPowered by Whisper",
+                text="Local multilingual speech-to-text\nPowered by Nemotron and Whisper",
                 font=("Segoe UI", 10),
                 fg=text_dim,
                 bg=bg,
@@ -889,34 +1008,86 @@ class STTDaemon:
             with self._resume_lock:
                 self._resume_in_progress = False
 
-    def _show_model_setup_dialog(self, model_manager: ModelManager) -> bool:
-        """Show model setup dialog.
+    def _active_model_name(self, engine: Optional[str] = None) -> str:
+        """Resolve the active model name for the given (or current) engine."""
+        engine = engine or self.config.engine.type
+        if engine == "nemotron":
+            return self.config.engine.nemotron_model
+        return self.config.engine.whisper_model
+
+    def _active_tk_parent(self):
+        """Find a live Tk window to parent a nested dialog to.
+
+        Prefer the open settings dialog (the engine switch is driven from it),
+        then the overlay root. Returns None when nothing is up (first run),
+        in which case the model dialog creates its own root - safe because no
+        other Tk root exists yet.
+        """
+        if self._settings_dialog is not None:
+            try:
+                win = self._settings_dialog.get_window()
+                if win is not None:
+                    return win
+            except Exception:
+                pass
+        if self._overlay is not None:
+            try:
+                return self._overlay.get_root()
+            except Exception:
+                pass
+        return None
+
+    def _show_model_setup_dialog(
+        self,
+        model_manager: ModelManager,
+        engine: Optional[str] = None,
+        model_name: Optional[str] = None,
+        persist: bool = True,
+        parent=None,
+    ) -> bool:
+        """Show the engine-aware model setup dialog.
 
         Args:
             model_manager: ModelManager instance.
+            engine: Engine to install for (defaults to current config engine).
+            model_name: Model to install (defaults to active model for engine).
+            persist: If True (first-run) the dialog persists the selected model
+                to config. If False (transactional switch) it must NOT persist;
+                the daemon persists after the new engine loads.
 
         Returns:
-            True if model is ready, False if user cancelled.
+            True if the model is ready, False if user cancelled / failed.
         """
         if not _MODEL_DIALOG_AVAILABLE:
             return False
 
+        engine = engine or self.config.engine.type
+        if model_name is None:
+            model_name = self._active_model_name(engine)
+
         dialog = ModelSetupDialog(
             model_manager=model_manager,
-            model_name=self.config.engine.whisper_model,
+            model_name=model_name,
+            engine=engine,
+            persist_config=persist,
+            parent=parent,
         )
         return dialog.show()
 
     def _print_manual_download_instructions(self, model_manager: ModelManager) -> None:
-        """Print manual download instructions to console."""
+        """Print manual download instructions to console (engine-aware)."""
+        from cld.model_manager import get_models
+
+        engine = self.config.engine.type
+        model_name = self._active_model_name(engine)
         print("\n" + "=" * 60, flush=True)
         print("MODEL SETUP REQUIRED", flush=True)
         print("=" * 60, flush=True)
-        print(f"\nModel '{self.config.engine.whisper_model}' is not installed.", flush=True)
+        print(f"\nModel '{model_name}' ({engine}) is not installed.", flush=True)
         print("\nDownload manually from:", flush=True)
-        for name, info in model_manager.get_all_models().items():
-            url = model_manager.get_download_url(name)
-            print(f"  {name} ({info['size']}): {url}", flush=True)
+        for name, info in get_models(engine).items():
+            url = model_manager.get_engine_download_url(engine, name)
+            print(f"  {name} ({info.get('size', '?')}): {url}", flush=True)
         print(f"\nModels are cached in: {model_manager._models_dir}", flush=True)
         print("=" * 60 + "\n", flush=True)
 
@@ -963,19 +1134,19 @@ class STTDaemon:
         if not self._init_components():
             raise SystemExit(1)
 
-        # Check model availability before loading
+        # Check model availability before loading (engine-aware)
         model_manager = ModelManager()  # ModelManager.__init__ calls setup_model_cache()
-        model_name = self.config.engine.whisper_model
+        engine_type = self.config.engine.type
+        model_name = self._active_model_name(engine_type)
 
-        if not model_manager.is_model_available(model_name):
-            print(f"Model '{model_name}' not found, showing setup dialog...", flush=True)
+        if not model_manager.is_engine_model_available(engine_type, model_name):
+            print(f"Model '{model_name}' ({engine_type}) not found, showing setup dialog...", flush=True)
 
             # Try to show GUI dialog (even without --overlay flag)
             try:
-                if self._show_model_setup_dialog(model_manager):
-                    # Model downloaded successfully, reload config to get selected model
+                if self._show_model_setup_dialog(model_manager, engine=engine_type, model_name=model_name):
+                    # Model installed successfully, reload config to get selected model
                     self.config = Config.load()
-                    model_name = self.config.engine.whisper_model
                     # Reinitialize engine with new model
                     self._engine = build_engine(self.config)
                     print("Model setup complete.", flush=True)

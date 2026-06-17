@@ -224,6 +224,39 @@ def _write_pid_file() -> None:
         logging.getLogger(__name__).debug("Failed to write PID file", exc_info=True)
 
 
+def _pid_alive(pid: int) -> bool:
+    """Return True if ``pid`` is a live process - WITHOUT signalling it.
+
+    The POSIX idiom ``os.kill(pid, 0)`` is a liveness probe on Unix, but on
+    Windows signal 0 is ``CTRL_C_EVENT``: ``os.kill`` would try to *deliver a
+    console control event* to the target, not test it - and in a console-less
+    process it raises, so a perfectly live daemon gets misreported as dead and
+    its PID file is wrongly reaped (which then takes the running daemon down).
+    Use OpenProcess + GetExitCodeProcess, which only reads state.
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def _read_pid_file() -> Optional[int]:
     """Read PID from file and validate the process exists.
 
@@ -234,9 +267,7 @@ def _read_pid_file() -> Optional[int]:
         if not pid_path.exists():
             return None
         pid = int(pid_path.read_text().strip())
-        # Validate process exists (signal 0 = check existence)
-        os.kill(pid, 0)
-        return pid
+        return pid if _pid_alive(pid) else None
     except (ValueError, OSError):
         return None
     except Exception:
@@ -364,7 +395,13 @@ def _spawn_background(enable_overlay: bool = False) -> bool:
             if mutex_held:
                 pid_in_file = _read_pid_file()
                 if pid_in_file == proc.pid:
-                    logger.info("Daemon started in background (PID %d).", proc.pid)
+                    # The daemon is up; never let a logging hiccup (e.g. a
+                    # WinError 6 from a windowed exe's std handles) turn this
+                    # success into a spurious failure + foreground fallback.
+                    try:
+                        logger.info("Daemon started in background (PID %d).", proc.pid)
+                    except Exception:
+                        pass
                     return True
                 if mutex_first_seen is None:
                     mutex_first_seen = time.monotonic()

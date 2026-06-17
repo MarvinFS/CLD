@@ -26,4 +26,11 @@ def build_engine(config: Config) -> STTEngine:
             gpu_device=gpu_device,
             translate_to_english=config.engine.translate_to_english,
         )
+    elif engine_type == "nemotron":
+        from cld.engines.nemotron import NemotronEngine
+
+        return NemotronEngine(
+            model_name=config.engine.nemotron_model,
+            language=config.engine.nemotron_language,
+        )
     raise EngineError(f"Unknown engine '{engine_type}'")

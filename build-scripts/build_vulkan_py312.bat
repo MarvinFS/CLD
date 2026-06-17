@@ -10,13 +10,13 @@ REM   - GPU drivers with Vulkan support
 REM
 REM Usage:
 REM   1. Open "Developer Command Prompt for VS 2022"
-REM   2. cd D:\claudecli-dictate2\build-scripts
+REM   2. cd %USERPROFILE%\CLD\build-scripts
 REM   3. build_vulkan_py312.bat
 
 setlocal
 
-set VENV=D:\claudecli-dictate2\.venv
-set PYWHISPERCPP_SRC=D:\claudecli-dictate2\pywhispercpp-src
+set VENV=%USERPROFILE%\CLD\.venv
+set PYWHISPERCPP_SRC=%USERPROFILE%\CLD\pywhispercpp-src
 
 REM Ensure Python 3.12 from venv is used, not system Python 3.14
 set PATH=%VENV%\Scripts;C:\Program Files\Python312;%PATH%

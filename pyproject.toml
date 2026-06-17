@@ -1,14 +1,16 @@
 [project]
 name = "claudecli-dictate"
-version = "0.7.1"
-description = "ClaudeCli-Dictate (CLD) - Windows GUI speech-to-text with pywhispercpp backend, overlay UI and system tray integration"
+version = "0.8.2"
+description = "ClaudeCli-Dictate (CLD) - Windows GUI speech-to-text with Whisper + Nemotron engines, overlay UI and system tray integration"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
-license = "MIT"
+# Matches LICENSE (GNU GPL v3) and the README license section. Was previously
+# mislabelled "MIT" - reconciled to the actual project license.
+license = "GPL-3.0-or-later"
 authors = [
     { name = "MarvinFS" }
 ]
-keywords = ["whisper", "speech-to-text", "stt", "voice", "dictation", "windows", "gui", "pywhispercpp"]
+keywords = ["whisper", "nemotron", "sherpa-onnx", "speech-to-text", "stt", "voice", "dictation", "windows", "gui", "pywhispercpp"]
 
 dependencies = [
     "sounddevice>=0.4",
@@ -23,6 +25,11 @@ dependencies = [
     "pystray==0.19.5",
     "pillow>=9.0",
     "pywhispercpp>=1.4",
+    # Exact pin: the Nemotron engine targets the sherpa-onnx 1.13.3 Python API
+    # (OnlineRecognizer.from_transducer field names + stream.set_option) and a
+    # specific CPU-only onnxruntime layout the PyInstaller spec excludes from
+    # UPX by exact filename. A minor bump could rename the bundled native files.
+    "sherpa-onnx==1.13.3",
     "psutil>=5.9",
 ]
 

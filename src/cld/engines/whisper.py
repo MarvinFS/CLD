@@ -5,11 +5,12 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
+
+from cld.engines._timeout import TimeoutRunner, FuturesTimeoutError
 
 _whisper_available = False
 _Model = None
@@ -143,12 +144,9 @@ class WhisperEngine:
         # that unload_model() (driven by sleep/wake recovery) cannot delete
         # the native model while whisper.cpp is still using it.
         self._transcribe_lock = threading.Lock()
-        # Long-lived executor used by _transcribe_with_timeout. We keep it
-        # alive across calls so that a timeout doesn't have to wait on
-        # ThreadPoolExecutor.__exit__() (which calls shutdown(wait=True) and
-        # makes the timeout effectively unbounded).
-        self._transcribe_executor: Optional[ThreadPoolExecutor] = None
-        self._executor_lock = threading.Lock()
+        # Long-lived single-worker runner enforcing a real wall-clock timeout
+        # (see engines/_timeout.py). Shared pattern with NemotronEngine.
+        self._runner = TimeoutRunner(thread_name_prefix="cld-transcribe")
         self._logger = logging.getLogger(__name__)
         self._last_error: Optional[str] = None
 
@@ -412,47 +410,21 @@ class WhisperEngine:
 
         return chunks
 
-    def _get_transcribe_executor(self) -> ThreadPoolExecutor:
-        """Lazily build the long-lived single-worker executor.
-
-        We deliberately do NOT use ``with ThreadPoolExecutor(...) as ...`` in
-        the timeout path because the implicit ``__exit__()`` calls
-        ``shutdown(wait=True)`` and blocks until the running task finishes,
-        which makes the wall-clock timeout meaningless. The executor lives
-        for the lifetime of the engine instead, and a timed-out future is
-        cancelled via ``cancel_futures=True``.
-        """
-        with self._executor_lock:
-            if self._transcribe_executor is None:
-                self._transcribe_executor = ThreadPoolExecutor(
-                    max_workers=1, thread_name_prefix="cld-transcribe"
-                )
-            return self._transcribe_executor
-
     def _transcribe_with_timeout(self, audio: np.ndarray) -> str:
         """Transcribe a single audio chunk with a real wall-clock timeout."""
-        executor = self._get_transcribe_executor()
-        future = executor.submit(self._transcribe_internal, audio)
         try:
-            return future.result(timeout=self.transcription_timeout)
+            return self._runner.run(
+                lambda: self._transcribe_internal(audio), self.transcription_timeout
+            )
         except FuturesTimeoutError:
             self._logger.warning(
                 "Chunk transcription timed out after %d seconds.",
                 self.transcription_timeout,
             )
             self._last_error = f"Transcription timed out after {self.transcription_timeout}s"
-            # Best-effort cancellation. The native whisper.cpp call cannot be
-            # interrupted from Python, but cancelling the future stops any
-            # queued follow-up work from running on this stuck worker.
-            future.cancel()
-            # Replace the executor: the stuck worker thread is still alive
-            # holding the GIL-released native call, but a fresh executor
-            # ensures future transcriptions don't queue behind it.
-            with self._executor_lock:
-                stuck = self._transcribe_executor
-                self._transcribe_executor = None
-                if stuck is not None:
-                    stuck.shutdown(wait=False, cancel_futures=True)
+            # The stuck worker is abandoned and the executor replaced inside
+            # TimeoutRunner.run(); the native whisper.cpp call cannot be
+            # interrupted from Python but won't block future transcriptions.
             return ""
 
     def _join_chunks(self, results: List[str]) -> str:

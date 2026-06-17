@@ -186,6 +186,14 @@ def _audio_backend_hint() -> str | None:
 
 
 def _ensure_engine_ready(config: Config, skip_model_download: bool) -> bool:
+    """Dependency-only readiness check.
+
+    Returns True when the selected engine's package merely *imports*. It does
+    NOT gate on model presence: ``run_setup`` exits before starting the daemon
+    if this returns False, and the daemon's first-run dialog is what handles a
+    missing model (including the deferred Nemotron archive install). Gating on
+    the model here would block that deferred install.
+    """
     try:
         engine = build_engine(config)
     except EngineError as exc:
@@ -198,6 +206,11 @@ def _ensure_engine_ready(config: Config, skip_model_download: bool) -> bool:
                 "Whisper dependencies missing. Run: "
                 f"{_dependency_hint('whisper')}"
             )
+        elif config.engine.type == "nemotron":
+            _print_error(
+                "Nemotron dependencies missing (sherpa-onnx). Run: "
+                f"{_dependency_hint()}"
+            )
         else:
             _print_error(
                 "STT engine dependencies missing. Run: "
@@ -205,15 +218,10 @@ def _ensure_engine_ready(config: Config, skip_model_download: bool) -> bool:
             )
         return False
 
-    if skip_model_download:
-        return True
-
-    _print_info("Loading STT model (first run may download)...")
-    if engine.load_model():
-        _print_info("Model ready.")
-        return True
-    _print_error("Model failed to load.")
-    return False
+    # Model presence is intentionally NOT checked here - the daemon first-run
+    # dialog downloads/installs it. skip_model_download is kept for CLI compat.
+    _print_info("Engine dependencies OK (model is installed on first run).")
+    return True
 
 
 def _spawn_daemon(plugin_root: Path) -> bool:

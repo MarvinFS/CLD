@@ -459,6 +459,21 @@ class TrayIcon:
         }
         self._icon.title = titles.get(state, "CLD")
 
+    def notify(self, message: str, title: str = "CLD") -> None:
+        """Show a balloon/toast notification via the tray icon (best-effort).
+
+        Uses pystray's Shell_NotifyIcon balloon on Windows. Safe to call from
+        any thread; silently no-ops if the icon isn't running or the backend
+        lacks notify support.
+        """
+        icon = self._icon
+        if icon is None:
+            return
+        try:
+            icon.notify(message, title)
+        except Exception:
+            logger.debug("Tray notify failed", exc_info=True)
+
     def set_overlay_visible(self, visible: bool):
         """Update overlay visibility state (for menu sync)."""
         self._overlay_visible = visible

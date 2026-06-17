@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 import glob
 import os
+from PyInstaller.utils.hooks import collect_all
 
 # Collect pywhispercpp binaries
 site_packages = '.venv/Lib/site-packages'
@@ -15,12 +16,17 @@ for pattern in ['whisper*.dll', 'ggml*.dll']:
     for f in glob.glob(f'{site_packages}/{pattern}'):
         pywhispercpp_binaries.append((f, '.'))
 
+# Collect sherpa-onnx (Nemotron engine): bundles its own native runtime
+# (onnxruntime.dll, sherpa-onnx-*-api.dll, _sherpa_onnx*.pyd under
+# sherpa_onnx/lib/). MERGE these into the existing lists - do not overwrite.
+sherpa_datas, sherpa_binaries, sherpa_hiddenimports = collect_all('sherpa_onnx')
+
 a = Analysis(
     ['src\\cld\\cli.py'],
     pathex=[],
-    binaries=pywhispercpp_binaries,
-    datas=[('sounds', 'sounds'), ('cld_icon.png', '.'), ('mic_256.png', '.'), ('C:/Program Files/Python312/tcl/tcl8.6', 'tcl/tcl8.6'), ('C:/Program Files/Python312/tcl/tk8.6', 'tcl/tk8.6'), ('.venv/Lib/site-packages/_sounddevice_data', '_sounddevice_data')],
-    hiddenimports=['pywhispercpp', 'pywhispercpp.model'],
+    binaries=pywhispercpp_binaries + sherpa_binaries,
+    datas=[('sounds', 'sounds'), ('cld_icon.png', '.'), ('mic_256.png', '.'), ('C:/Program Files/Python312/tcl/tcl8.6', 'tcl/tcl8.6'), ('C:/Program Files/Python312/tcl/tk8.6', 'tcl/tk8.6'), ('.venv/Lib/site-packages/_sounddevice_data', '_sounddevice_data')] + sherpa_datas,
+    hiddenimports=['pywhispercpp', 'pywhispercpp.model'] + sherpa_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=['pyi_rth_numpy.py', 'pyi_rth_tcltk.py', 'pyi_rth_pywhispercpp.py'],
@@ -69,6 +75,12 @@ coll = COLLECT(
         'whisper.dll',
         '_pywhispercpp.cp312-win_amd64.pyd',
         'vulkan-1.dll',
+        # sherpa-onnx / onnxruntime native runtime (Nemotron). UPX corrupts
+        # large native ML runtimes - same crash class as ggml-vulkan.dll.
+        'onnxruntime.dll',
+        'sherpa-onnx-c-api.dll',
+        'sherpa-onnx-cxx-api.dll',
+        '_sherpa_onnx.cp312-win_amd64.pyd',
     ],
     name='CLD',
 )

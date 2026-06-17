@@ -2,7 +2,7 @@
 
 # 🎙️ CLD - ClaudeCli-Dictate
 
-**Version 0.5.1** | AI-Powered Voice Dictation That Stays on Your Machine
+**Version 0.8.2** | AI-Powered Voice Dictation That Stays on Your Machine
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Windows](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6?logo=windows)](https://github.com/MarvinFS/CLD)
@@ -55,9 +55,11 @@ CLD brings several capabilities together in one lightweight application.
 
 **🔐 Local Processing:** Audio capture, transcription, and text injection all happen on your machine. Nothing is uploaded anywhere. Your conversations, notes, and thoughts stay private.
 
-**🌐 Multilingual Support:** CLD uses Whisper, an open-source speech recognition model originally released by OpenAI. The actual implementation is whisper.cpp (a fast C++ port) with GGML model files from HuggingFace. Whisper understands 99 languages. Speak in English, German, Japanese, Russian, or any supported language and CLD transcribes in that language. It can even translate everything to English, if you tell it to do so in settings.
+**🌐 Multilingual, CPU-first (default engine):** Out of the box CLD uses NVIDIA Nemotron-3.5-ASR (via sherpa-onnx / k2-fsa). It runs entirely on the CPU with no GPU required, covers 40 locales including English and Russian, and writes punctuation as it transcribes. Speak in your language and CLD transcribes in that language, with your audio never leaving the machine.
 
-**⚡ GPU Acceleration:** CLD uses the Vulkan graphics API for GPU-accelerated inference. A 30-second recording transcribes in about 1-2 seconds on a mid-range GPU. Without GPU acceleration, the same recording might take 10-15 but in most cases close to 30 seconds.
+**🔀 Whisper engine (optional, GPU-accelerated):** Prefer Whisper, or want to use your GPU? Switch to Whisper (whisper.cpp with GGML models from HuggingFace) in Settings. It understands 99 languages and can translate everything to English. The first time you pick an engine, CLD downloads and verifies its model.
+
+**⚡ GPU Acceleration (Whisper engine):** When you run the Whisper engine, CLD uses the Vulkan graphics API for GPU-accelerated inference. A 30-second recording transcribes in about 1-2 seconds on a mid-range GPU. The default Nemotron engine runs on the CPU and needs no GPU at all.
 
 **🔄 Recording Modes:** Choose toggle mode (press once to start, press again to stop) or push-to-talk mode (hold to record, release to transcribe). Either way, the overlay shows your recording duration and responds to your voice with animated waveform bars.
 
@@ -67,7 +69,7 @@ CLD brings several capabilities together in one lightweight application.
 
 ## 🌍 Supported Languages
 
-Whisper supports 99 languages with automatic language detection. Just speak in your language and CLD transcribes it without any configuration:
+The default Nemotron engine covers 40 locales including English and Russian; the optional Whisper engine supports 99 languages with automatic detection. Just speak in your language and CLD transcribes it without any configuration:
 
 <details>
 <summary><b>Click to expand full language list</b></summary>
@@ -151,7 +153,7 @@ If medium-q5_0 struggles on your system, try the small model. If you have plenty
 
 On my home computer I personally use medium model and it works amazingly - a bit slower than medium-q5_0, but on my GPU still almost instant.
 
-Models are downloaded from HuggingFace during first-time setup and stored at `%LOCALAPPDATA%\CLD\models\`. File integrity is verified using MD5 hashes after download to catch corrupted files.
+Models are downloaded during first-time setup and stored at `%LOCALAPPDATA%\CLD\models\`. File integrity is verified using SHA-256 hashes after download, so a corrupted or tampered file is rejected before it is ever used. The optional Nemotron engine ships as a multi-file archive; CLD verifies the archive's SHA-256 and then every extracted file's SHA-256 against a pinned manifest before activating it.
 
 ---
 
@@ -363,7 +365,7 @@ CLD uses a modified pywhispercpp build with GPU device selection support. The so
 1. Open "Developer Command Prompt for VS 2022"
 2. Navigate to the build-scripts directory:
    ```
-   cd D:\claudecli-dictate2\build-scripts
+   cd %USERPROFILE%\CLD\build-scripts
    ```
 3. Run the build script:
    ```
@@ -428,12 +430,15 @@ The core recording and transcription logic remains inspired by the original, but
 | [Whisper](https://github.com/openai/whisper) | OpenAI | MIT |
 | [whisper.cpp](https://github.com/ggerganov/whisper.cpp) | Georgi Gerganov | MIT |
 | [GGML Models](https://huggingface.co/ggerganov/whisper.cpp) | Georgi Gerganov | MIT |
+| [Nemotron-3.5-ASR-Streaming-0.6B](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) | NVIDIA | OpenMDW-1.1 (ONNX export: MIT) |
 
 #### Core Dependencies
 
 | Library | Author | License |
 |---------|--------|---------|
 | [pywhispercpp](https://github.com/abdeladim-s/pywhispercpp) | Abdeladim Sadiki | MIT |
+| [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | k2-fsa | Apache-2.0 |
+| [onnxruntime](https://github.com/microsoft/onnxruntime) | Microsoft | MIT |
 | [sounddevice](https://github.com/spatialaudio/python-sounddevice) | Matthias Geier | MIT |
 | [pynput](https://github.com/moses-palmer/pynput) | Moses Palmer | LGPL-3.0 |
 | [pystray](https://github.com/moses-palmer/pystray) | Moses Palmer | LGPL-3.0 |
