@@ -14,10 +14,10 @@ logger = logging.getLogger(__name__)
 # Configuration schema version for migrations
 CONFIG_VERSION = 1
 
-# Default Nemotron model (the one pinned sherpa-onnx package in v1).
+# Default Nemotron model (pinned in model_manager.NEMOTRON_MODELS).
 DEFAULT_NEMOTRON_MODEL = "nemotron-3.5-streaming-0.6b-1120ms-int8"
 
-# Nemotron per-stream language codes (passed to stream.set_option("language", X)).
+# Nemotron language codes (mapped to the model's language prompt id).
 # "auto" lets the model detect; the rest are the 36 unique ISO codes (40 locales)
 # from the NVIDIA nemotron-3.5-asr-streaming-0.6b model card.
 NEMOTRON_LANGUAGES = (
@@ -30,10 +30,10 @@ NEMOTRON_LANGUAGES = (
 @dataclass
 class ActivationConfig:
     """Activation key settings."""
-    key: str = "alt"  # Generic 'alt' works with any Alt key (left, right, or AltGr)
-    scancode: int = 0  # Scancode is informational only; matching uses key name
+    key: str = "alt_r"  # Right Alt (AltGr); left Alt keeps opening app menus
+    scancode: int = 56  # Scancode is informational only; matching uses key name
     modifiers: list = field(default_factory=list)  # Optional modifiers: ["ctrl"], ["shift"], ["ctrl", "shift"]
-    mode: Literal["push_to_talk", "toggle"] = "toggle"  # Press to start, press again to stop
+    mode: Literal["push_to_talk", "toggle"] = "push_to_talk"  # Hold to record, release to transcribe
     enabled: bool = True
 
 
@@ -41,7 +41,7 @@ class ActivationConfig:
 class EngineConfig:
     """STT engine settings."""
     type: Literal["whisper", "nemotron"] = "nemotron"  # Active STT engine (default; Whisper is the optional GPU engine)
-    whisper_model: str = "medium-q5_0"  # ~1.5GB, good accuracy
+    whisper_model: str = "medium-q5_0"  # ~539MB, translates to English; turbo is recommended with a GPU
     force_cpu: bool = False  # Force CPU-only mode (ignore GPU) [whisper only]
     gpu_device: int = -1  # -1=auto-select, 0=first GPU, etc. [whisper only]
     translate_to_english: bool = False  # Translate to English [whisper only]
@@ -61,6 +61,7 @@ class RecordingConfig:
     """Recording settings."""
     max_seconds: int = 300
     sample_rate: int = 16000
+    input_device: str = ""  # Input device name (see AudioRecorder.get_devices); "" = system default
 
 
 @dataclass
@@ -278,6 +279,7 @@ class Config:
             config.recording = RecordingConfig(
                 max_seconds=rec.get("max_seconds", config.recording.max_seconds),
                 sample_rate=rec.get("sample_rate", config.recording.sample_rate),
+                input_device=rec.get("input_device", config.recording.input_device),
             )
         elif rec is not None:
             logger.warning("Invalid 'recording' section (type %s); using defaults", type(rec).__name__)
@@ -456,6 +458,18 @@ class Config:
             )
             self.engine.nemotron_language = "auto"
 
+        # A Whisper model CLD no longer offers (medium and small, dropped in 0.8.3) moves to the default.
+        from cld.model_manager import WHISPER_MODELS
+        if (
+            not isinstance(self.engine.whisper_model, str)
+            or self.engine.whisper_model not in WHISPER_MODELS
+        ):
+            logger.warning(
+                "Unknown whisper_model '%s'; defaulting to %r",
+                self.engine.whisper_model, EngineConfig.whisper_model,
+            )
+            self.engine.whisper_model = EngineConfig.whisper_model
+
         # Engine booleans + gpu_device range.
         self.engine.force_cpu = bool(self.engine.force_cpu)
         self.engine.translate_to_english = bool(self.engine.translate_to_english)
@@ -491,6 +505,9 @@ class Config:
         if self.recording.sample_rate != 16000:
             logger.warning("sample_rate %s not supported; forcing 16000", self.recording.sample_rate)
             self.recording.sample_rate = 16000
+        if not isinstance(self.recording.input_device, str):
+            logger.warning("Invalid input_device %r; using system default", self.recording.input_device)
+            self.recording.input_device = ""
 
         # Validate UI overlay position - must be a [int, int] list.
         pos = self.ui.overlay_position
@@ -506,8 +523,3 @@ class Config:
         self.ui.show_on_startup = bool(self.ui.show_on_startup)
 
         return self
-
-
-def get_platform() -> str:
-    """Get the current platform identifier (Windows only)."""
-    return "windows"

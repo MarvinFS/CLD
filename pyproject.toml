@@ -1,6 +1,6 @@
 [project]
 name = "claudecli-dictate"
-version = "0.8.2"
+version = "0.8.3"
 description = "ClaudeCli-Dictate (CLD) - Windows GUI speech-to-text with Whisper + Nemotron engines, overlay UI and system tray integration"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -10,7 +10,7 @@ license = "GPL-3.0-or-later"
 authors = [
     { name = "MarvinFS" }
 ]
-keywords = ["whisper", "nemotron", "sherpa-onnx", "speech-to-text", "stt", "voice", "dictation", "windows", "gui", "pywhispercpp"]
+keywords = ["whisper", "nemotron", "onnxruntime", "speech-to-text", "stt", "voice", "dictation", "windows", "gui", "pywhispercpp"]
 
 dependencies = [
     "sounddevice>=0.4",
@@ -25,11 +25,10 @@ dependencies = [
     "pystray==0.19.5",
     "pillow>=9.0",
     "pywhispercpp>=1.4",
-    # Exact pin: the Nemotron engine targets the sherpa-onnx 1.13.3 Python API
-    # (OnlineRecognizer.from_transducer field names + stream.set_option) and a
-    # specific CPU-only onnxruntime layout the PyInstaller spec excludes from
-    # UPX by exact filename. A minor bump could rename the bundled native files.
-    "sherpa-onnx==1.13.3",
+    # Exact pin: the Nemotron engine drives the ONNX model directly through
+    # onnxruntime, and CLD.spec excludes its native files from UPX by exact
+    # filename. A bump can rename them, so re-check CLD.spec's upx_exclude list.
+    "onnxruntime==1.29.0",
     "psutil>=5.9",
 ]
 

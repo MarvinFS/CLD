@@ -1,5 +1,6 @@
 """Keyboard output: direct injection or clipboard fallback."""
 
+import ctypes
 import json
 import logging
 import time
@@ -26,6 +27,52 @@ _injection_checked_at: Optional[float] = None
 _injection_cache_ttl = 300.0
 _logger = logging.getLogger(__name__)
 _pynput_warned = False
+
+# Text goes out through SendInput with KEYEVENTF_UNICODE. pynput's type() sends
+# any character that CLD's own keyboard layout reaches without modifiers as a
+# virtual key, and the target window maps that key through its layout: with
+# Russian active, "." arrives as "ю" and "," as "б".
+_INPUT_KEYBOARD = 1
+_KEYEVENTF_KEYUP = 0x0002
+_KEYEVENTF_UNICODE = 0x0004
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort), ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _MOUSEINPUT(ctypes.Structure):  # only here so the union has INPUT's real size
+    _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", ctypes.c_ulong),
+                ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _INPUT(ctypes.Structure):
+    class _U(ctypes.Union):
+        _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT)]
+
+    _anonymous_ = ("u",)
+    _fields_ = [("type", ctypes.c_ulong), ("u", _U)]
+
+
+def _send_input(events) -> int:
+    return ctypes.windll.user32.SendInput(len(events), events, ctypes.sizeof(_INPUT))
+
+
+def _type_unicode(text: str) -> None:
+    """Type text as Unicode key events, so the target's keyboard layout can't change it."""
+    units = memoryview(text.encode("utf-16-le")).cast("H")
+    events = (_INPUT * (2 * len(units)))()
+    for i, unit in enumerate(units):
+        for j, up in enumerate((0, _KEYEVENTF_KEYUP)):
+            event = events[2 * i + j]
+            event.type = _INPUT_KEYBOARD
+            event.ki.wScan = unit
+            event.ki.dwFlags = _KEYEVENTF_UNICODE | up
+    sent = _send_input(events)
+    if sent != len(events):
+        # Windows blocked the input (e.g. an elevated target window).
+        raise OSError(f"SendInput delivered {sent} of {len(events)} key events")
 
 
 def get_keyboard() -> Controller:
@@ -179,8 +226,7 @@ def _output_via_injection(
         if claude_hwnd:
             _logger.debug("Attempting to focus Claude Code window (hwnd=%d)", claude_hwnd)
             if focus_window_by_hwnd(claude_hwnd):
-                kb = get_keyboard()
-                kb.type(text)
+                _type_unicode(text)
                 if config.sound_effects:
                     play_sound("complete")
                 return True
@@ -205,7 +251,7 @@ def _output_via_injection(
         time.sleep(0.05)
 
         # Type the text
-        kb.type(text)
+        _type_unicode(text)
 
         if config.sound_effects:
             play_sound("complete")
@@ -306,23 +352,4 @@ def _output_via_clipboard(
         if config.sound_effects:
             play_sound("error")
         _logger.warning("Clipboard output failed", exc_info=True)
-        return False
-
-
-def type_text_streaming(text: str) -> bool:
-    """Type text character by character for streaming output.
-
-    This is used during live transcription to show words as they're recognized.
-
-    Args:
-        text: The text to type.
-
-    Returns:
-        True if successful, False otherwise.
-    """
-    try:
-        kb = get_keyboard()
-        kb.type(text)
-        return True
-    except Exception:
         return False

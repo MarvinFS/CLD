@@ -1,6 +1,6 @@
 """Shared wall-clock timeout helper for STT engines.
 
-Native inference calls (whisper.cpp, sherpa-onnx) release the GIL but cannot
+Native inference calls (whisper.cpp, onnxruntime) release the GIL but cannot
 be interrupted from Python. To still enforce a real wall-clock timeout we run
 each call on a long-lived single-worker thread and wait on the future. On
 timeout we abandon the stuck worker and swap in a fresh executor so the next

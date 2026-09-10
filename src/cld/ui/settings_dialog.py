@@ -1,61 +1,24 @@
 """Full settings dialog for CLD."""
 
-import ctypes
 import logging
-import platform
 import tkinter as tk
 from tkinter import ttk, messagebox
 from typing import Callable, Optional
 
 from cld.config import Config, NEMOTRON_LANGUAGES
+from cld.model_manager import WHISPER_MODELS
+from cld.recorder import AudioRecorder
 from cld.ui.hardware import get_available_models, detect_hardware, enumerate_gpus, GPUDeviceInfo
 from cld.ui.key_scanner import KeyScanner, KeyCapture, KEY_DISPLAY_NAMES
+from cld.ui.model_dialog import set_dark_title_bar
 
 logger = logging.getLogger(__name__)
 
 
-def set_dark_title_bar(window) -> None:
-    """Set dark title bar on Windows 10/11."""
-    if platform.system() != "Windows":
-        return
-    try:
-        window.update_idletasks()
-        window.update()
-
-        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-        DWMWA_USE_IMMERSIVE_DARK_MODE_OLD = 19
-        GA_ROOT = 2
-        value = ctypes.c_int(1)
-
-        hwnd = ctypes.windll.user32.GetAncestor(window.winfo_id(), GA_ROOT)
-        if not hwnd:
-            hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
-
-        if hwnd:
-            result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
-                ctypes.byref(value), ctypes.sizeof(value)
-            )
-            if result != 0:
-                ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                    hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_OLD,
-                    ctypes.byref(value), ctypes.sizeof(value)
-                )
-
-            SWP_FRAMECHANGED = 0x0020
-            SWP_NOMOVE = 0x0002
-            SWP_NOSIZE = 0x0001
-            SWP_NOZORDER = 0x0004
-            ctypes.windll.user32.SetWindowPos(
-                hwnd, None, 0, 0, 0, 0,
-                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
-            )
-    except Exception:
-        pass
-
-
 class SettingsDialog:
     """Full settings dialog with all configuration options."""
+
+    _DEFAULT_DEVICE = "System default"  # Combobox label for recording.input_device == ""
 
     def __init__(
         self,
@@ -104,7 +67,7 @@ class SettingsDialog:
         self._engine_combo: Optional[ttk.Combobox] = None
         self._engine_values: list[str] = ["whisper", "nemotron"]
         self._engine_labels: dict[str, str] = {
-            "whisper": "Whisper (GGML)", "nemotron": "Nemotron (sherpa-onnx)"
+            "whisper": "Whisper (GGML)", "nemotron": "Nemotron (ONNX)"
         }
         self._model_combo: Optional[ttk.Combobox] = None
         self._models_status_label: Optional[tk.Label] = None
@@ -527,8 +490,6 @@ class SettingsDialog:
             bg=self._surface,
         ).pack(side=tk.LEFT)
 
-        self._engine_values = ["whisper", "nemotron"]
-        self._engine_labels = {"whisper": "Whisper (GGML)", "nemotron": "Nemotron (sherpa-onnx)"}
         self._engine_var = tk.StringVar(value=self._config.engine.type)
         engine_combo = ttk.Combobox(
             engine_row,
@@ -567,6 +528,7 @@ class SettingsDialog:
         )
         self._model_combo.pack(side=tk.RIGHT)
         self._update_model_options()
+        self._model_combo.bind("<<ComboboxSelected>>", lambda _e: self._apply_engine_visibility())
 
         # Translate to English checkbox (Whisper only)
         self._translate_row = tk.Frame(section, bg=self._surface)
@@ -626,7 +588,7 @@ class SettingsDialog:
         try:
             if self._hw_info is None:
                 self._hw_info = detect_hardware()
-            hw_text = f"CPU: {self._hw_info.cpu_cores} cores | RAM: {self._hw_info.ram_gb:.1f} GB | Recommended: {self._hw_info.recommended_model}"
+            hw_text = f"CPU: {self._hw_info.cpu_cores} cores | RAM: {self._hw_info.ram_gb:.1f} GB | Recommended: {self._hw_info.recommendation}"
         except Exception:
             hw_text = ""
 
@@ -1009,6 +971,32 @@ class SettingsDialog:
         """Build the recording settings section."""
         section = self._build_section(parent, "Recording")
 
+        # Input device row
+        dev_row = tk.Frame(section, bg=self._surface)
+        dev_row.pack(fill=tk.X, padx=12, pady=8)
+
+        tk.Label(
+            dev_row,
+            text="Input Device",
+            font=("Segoe UI", 10),
+            fg=self._text,
+            bg=self._surface,
+        ).pack(side=tk.LEFT)
+
+        devices = [d["name"] for d in AudioRecorder().get_devices()]
+        self._input_device_var = tk.StringVar(
+            value=self._config.recording.input_device or self._DEFAULT_DEVICE
+        )
+        device_combo = ttk.Combobox(
+            dev_row,
+            textvariable=self._input_device_var,
+            values=[self._DEFAULT_DEVICE] + devices,
+            state="readonly",
+            width=30,
+            style="Dark.TCombobox",
+        )
+        device_combo.pack(side=tk.RIGHT)
+
         # Max duration row
         dur_row = tk.Frame(section, bg=self._surface)
         dur_row.pack(fill=tk.X, padx=12, pady=8)
@@ -1089,25 +1077,23 @@ class SettingsDialog:
             self._model_var.set(current)
             self._model_combo.current(values.index(current))
         elif values:
-            if engine == "whisper":
-                default = "medium" if "medium" in values else values[0]
-            else:
-                default = values[0]
-            self._model_var.set(default)
-            self._model_combo.current(values.index(default))
+            self._model_var.set(values[0])
+            self._model_combo.current(0)
 
     def _apply_engine_visibility(self) -> None:
-        """Show/hide engine-specific controls. Whisper: translate + GPU/CPU.
+        """Show/hide engine-specific controls. Whisper: translate (models that can) + GPU/CPU.
         Nemotron: language selector; GPU/CPU controls disabled (CPU-only v1)."""
         engine = self._selected_engine()
         is_nemotron = engine == "nemotron"
 
-        # Translate (whisper) vs language (nemotron) rows
+        # Translate (whisper models that can) vs language (nemotron) rows
         if self._translate_row is not None:
-            if is_nemotron:
+            model = self._model_var.get() if self._model_var else ""
+            if is_nemotron or not WHISPER_MODELS.get(model, {}).get("translates", True):
                 self._translate_row.pack_forget()
             else:
-                self._translate_row.pack(fill=tk.X, padx=12, pady=8)
+                # after= keeps the row under Model when it reappears
+                self._translate_row.pack(fill=tk.X, padx=12, pady=8, after=self._model_combo.master)
         if self._language_row is not None:
             if is_nemotron:
                 self._language_row.pack(fill=tk.X, padx=12, pady=8)
@@ -1115,7 +1101,6 @@ class SettingsDialog:
                 self._language_row.pack_forget()
 
         # Hardware (GPU/CPU) controls are Whisper-only; disable for Nemotron.
-        new_state = "disabled" if is_nemotron else "readonly"
         if self._gpu_combo is not None:
             # Keep disabled when whisper+force_cpu; otherwise readonly.
             if is_nemotron:
@@ -1205,6 +1190,8 @@ class SettingsDialog:
         self._config.output.sound_effects = self._sound_var.get()
 
         self._config.recording.max_seconds = self._duration_var.get()
+        device = self._input_device_var.get()
+        self._config.recording.input_device = "" if device == self._DEFAULT_DEVICE else device
 
         # Validate, but do NOT persist here. The daemon (on_save) owns the
         # transaction: it rebuilds/loads the engine and only persists this

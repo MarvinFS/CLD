@@ -172,7 +172,6 @@ class STTOverlay:
         self._border_color = "#333333"
         self._bar_color_idle = "#444444"
         self._bar_color_active = "#ffffff"
-        self._bar_color_recording = "#66ff66"
         self._timer_color = "#888888"
         self._status_color = "#666666"
         self._accent_color = "#4a9eff"
@@ -843,29 +842,6 @@ class STTOverlay:
                 outline="#66ff66", width=2
             )
 
-    def _draw_drag_handle(self):
-        """Draw the drag handle (3 horizontal lines)."""
-        if not self._drag_canvas:
-            return
-
-        self._drag_canvas.delete("all")
-
-        w = 24
-        h = self._tiny_height - 8
-        line_w = 12
-        line_gap = 5
-        start_x = (w - line_w) // 2
-        start_y = h // 2 - line_gap
-
-        color = self._border_color
-
-        for i in range(3):
-            y = start_y + i * line_gap
-            self._drag_canvas.create_line(
-                start_x, y, start_x + line_w, y,
-                fill=color, width=2
-            )
-
     def _draw_menu_dots(self):
         """Draw menu dots (3 vertical dots) - Windows Voice Typing style."""
         if not self._drag_canvas:
@@ -1248,12 +1224,6 @@ class STTOverlay:
         """Auto-collapse to tiny mode if still in ready state."""
         if self._state == "ready" and self._mode == self.MODE_NORMAL:
             self._switch_to_tiny()
-
-    def set_audio_level(self, level: float):
-        """Set current audio level (0.0 to 1.0) for visualization."""
-        if self._state == "recording":
-            # Shift levels and add new one
-            self._audio_levels = self._audio_levels[1:] + [level]
 
     def show(self):
         """Show and start the overlay (must be called from main thread)."""

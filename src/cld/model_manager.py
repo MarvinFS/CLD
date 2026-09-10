@@ -33,15 +33,6 @@ logger = logging.getLogger(__name__)
 # never permitted. To add a new model, fetch its LFS pointer and copy
 # `sha256` and `size` here.
 WHISPER_MODELS = {
-    "small": {
-        "file": "ggml-small.bin",
-        "size": "488MB",
-        "size_bytes": 487_601_967,
-        "sha256": "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b",
-        "ram": "1GB",
-        "cores": 4,
-        "description": "Good accuracy - 4+ CPU cores recommended",
-    },
     "medium-q5_0": {
         "file": "ggml-medium-q5_0.bin",
         "size": "539MB",
@@ -49,16 +40,23 @@ WHISPER_MODELS = {
         "sha256": "19fea4b380c3a618ec4723c3eef2eb785ffba0d0538cf43f8f235e7b3b34220f",
         "ram": "2GB",
         "cores": 4,
-        "description": "Default - quantized for best speed/accuracy balance",
+        "description": (
+            "Translates to English. Runs on a GPU, or slowly on the CPU. "
+            "30 s of speech: about 14 s on an 8-core CPU, 0.4 s on a GPU."
+        ),
     },
-    "medium": {
-        "file": "ggml-medium.bin",
-        "size": "1.5GB",
-        "size_bytes": 1_533_763_059,
-        "sha256": "6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208",
-        "ram": "3GB",
-        "cores": 6,
-        "description": "Best accuracy - 6+ CPU cores recommended",
+    "large-v3-turbo-q5_0": {
+        "file": "ggml-large-v3-turbo-q5_0.bin",
+        "size": "574MB",
+        "size_bytes": 574_041_195,
+        "sha256": "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
+        "ram": "2GB",
+        "cores": 4,
+        "translates": False,  # Asked to translate, it types the spoken language with junk in front
+        "description": (
+            "Recommended with a GPU. Most accurate, can't translate to English. "
+            "30 s of speech: about 23 s on an 8-core CPU, 0.2 s on a GPU."
+        ),
     },
 }
 
@@ -70,8 +68,10 @@ GGML_BASE_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
 # AND a complete per-member manifest (every extracted file's path + sha256 +
 # size), so authenticity is verified end to end. ``encoder``/``decoder``/
 # ``joiner``/``tokens`` name the four files the engine loads. All facts below
-# were captured from the official k2-fsa release asset and verified locally
-# (see _work/PROGRESS.md): a CPU decode of the bundled en/ru WAVs succeeded.
+# were captured from the official k2-fsa release asset and verified locally.
+# k2-fsa re-uploaded the 1120ms archive on 2026-07-09 under the same filename
+# (encoder att_context_size fixed from 70 to 56, k2-fsa/sherpa-onnx#3732), so a
+# pin can go stale without the URL changing: re-check the asset digest.
 NEMOTRON_MODELS = {
     "nemotron-3.5-streaming-0.6b-1120ms-int8": {
         "family": "nemotron-3.5-asr-streaming-0.6b",
@@ -81,9 +81,9 @@ NEMOTRON_MODELS = {
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
             "sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-1120ms-int8-2026-06-11.tar.bz2"
         ),
-        "size_bytes": 473_896_597,
-        "size": "474MB download / ~700MB on disk",
-        "sha256": "b3be358ec14dd5fb977cfb21583b9fd356677845c5a2d6ffaab9d11e947ec5ae",
+        "size_bytes": 475_276_334,
+        "size": "475MB download / ~700MB on disk",
+        "sha256": "adbdd5e9fef87300c37cebfcfc4f1ebe56845c860c8a760af0a1dd65ce9beed3",
         # Leading directory inside the archive, stripped on extract so the
         # version dir directly contains the members below.
         "top_dir": "sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-1120ms-int8-2026-06-11",
@@ -94,24 +94,38 @@ NEMOTRON_MODELS = {
         "members": [
             {"path": "decoder.int8.onnx", "size_bytes": 14_978_075,
              "sha256": "19f9c98fc6d0a2c33a65a43b36fdb2e914c26c0aa9764be3aebc502a1e982fb0"},
-            {"path": "encoder.int8.onnx", "size_bytes": 657_395_117,
-             "sha256": "f23a184d565764025b1ff872d430a1a3a1163b25e414d5298b850e08bd776a91"},
+            {"path": "encoder.int8.onnx", "size_bytes": 657_601_521,
+             "sha256": "2fff2166acaa535bd969fb223c1f0783d71029f143cb298bc54c2afe85abf772"},
             {"path": "joiner.int8.onnx", "size_bytes": 9_504_438,
              "sha256": "4101c7c679a0bc30483794b27a059e34e79232aa2068d78d51231a22c8b0d7ce"},
-            {"path": "README.md", "size_bytes": 223,
-             "sha256": "e1c0f2f844963f42aab370f10f96195bdc4851101558888775d7d291045e7cc7"},
-            {"path": "test_wavs/en.wav", "size_bytes": 228_908,
-             "sha256": "eb1eb008904465b74c304aad8342e8c7d3c6e61ffe9f66adcaca9cf0f76a93f4"},
-            {"path": "test_wavs/ja.wav", "size_bytes": 230_444,
-             "sha256": "460bd8dccb0d2a5f4e29c628f837be4082d13defc64c3fc21dd1b6bb0e119095"},
+            {"path": "README.md", "size_bytes": 215,
+             "sha256": "31a0ca29d86abbe7728a26544afd2f0b3980b76ee02975fd140680f1555e88a9"},
+            {"path": "test_wavs/ar.wav", "size_bytes": 209_522,
+             "sha256": "6ef45ea67521622c058c500e9657263925ede912acb173e863d5314e9ce4b0b5"},
+            {"path": "test_wavs/de.wav", "size_bytes": 121_388,
+             "sha256": "36d3c4845b9808a1656a2a2e92d884590e2db94389e6fe559643291ae0cd3710"},
+            {"path": "test_wavs/es.wav", "size_bytes": 235_052,
+             "sha256": "49fd2cfa4b62db7068143c582b35de9d31ec2733495ece3611105131d21de06c"},
+            {"path": "test_wavs/fr.wav", "size_bytes": 219_180,
+             "sha256": "b59be4349b92d344fb903677165eaf4694025d1ab119c608726ecbcb3164b528"},
+            {"path": "test_wavs/ja.wav", "size_bytes": 719_916,
+             "sha256": "780f95a86ba6cc33a4431fcafeacd213417dfa0a6613f93e4400c18f4dd467b0"},
+            {"path": "test_wavs/ko.wav", "size_bytes": 305_096,
+             "sha256": "15d91c14f80895d567ba5dd2ebdd1e507569306c436875b3f908e213d689b0a4"},
+            {"path": "test_wavs/uk.wav", "size_bytes": 192_044,
+             "sha256": "e9c007687c3fb78fbd5382ab654093cb3c90989472607324faf487ae01de198f"},
+            {"path": "test_wavs/vi.wav", "size_bytes": 128_624,
+             "sha256": "bad24232a06f222697cc27e50bc33c7cd9c1bf7faa73847af7e6742f89b366c0"},
+            {"path": "test_wavs/zh.wav", "size_bytes": 228_480,
+             "sha256": "7f383a320af7d23200a3cf7313a9bc938972acdb1bc180db4e970bfd648cb641"},
             {"path": "tokens.txt", "size_bytes": 131_440,
              "sha256": "729cc103155bafa785f9cd45746cd41cabe97eab7182fc04d594129587958f8a"},
         ],
         "ram": "2GB",
         "cores": 4,
         "description": (
-            "Nemotron-3.5 streaming 0.6B, int8, 1120ms chunk - 40 locales incl. "
-            "EN+RU, native punctuation, CPU-only (~700MB on disk)"
+            "Default engine, CPU only. 40 locales including English and Russian, "
+            "writes punctuation. 30 s of speech: about 6 s on an 8-core CPU."
         ),
     },
 }
@@ -282,7 +296,7 @@ class ModelManager:
         """Check if a model is downloaded and ready.
 
         Args:
-            model_name: Model name (e.g., 'medium-q5_0', 'small').
+            model_name: Model name (e.g., 'medium-q5_0').
             verify_hash: If True, also verify the file's SHA-256 against the
                 pinned hash in ``WHISPER_MODELS``.
 
@@ -547,11 +561,9 @@ class ModelManager:
         if not can_run:
             return False, "CPU doesn't support required instruction sets (need SSE4.1 minimum)"
 
-        # Check for AVX2 which is recommended for medium model
-        if model_name == "medium" and "AVX2" not in supported:
-            warnings.append(
-                f"AVX2 not detected - {model_name} model may be slow. Consider medium-q5_0."
-            )
+        # Without AVX2 Whisper runs slowly on the CPU
+        if "AVX2" not in supported:
+            warnings.append(f"AVX2 not detected - {model_name} model may be slow on the CPU.")
 
         # Check CPU cores
         try:
@@ -599,14 +611,6 @@ class ModelManager:
         """
         return get_spec("whisper", model_name) if has_spec("whisper", model_name) else None
 
-    def get_all_models(self) -> dict:
-        """Get all available models.
-
-        Returns:
-            Dictionary of model name to info.
-        """
-        return get_models("whisper")
-
     def get_download_url(self, model_name: str) -> Optional[str]:
         """Get direct download URL for model.
 
@@ -622,27 +626,6 @@ class ModelManager:
         filename = get_spec("whisper", model_name)["file"]
         return f"{GGML_BASE_URL}/{filename}"
 
-    def update_model(
-        self,
-        model_name: str,
-        progress_callback: Optional[Callable[[int, int, float], None]] = None,
-    ) -> tuple[bool, str]:
-        """Update an existing model by re-downloading it.
-
-        The old model is NEVER unlinked before the new download succeeds and
-        verifies. ``download_model()`` writes to a ``.tmp`` sibling and only
-        atomically replaces the final file after SHA-256 verification, so a
-        failed update leaves the previous working model in place.
-
-        Args:
-            model_name: Model name to update.
-            progress_callback: Called with (downloaded_bytes, total_bytes, speed_mbps).
-
-        Returns:
-            Tuple of (success, error_message).
-        """
-        return self.download_model(model_name, progress_callback)
-
     # ----------------------------------------------------------------- #
     # Nemotron (multi-file sherpa-onnx archive) support                  #
     # ----------------------------------------------------------------- #
@@ -655,11 +638,14 @@ class ModelManager:
         return self._nemotron_root() / f"{model_name}.current"
 
     def resolve_nemotron_dir(self, model_name: str) -> Optional[Path]:
-        """Resolve the active version dir via the pointer, or None.
+        """Resolve the pinned version's dir via the pointer, or None.
 
-        Returns the dir that directly contains the .onnx/tokens files. Does
+        Returns the dir that directly contains the .onnx/tokens files. A pointer
+        to a superseded version (an older pin) counts as not installed. Does
         NOT validate hashes (cheap path used on every engine load).
         """
+        if not has_spec("nemotron", model_name):
+            return None
         ptr = self._nemotron_pointer(model_name)
         if not ptr.exists():
             return None
@@ -667,7 +653,7 @@ class ModelManager:
             sha = ptr.read_text(encoding="utf-8").strip()
         except OSError:
             return None
-        if not sha:
+        if sha != get_spec("nemotron", model_name)["sha256"][:12]:
             return None
         version_dir = self._nemotron_root() / sha
         return version_dir if version_dir.is_dir() else None
@@ -783,8 +769,6 @@ class ModelManager:
             return False
         spec = get_spec("nemotron", model_name)
         sha_prefix = spec["sha256"][:12]
-        if version_dir.name != sha_prefix:
-            return False  # pointer references a non-pinned version
         if not verify_hash:
             for key in ("tokens", "encoder", "decoder", "joiner"):
                 if not (version_dir / spec[key]).exists():
@@ -802,8 +786,6 @@ class ModelManager:
             return False, "Model not found"
         spec = get_spec("nemotron", model_name)
         sha_prefix = spec["sha256"][:12]
-        if version_dir.name != sha_prefix:
-            return False, "Installed version does not match pinned hash"
         return self._verify_nemotron_members(version_dir, spec, sha_prefix, use_cache=False)
 
     def install_nemotron_from_archive(
@@ -842,10 +824,7 @@ class ModelManager:
         version_dir = self._nemotron_root() / sha_prefix
 
         # Idempotent: already installed and committed to this exact version.
-        if (
-            self.resolve_nemotron_dir(model_name) == version_dir
-            and self.is_nemotron_model_available(model_name, verify_hash=True)
-        ):
+        if self.is_nemotron_model_available(model_name, verify_hash=True):
             return True, ""
 
         # Extract fresh into the content-addressed dir (any prior *different*
@@ -865,14 +844,24 @@ class ModelManager:
             return False, f"Member verification failed: {err}"
 
         # Commit: atomic small-file pointer write (NOT os.replace over a dir).
+        ptr = self._nemotron_pointer(model_name)
+        try:
+            previous = ptr.read_text(encoding="utf-8").strip()
+        except OSError:
+            previous = ""  # first install: nothing to clean up
         try:
             self._nemotron_root().mkdir(parents=True, exist_ok=True)
-            ptr = self._nemotron_pointer(model_name)
             tmp = ptr.with_suffix(ptr.suffix + ".tmp")
             tmp.write_text(sha_prefix, encoding="utf-8")
             os.replace(tmp, ptr)
         except OSError as e:
             return False, f"Failed to commit model pointer: {e}"
+
+        # A re-pinned model leaves its previous version behind, now unreferenced.
+        # Delete only a plain sha12 name, never a path someone wrote into the pointer.
+        if (previous != sha_prefix and len(previous) == 12
+                and all(c in "0123456789abcdef" for c in previous)):
+            self._delete_nemotron_version(previous)
 
         logger.info("Nemotron model installed: %s -> %s", model_name, sha_prefix)
         return True, ""
@@ -963,23 +952,23 @@ class ModelManager:
         if not has_spec("nemotron", model_name):
             return False, f"Unknown model: {model_name}"
         spec = get_spec("nemotron", model_name)
-        sha_prefix = spec["sha256"][:12]
         ptr = self._nemotron_pointer(model_name)
-        version_dir = self._nemotron_root() / sha_prefix
         try:
             if ptr.exists():
                 ptr.unlink()
-            if version_dir.is_dir():
-                shutil.rmtree(version_dir, ignore_errors=True)
         except OSError as e:
             return False, f"Failed to remove model: {e}"
-        # Drop cached member hashes for this version.
+        self._delete_nemotron_version(spec["sha256"][:12])
+        return True, ""
+
+    def _delete_nemotron_version(self, sha_prefix: str) -> None:
+        """Delete one content version dir and drop its cached member hashes."""
+        shutil.rmtree(self._nemotron_root() / sha_prefix, ignore_errors=True)
         stale = [k for k in self._metadata if k.startswith(f"nemotron:{sha_prefix}:")]
         for k in stale:
             self._metadata.pop(k, None)
         if stale:
             self._save_metadata()
-        return True, ""
 
     # ----------------------------------------------------------------- #
     # Engine-agnostic dispatchers (used by daemon/UI/setup)             #

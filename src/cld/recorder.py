@@ -49,6 +49,7 @@ class RecorderConfig:
     dtype: str = "float32"
     max_recording_seconds: Optional[int] = None
     preroll_ms: int = 300  # Pre-roll buffer in milliseconds to capture audio before hotkey
+    device: Optional[str] = None  # Input device name from get_devices(); None = system default
 
 
 @dataclass
@@ -111,7 +112,10 @@ class AudioRecorder:
             return False
 
     def get_devices(self) -> list[dict]:
-        """Get available input devices.
+        """Get available input devices on the default input's host API.
+
+        The other host APIs list the same devices again, and the default
+        one (MME on Windows) opens any of them at our 16 kHz.
 
         Returns:
             List of device info dictionaries.
@@ -120,14 +124,52 @@ class AudioRecorder:
             return []
 
         try:
+            hostapi = sd.query_devices(kind="input")["hostapi"]
             devices = sd.query_devices()
             return [
                 {"name": d["name"], "index": i, "channels": d["max_input_channels"]}
                 for i, d in enumerate(devices)
-                if d["max_input_channels"] > 0
+                if d["max_input_channels"] > 0 and d["hostapi"] == hostapi
             ]
         except Exception:
             return []
+
+    def _device_index(self) -> Optional[int]:
+        """Resolve the configured device name to an index; None = system default.
+
+        Stored by name because indices change as devices are added or removed.
+        A device that is gone falls back to the default instead of leaving
+        CLD with no microphone at all.
+        """
+        # ponytail: PortAudio enumerates devices (and the system default) once
+        # at startup, so a device that appears later (e.g. NVIDIA Broadcast
+        # starting after CLD) needs a CLD restart. Re-init PortAudio here
+        # (sd._terminate/_initialize, no stream open) if that bites.
+        if not self.config.device:
+            return None
+        for d in self.get_devices():
+            if d["name"] == self.config.device:
+                self._logger.info("Using input device %r", self.config.device)
+                return d["index"]
+        self._logger.warning("Input device %r not found; using system default", self.config.device)
+        return None
+
+    def _open_stream(self) -> "sd.InputStream":
+        """Open and start an input stream on the configured device."""
+        stream = sd.InputStream(
+            device=self._device_index(),
+            samplerate=self.config.sample_rate,
+            channels=self.config.channels,
+            dtype=self.config.dtype,
+            blocksize=self.config.blocksize,
+            callback=self._audio_callback,
+        )
+        try:
+            stream.start()
+        except Exception:
+            stream.close()
+            raise
+        return stream
 
     @property
     def _recording(self) -> bool:
@@ -143,19 +185,6 @@ class AudioRecorder:
                 self._state = _RecorderState.RECORDING
             elif not value and self._state is _RecorderState.RECORDING:
                 self._state = _RecorderState.PRIMED if self._stream is not None else _RecorderState.STOPPED
-
-    @property
-    def _primed(self) -> bool:
-        """Backwards-compat alias - True when the stream is alive."""
-        return self._state in (_RecorderState.PRIMED, _RecorderState.RECORDING)
-
-    @_primed.setter
-    def _primed(self, value: bool) -> None:
-        with self._lock:
-            if value and self._state is _RecorderState.STOPPED:
-                self._state = _RecorderState.PRIMED
-            elif not value and self._state in (_RecorderState.PRIMED, _RecorderState.RECORDING):
-                self._state = _RecorderState.STOPPED
 
     def _audio_callback(self, indata, frames, time_info, status):
         """Audio callback that handles both pre-roll and recording."""
@@ -234,14 +263,7 @@ class AudioRecorder:
                 self._logger.debug("Refusing prime() during shutdown")
                 return False
             try:
-                self._stream = sd.InputStream(
-                    samplerate=self.config.sample_rate,
-                    channels=self.config.channels,
-                    dtype=self.config.dtype,
-                    blocksize=self.config.blocksize,
-                    callback=self._audio_callback,
-                )
-                self._stream.start()
+                self._stream = self._open_stream()
                 self._state = _RecorderState.PRIMED
                 self._logger.info("Audio stream primed with %dms pre-roll", self.config.preroll_ms)
                 return True
@@ -286,14 +308,7 @@ class AudioRecorder:
                 # Open the stream if not primed. Done inside the lock so
                 # shutdown() cannot close it concurrently.
                 if self._state is _RecorderState.STOPPED:
-                    self._stream = sd.InputStream(
-                        samplerate=self.config.sample_rate,
-                        channels=self.config.channels,
-                        dtype=self.config.dtype,
-                        blocksize=self.config.blocksize,
-                        callback=self._audio_callback,
-                    )
-                    self._stream.start()
+                    self._stream = self._open_stream()
 
                 self._state = _RecorderState.RECORDING
                 return True
@@ -331,25 +346,35 @@ class AudioRecorder:
                 audio = None
             self._recorded_chunks = deque()
 
-            # Decide whether we stay primed for the next press or fully stop.
-            # The pre-roll case keeps the stream alive on a non-primed-but-
-            # started recorder we just close it here. Either way the state
-            # transitions to PRIMED (stream alive) or STOPPED (stream torn down).
-            keep_stream = self._stream is not None
-            if not keep_stream and self._stream is not None:
-                try:
-                    self._stream.stop()
-                    self._stream.close()
-                except Exception:
-                    self._logger.debug("Failed to stop audio stream cleanly", exc_info=True)
-                self._stream = None
-                self._state = _RecorderState.STOPPED
-            else:
-                self._state = _RecorderState.PRIMED
+            # The stream stays open so the pre-roll buffer keeps filling. No
+            # stream (a failed switch_device) means the next start() opens one.
+            self._state = _RecorderState.PRIMED if self._stream is not None else _RecorderState.STOPPED
 
         if audio is None:
             return None
         return np.squeeze(audio)
+
+    def switch_device(self, device: Optional[str]) -> None:
+        """Move the open stream to another input device (None = system default).
+
+        A recording in progress keeps its audio and continues on the new device.
+        """
+        with self._lock:
+            self.config.device = device
+            if self._stream is None:
+                return  # the next prime() or start() opens the new device
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                self._logger.debug("Failed to close the old input stream", exc_info=True)
+            try:
+                self._stream = self._open_stream()
+            except Exception:
+                self._logger.exception("Failed to open input device %r", device)
+                self._stream = None
+                if self._state is _RecorderState.PRIMED:
+                    self._state = _RecorderState.STOPPED
 
     def shutdown(self) -> None:
         """Fully stop the audio stream and forbid future starts."""
@@ -388,29 +413,6 @@ class AudioRecorder:
         """
         with _spectrum_lock:
             return _spectrum_bands.copy()
-
-    def get_volume_level(self, chunk: np.ndarray) -> float:
-        """Calculate volume level (0-1) for a chunk.
-
-        Args:
-            chunk: Audio chunk.
-
-        Returns:
-            Volume level from 0.0 to 1.0.
-        """
-        if chunk.size == 0:
-            return 0.0
-
-        # RMS volume
-        rms = np.sqrt(np.mean(chunk**2))
-
-        # Normalize to 0-1 range (assuming typical voice levels)
-        # Adjust these thresholds based on testing
-        min_db = -60
-        max_db = -10
-        db = 20 * np.log10(max(rms, 1e-10))
-        normalized = (db - min_db) / (max_db - min_db)
-        return max(0.0, min(1.0, normalized))
 
 
 def get_sounddevice_import_error() -> Exception | None:

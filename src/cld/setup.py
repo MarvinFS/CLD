@@ -208,7 +208,7 @@ def _ensure_engine_ready(config: Config, skip_model_download: bool) -> bool:
             )
         elif config.engine.type == "nemotron":
             _print_error(
-                "Nemotron dependencies missing (sherpa-onnx). Run: "
+                "Nemotron dependencies missing (onnxruntime). Run: "
                 f"{_dependency_hint()}"
             )
         else:

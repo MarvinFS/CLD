@@ -118,6 +118,7 @@ class STTDaemon:
                 RecorderConfig(
                     sample_rate=self.config.sample_rate,
                     max_recording_seconds=self.config.max_recording_seconds,
+                    device=self.config.recording.input_device or None,
                 )
             )
             if not self._recorder.is_available():
@@ -452,6 +453,7 @@ class STTDaemon:
         """
         self._logger.info("Configuration change requested")
         new_config = new_config.validate()
+        old_device = self.config.recording.input_device
 
         if self._engine_config_differs(self.config, new_config):
             if not self._switch_engine(new_config):
@@ -468,6 +470,13 @@ class STTDaemon:
         else:
             self.config = new_config
             new_config.save()
+
+        if self._recorder and self.config.recording.input_device != old_device:
+            # Move the pre-roll stream, and a recording in progress, to the new
+            # microphone. prime() only opens a stream if none is running.
+            self._recorder.switch_device(self.config.recording.input_device or None)
+            if not self._recorder.prime():
+                self._logger.warning("Failed to prime audio on the new input device")
 
         self._restart_hotkey()
 

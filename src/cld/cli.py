@@ -271,6 +271,11 @@ def _run_transcribe(args: Sequence[str]) -> int:
         return 1
 
     audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    if sr != 16000:
+        # ponytail: linear interpolation, no anti-alias filter; good enough for
+        # this smoke test, and both engines take 16 kHz only.
+        audio = np.interp(np.arange(0, len(audio), sr / 16000), np.arange(len(audio)), audio)
+        audio, sr = audio.astype(np.float32), 16000
     config = Config.load()
     engine = build_engine(config)
     if not engine.is_available():

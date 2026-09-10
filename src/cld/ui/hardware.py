@@ -15,11 +15,6 @@ class GPUDeviceInfo:
     index: int
     name: str
 
-    @property
-    def display_name(self) -> str:
-        """User-friendly display name for dropdown."""
-        return self.name
-
 
 @dataclass
 class HardwareInfo:
@@ -46,6 +41,11 @@ class HardwareInfo:
         if self.has_cuda:
             return "CUDA"
         return None
+
+    @property
+    def recommendation(self) -> str:
+        """Model to recommend in the UI: Nemotron without a GPU, else the Whisper model."""
+        return "Nemotron" if self.recommended_engine == "nemotron" else self.recommended_model
 
     @property
     def summary(self) -> str:
@@ -336,33 +336,21 @@ def detect_hardware() -> HardwareInfo:
 
 
 def _get_recommendations(info: HardwareInfo) -> tuple[str, str]:
-    """Determine recommended GGML Whisper model based on hardware.
+    """Determine the recommended engine and GGML Whisper model based on hardware.
 
-    CLD uses pywhispercpp with GGML models:
-    - With GPU (Vulkan/CUDA): medium-q5_0 for fast inference
-    - CPU 8+ cores: medium (full precision)
-    - CPU 4+ cores: medium-q5_0 (quantized, default)
-    - CPU 2-3 cores: small
+    - GPU: Whisper large-v3-turbo-q5_0 (most accurate, fastest on a GPU)
+    - No GPU: Nemotron. The Whisper model to preselect there is medium-q5_0,
+      since turbo takes about 1.7x as long on the CPU.
 
     Args:
         info: Hardware detection results.
 
     Returns:
-        Tuple of (engine, model) recommendations.
+        Tuple of (engine, Whisper model) recommendations.
     """
-    # GPU available - recommend medium-q5_0 as good balance
     if info.has_gpu:
-        return ("whisper", "medium-q5_0")
-
-    # CPU-only recommendations based on core count
-    if info.cpu_cores < 2:
-        return ("whisper", "small")
-    elif info.cpu_cores >= 8:
-        return ("whisper", "medium")
-    elif info.cpu_cores >= 4:
-        return ("whisper", "medium-q5_0")
-    else:
-        return ("whisper", "small")
+        return ("whisper", "large-v3-turbo-q5_0")
+    return ("nemotron", "medium-q5_0")
 
 
 def get_max_supported_model(info: Optional[HardwareInfo] = None) -> str:
@@ -390,9 +378,8 @@ def get_available_models(engine: str = "whisper") -> list[tuple[str, str]]:
             out.append((name, f"{name} ({spec.get('size', '?')})"))
         return out
     return [
-        ("small", "Small (~488MB) - Good accuracy"),
-        ("medium-q5_0", "Medium Q5 (~539MB) - Recommended"),
-        ("medium", "Medium (~1.5GB) - Best accuracy"),
+        ("large-v3-turbo-q5_0", "Large v3 Turbo Q5 (~574MB) - Recommended with a GPU"),
+        ("medium-q5_0", "Medium Q5 (~539MB) - Translates to English"),
     ]
 
 

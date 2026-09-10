@@ -11,6 +11,7 @@ from typing import List, Optional
 import numpy as np
 
 from cld.engines._timeout import TimeoutRunner, FuturesTimeoutError
+from cld.model_manager import WHISPER_MODELS
 
 _whisper_available = False
 _Model = None
@@ -116,9 +117,8 @@ class WhisperEngine:
     CLD prefers Vulkan for universal GPU support at ~4x smaller distribution size.
 
     Models (default: medium-q5_0):
-        - small: ~488MB, fast, good accuracy
-        - medium-q5_0: ~539MB, quantized, best balance (default)
-        - medium: ~1.5GB, full precision, best accuracy
+        - medium-q5_0: ~539MB, quantized, translates to English (default)
+        - large-v3-turbo-q5_0: ~574MB, most accurate, fastest on a GPU, can't translate to English
     """
 
     def __init__(
@@ -137,7 +137,9 @@ class WhisperEngine:
         self.gpu_device = gpu_device
         self._cpu_count = cpu_count
         self.transcription_timeout = transcription_timeout
-        self.translate_to_english = translate_to_english
+        # A saved Translate to English setting never reaches a model that can't translate.
+        can_translate = WHISPER_MODELS.get(model_name, {}).get("translates", True)
+        self.translate_to_english = translate_to_english and can_translate
         self._model: Optional[object] = None
         self._model_lock = threading.Lock()
         # Held for the entire duration of an in-flight transcribe() call so

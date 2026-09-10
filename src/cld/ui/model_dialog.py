@@ -122,7 +122,6 @@ class ModelSetupDialog:
 
         # UI elements
         self._container: Optional[tk.Frame] = None
-        self._hw_label: Optional[tk.Label] = None
         self._icon_photo = None  # Keep reference to prevent GC
         self._progress_frame: Optional[tk.Frame] = None
         self._progress_bar: Optional[ttk.Progressbar] = None
@@ -134,7 +133,6 @@ class ModelSetupDialog:
         self._download_btn: Optional[tk.Button] = None
         self._manual_btn: Optional[tk.Button] = None
         self._exit_btn: Optional[tk.Button] = None
-        self._url_label: Optional[tk.Label] = None
         self._is_downloading: bool = False
 
     def _post_to_ui(self, callback) -> None:
@@ -240,7 +238,7 @@ class ModelSetupDialog:
                 "gpu_name": hw.gpu_name,
                 "ram_gb": hw.ram_gb,
                 "cpu_cores": hw.cpu_cores,
-                "recommended": hw.recommended_model,
+                "recommended": hw.recommendation,
                 "summary": hw.summary,
             }
         except Exception as e:
@@ -436,7 +434,7 @@ class ModelSetupDialog:
             font=("Segoe UI", 9),
             fg=self._text_dim,
             bg=self._surface,
-            wraplength=470,
+            wraplength=440,  # Narrower than the section, or a long line clips on both sides
             justify="left",
         )
         self._info_label.pack(anchor="w")
@@ -532,12 +530,6 @@ class ModelSetupDialog:
 
             if self._info_label:
                 self._info_label.config(text=text)
-
-        # Update URL
-        if self._url_label:
-            url = self._manager.get_engine_download_url(self._engine, model_name)
-            if url:
-                self._url_label.config(text=url)
 
     def _select_model(self, model_name: str):
         """Select a model from dropdown."""
@@ -1186,7 +1178,9 @@ class ModelUpdateDialog:
                     text = f"{downloaded / (1024*1024):.1f} MB downloaded"
                 self._post_to_ui(lambda p=pct, t=text: self._update_progress(p, t))
 
-            success, error = self._manager.update_model(self._model_name, progress_callback)
+            success, error = self._manager.download_engine_model(
+                self._engine, self._model_name, progress_callback
+            )
             self._post_to_ui(lambda s=success, e=error: self._on_download_complete(s, e))
 
         self._download_thread = threading.Thread(target=download, daemon=True)

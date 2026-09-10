@@ -2,6 +2,32 @@
 
 All notable changes to CLD are documented here, newest first.
 
+## [0.8.3] - 2026-09-10
+
+### Added
+- Input Device setting in Settings > Recording: choose which microphone CLD records from. System default keeps using the Windows default recording device. A new choice takes effect when you click Save.
+- If the saved microphone is missing at startup, CLD records from the system default instead.
+- Whisper Large v3 Turbo Q5 model (574 MB). CLD recommends it on PCs with a GPU, where it transcribes a 30-second dictation in about 0.2 s on an RTX 4090. It can't translate into English, so Settings hides Translate to English while it's selected. Use Medium Q5 to translate.
+
+### Changed
+- Nemotron uses the corrected model files that k2-fsa republished on 2026-07-09 (encoder attention context 56 instead of 70). The first time CLD starts after the update, the model setup dialog offers the download (about 475 MB). Once the new version is installed, CLD deletes the previous one.
+- The Nemotron engine runs the model directly with onnxruntime instead of through sherpa-onnx. It follows NVIDIA's reference streaming recipe: NeMo's log-mel features, NeMo's chunk grid, and a final chunk sent with its true length. sherpa-onnx 1.13.7 pads the final chunk to a full window, and with the corrected model that loses the closing punctuation.
+- Model recommendations: Whisper Large v3 Turbo Q5 on PCs with a GPU and the Nemotron engine on PCs without one. The Whisper setup dialog preselects Medium Q5 when there's no GPU. Before, Medium Q5 was recommended with a GPU and Medium on CPUs with 8 or more cores.
+- The model setup dialog shows each model's use case and how long it takes to transcribe 30 seconds of speech on a CPU and on a GPU.
+- On CPUs without AVX2, the model setup dialog warns for every Whisper model, not only for Medium.
+- New installs use push-to-talk on the right Alt key: hold it while you speak, and let go to transcribe. Before, a new install used toggle mode on either Alt key. Saved settings keep their key and mode.
+
+### Removed
+- The full-precision Whisper Medium model (1.5 GB). Medium Q5 gives almost the same text at a third of the size and runs as fast or faster.
+- Whisper Small (488 MB). It made the most recognition mistakes of the Whisper models, and Nemotron is as fast on the CPU.
+- Settings that used Medium or Small switch to Medium Q5. CLD doesn't delete the old ggml-medium.bin or ggml-small.bin file.
+
+### Fixed
+- Dictation produced no text when the Windows default recording device was a silent input, such as an unused channel on an audio interface. You can now pick the right microphone in Input Device.
+- Nemotron dropped words and sometimes whole phrases in long dictations. The earlier model files caused it.
+- A recording that starts right on the first word no longer loses that word.
+- In a window with a non-English keyboard layout, dictated punctuation and Latin letters came out as other characters, for example "." as "ю" and "," as "б" in the Russian layout. CLD now types every character as Unicode. If Windows blocks typed input, for example into an elevated window, CLD copies the text to the clipboard instead.
+
 ## [0.8.2] - 2026-06-18
 
 CLD now defaults to a new speech engine, adds in-app model management, and ships a batch of reliability fixes.

@@ -75,6 +75,7 @@ def _user_scope() -> str:
 # that a hostile local process can't trivially squat the mutex to lock out CLD.
 _USER_SCOPE = _user_scope()
 MUTEX_NAME = f"Local\\CLD-{_CLD_APP_GUID}-{_USER_SCOPE}-SingleInstance"
+ERROR_ALREADY_EXISTS = 183  # Win32: the named mutex already existed
 SHUTDOWN_PIPE_NAME = f"\\\\.\\pipe\\CLD-{_USER_SCOPE}-shutdown"
 
 # Global mutex handle (kept alive while running)
@@ -101,7 +102,6 @@ def _acquire_mutex() -> bool:
     global _mutex_handle
 
     kernel32 = ctypes.windll.kernel32
-    ERROR_ALREADY_EXISTS = 183
 
     # Create or open the mutex
     _mutex_handle = kernel32.CreateMutexW(None, True, MUTEX_NAME)
@@ -132,7 +132,6 @@ def _release_mutex() -> None:
 def is_daemon_running() -> bool:
     """Check if daemon is running using mutex."""
     kernel32 = ctypes.windll.kernel32
-    ERROR_ALREADY_EXISTS = 183
 
     # Try to create the mutex
     handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
