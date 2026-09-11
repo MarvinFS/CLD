@@ -3,6 +3,7 @@
 import enum
 import logging
 import math
+import queue
 import threading
 from collections import deque
 from dataclasses import dataclass
@@ -79,6 +80,8 @@ class AudioRecorder:
         self._state: _RecorderState = _RecorderState.STOPPED
         self._stream: Optional["sd.InputStream"] = None
         self._recorded_chunks: Deque[np.ndarray] = deque()
+        # Live typing reads the recording as it arrives; set by start(), cleared by stop().
+        self._live_queue: Optional[queue.Queue] = None
         self._max_chunks = self._compute_max_chunks()
         # All lifecycle (state + stream) transitions and any access to
         # ``_recording`` and ``_primed`` happen under this lock. The
@@ -240,6 +243,8 @@ class AudioRecorder:
             if self._recording:
                 # Store chunks for transcription
                 self._recorded_chunks.append(chunk)
+                if self._live_queue is not None:
+                    self._live_queue.put_nowait(chunk)
             else:
                 # Not recording - fill pre-roll buffer (circular)
                 self._preroll_buffer.append(chunk)
@@ -273,12 +278,13 @@ class AudioRecorder:
                 self._state = _RecorderState.STOPPED
                 return False
 
-    def start(self) -> bool:
+    def start(self, live_queue: Optional[queue.Queue] = None) -> bool:
         """Start recording audio.
 
         If prime() was called, the pre-roll buffer is included at the
         beginning of the recording to capture audio from before the
-        hotkey was pressed.
+        hotkey was pressed. ``live_queue`` also receives every chunk,
+        pre-roll first, until ``stop()``.
 
         Returns:
             True if recording started successfully.
@@ -304,6 +310,11 @@ class AudioRecorder:
                     for chunk in self._preroll_buffer:
                         self._recorded_chunks.append(chunk)
                     self._preroll_buffer.clear()
+
+                self._live_queue = live_queue
+                if live_queue is not None:
+                    for chunk in self._recorded_chunks:
+                        live_queue.put_nowait(chunk)
 
                 # Open the stream if not primed. Done inside the lock so
                 # shutdown() cannot close it concurrently.
@@ -345,6 +356,7 @@ class AudioRecorder:
             else:
                 audio = None
             self._recorded_chunks = deque()
+            self._live_queue = None
 
             # The stream stays open so the pre-roll buffer keeps filling. No
             # stream (a failed switch_device) means the next start() opens one.

@@ -2,7 +2,7 @@
 
 # CLD - ClaudeCli-Dictate
 
-Version 0.8.3 | Voice dictation that stays on your machine
+Version 0.9.0 | Voice dictation that stays on your machine
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Windows](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6?logo=windows)](https://github.com/MarvinFS/CLD)
@@ -65,6 +65,7 @@ Open Settings from the tray icon's menu or the gear icon on the overlay. Most ch
 | Engine, Model | Switch the engine or the model without a restart. CLD loads the new model before it unloads the old one, so a failed switch keeps the previous one working. |
 | Language | Nemotron only. The language you speak, or Auto. |
 | Translate to English | Whisper Medium Q5 only. Types English whatever language you speak. |
+| Type while speaking | On by default, for Whisper on a GPU. CLD types while you speak and fixes words as more speech makes them clear. When you stop, CLD replaces it with a transcription of the whole recording. Nemotron, and Whisper on the CPU, still type after you stop. Output Mode Clipboard turns it off. |
 | Force CPU Only, GPU Device | Whisper only, and both take effect after a restart. Force CPU Only keeps Whisper on the CPU even when you have a GPU. GPU Device picks the GPU when you have several, and Auto-select uses the first one Vulkan reports. |
 | Output Mode | Auto, the default, types the text and copies it to the clipboard when a window blocks typing. Injection types it, and Clipboard pastes it with Ctrl+V. |
 | Sound Effects | Plays short sounds when recording starts and stops and when something goes wrong. |

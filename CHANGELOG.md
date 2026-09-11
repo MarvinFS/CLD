@@ -2,6 +2,11 @@
 
 All notable changes to CLD are documented here, newest first.
 
+## [0.9.0] - 2026-09-11
+
+### Added
+- Type while speaking, on by default, in Settings > STT Engine. With Whisper on a GPU, CLD types the text while you speak and fixes words as more speech makes them clear. When you stop, CLD replaces it with a transcription of the whole recording. Nemotron, and Whisper on the CPU, still type after you stop. Clear the checkbox to type after you stop, as in 0.8.3. CLD releases the hotkey for the window it types into, so right Alt doesn't turn the text into shortcuts or open a menu.
+
 ## [0.8.3] - 2026-09-10
 
 ### Added

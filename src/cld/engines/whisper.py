@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 from typing import List, Optional
@@ -100,6 +101,11 @@ def has_gpu_device_selection() -> bool:
     Standard pywhispercpp silently falls back to CPU if this is missing.
     """
     return _has_gpu_init_params
+
+
+def _detected_language(model) -> str:
+    """The language whisper.cpp detected in the model's last language="auto" pass."""
+    return _pw.whisper_lang_str(_pw.whisper_full_lang_id(model._ctx))
 
 
 # Audio chunking constants for long recordings
@@ -470,6 +476,13 @@ class WhisperEngine:
 
         return joined.strip()
 
+    def open_stream(self, sample_rate: int = 16000) -> Optional[_Stream]:
+        """Live typing on a GPU (see STTEngine). None on the CPU, where one pass over a
+        few seconds of speech takes longer than the speech itself."""
+        if not self.use_gpu or self._model is None or sample_rate != 16000:
+            return None
+        return _Stream(self)
+
     def transcribe(self, audio: np.ndarray, sample_rate: int = 16000) -> str:
         """Transcribe audio to text with chunking for long recordings.
 
@@ -517,3 +530,147 @@ class WhisperEngine:
             except Exception:
                 self._logger.exception("Whisper transcription failed")
                 return ""
+
+
+# Whole-word Whisper annotations such as [BLANK_AUDIO], (music) or *laughs*.
+_ARTIFACT_WORD = re.compile(r"^[\[(*].*[\])*]$")
+
+
+class _Stream:
+    """Live Whisper: a worker re-decodes the recording every _STEP_SAMPLES of new audio.
+
+    A word is committed once a pass agrees on it with a pass that heard at least
+    _AGREE_SAMPLES less audio (LocalAgreement-2, as in ufal/whisper_streaming, whose
+    passes are also about a second apart). Back-to-back passes hear nearly the same
+    audio and agree on almost anything. The rest of the latest pass is tentative.
+
+    The language is detected once and pinned, so later passes skip detection. Past
+    _TRIM_SAMPLES the passes drop the audio of leading segments whose words are all
+    committed, and those words prompt the passes that follow. finish() transcribes the
+    whole recording through the batch path, without the passes' text as context.
+    """
+
+    _MIN_SAMPLES = 16000  # passes on less than 1 s of audio make words up
+    _STEP_SAMPLES = 4800
+    _AGREE_SAMPLES = 16000
+    _PIN_SAMPLES = 2 * 16000  # the language is pinned on the first pass with this much audio
+    _TRIM_SAMPLES = 20 * 16000
+
+    def __init__(self, engine: WhisperEngine):
+        self._engine = engine
+        self._logger = engine._logger
+        self._lock = threading.Lock()  # guards everything below
+        self._recording: List[np.ndarray] = []
+        self._total = 0  # samples recorded
+        self._audio = np.zeros(0, np.float32)  # what the passes decode: the recording since the last trim
+        self._frozen: List[str] = []  # words of the trimmed audio
+        self._committed: List[str] = []  # committed words of self._audio
+        self._passes: List[tuple] = []  # (samples of self._audio heard, words), latest last
+        self._language = "auto"
+        self._prompt = ""
+        self._grew = threading.Event()
+        self._closed = False
+        self._worker = threading.Thread(target=self._run, name="cld-whisper-live", daemon=True)
+        self._worker.start()
+
+    def feed(self, audio: np.ndarray) -> tuple[str, str]:
+        audio = np.asarray(audio, np.float32).ravel()
+        with self._lock:
+            self._recording.append(audio)
+            self._total += len(audio)
+            self._audio = np.concatenate([self._audio, audio])
+        self._grew.set()
+        return self._hypothesis()
+
+    def finish(self) -> str:
+        """Stop the passes and transcribe the whole recording as the batch path does."""
+        self._closed = True
+        self._grew.set()
+        self._worker.join(self._engine.transcription_timeout)
+        with self._lock:
+            audio = np.concatenate(self._recording) if self._recording else None
+        # whisper.cpp keeps each decode's text as context for the next one unless no_context
+        # is set, and a decode whose context already holds the text of its audio skips it.
+        # The passes just read this audio, so the final decode runs without that context.
+        self._set_params(no_context=True)
+        try:
+            return self._engine.transcribe(audio, 16000) if audio is not None else ""
+        finally:
+            self._set_params(no_context=False)
+
+    def _hypothesis(self) -> tuple[str, str]:
+        with self._lock:
+            last = self._passes[-1][1] if self._passes else []
+            return " ".join(self._frozen + self._committed), " ".join(last[len(self._committed):])
+
+    def _run(self) -> None:
+        decoded = 0
+        try:
+            while True:
+                self._grew.wait()
+                self._grew.clear()
+                if self._closed:
+                    return
+                with self._lock:
+                    audio, total = self._audio, self._total
+                if len(audio) < self._MIN_SAMPLES or total - decoded < self._STEP_SAMPLES:
+                    continue
+                decoded = total
+                if not self._pass(audio):
+                    return
+        except Exception:
+            self._logger.exception("Live Whisper pass failed; the final text comes from finish()")
+
+    def _pass(self, audio: np.ndarray) -> bool:
+        """One pass over audio, a snapshot of self._audio. False once the model is unloaded."""
+        segments = self._decode(audio)
+        if segments is None:
+            return False
+        words = [w for seg, _ in segments for w in seg]
+        heard = len(audio)
+        with self._lock:
+            ref = next((w for n, w in reversed(self._passes) if n <= heard - self._AGREE_SAMPLES), None)
+            # ponytail: agreement on word position; a word the model inserts before the
+            # committed text shows up doubled until finish(). Align on timestamps if it bites.
+            agreed = len(os.path.commonprefix([ref, words])) if ref is not None else 0
+            if agreed > len(self._committed):
+                self._committed += words[len(self._committed):agreed]
+            self._passes = [p for p in self._passes if p[0] > heard - 2 * self._AGREE_SAMPLES]
+            self._passes.append((heard, words))
+            if heard > self._TRIM_SAMPLES:
+                self._trim(segments, heard, words)
+        return True
+
+    def _trim(self, segments, heard: int, words: List[str]) -> None:
+        done = cut = 0
+        for seg, t1 in segments[:-1]:
+            if done + len(seg) > len(self._committed):
+                break
+            done, cut = done + len(seg), int(t1) * 160  # t1 is in 10 ms steps
+        if cut:
+            self._audio = self._audio[cut:]
+            self._frozen += self._committed[:done]
+            self._committed = self._committed[done:]
+            self._passes = [(heard - cut, words[done:])]
+            self._prompt = " ".join(self._frozen)[-200:]
+
+    def _decode(self, audio: np.ndarray):
+        """[(words, end time)] per segment, or None when the model is unloaded."""
+        engine = self._engine
+        with engine._transcribe_lock:
+            model = engine._model
+            if model is None:
+                return None
+            segments = model.transcribe(audio, translate=engine.translate_to_english, language=self._language,
+                                        no_context=True, initial_prompt=self._prompt)
+            if self._language == "auto" and len(audio) >= self._PIN_SAMPLES:
+                self._language = _detected_language(model)
+        return [([w for w in s.text.split() if not _ARTIFACT_WORD.match(w)], s.t1) for s in segments]
+
+    def _set_params(self, no_context: bool) -> None:
+        """pywhispercpp keeps every param a call sets. The batch path expects no_context=False
+        and no initial prompt, and only sets the language and translate flag itself."""
+        with self._engine._transcribe_lock:
+            model = self._engine._model
+            if model is not None:
+                model._set_params({"no_context": no_context, "initial_prompt": ""})

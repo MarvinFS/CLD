@@ -88,6 +88,8 @@ class SettingsDialog:
 
         # Engine section state
         self._translate_var: Optional[tk.BooleanVar] = None
+        self._live_var: Optional[tk.BooleanVar] = None
+        self._live_cb: Optional[tk.Checkbutton] = None
         self._original_gpu_device: int = -1
         self._hw_info: Optional[object] = None  # Cached hardware info
 
@@ -555,6 +557,30 @@ class SettingsDialog:
             bd=0,
         )
         translate_cb.pack(side=tk.RIGHT)
+
+        # Type while speaking (Whisper on a GPU; disabled for Nemotron)
+        live_row = tk.Frame(section, bg=self._surface)
+        live_row.pack(fill=tk.X, padx=12, pady=8)
+        tk.Label(
+            live_row,
+            text="Type while speaking (experimental)",
+            font=("Segoe UI", 10),
+            fg=self._text,
+            bg=self._surface,
+        ).pack(side=tk.LEFT)
+        self._live_var = tk.BooleanVar(value=self._config.engine.live_typing)
+        self._live_cb = tk.Checkbutton(
+            live_row,
+            variable=self._live_var,
+            bg=self._surface,
+            fg=self._text,
+            activebackground=self._surface,
+            activeforeground=self._text,
+            selectcolor=self._accent,
+            highlightthickness=0,
+            bd=0,
+        )
+        self._live_cb.pack(side=tk.RIGHT)
 
         # Language selector (Nemotron only) - built now, shown/hidden per engine
         self._language_row = tk.Frame(section, bg=self._surface)
@@ -1110,6 +1136,8 @@ class SettingsDialog:
                 self._gpu_combo.config(state="disabled" if force_cpu else "readonly")
         if getattr(self, "_force_cpu_cb", None) is not None:
             self._force_cpu_cb.config(state="disabled" if is_nemotron else "normal")
+        if self._live_cb is not None:
+            self._live_cb.config(state="disabled" if is_nemotron else "normal")
 
     def _on_window_resize(self, event=None):
         """Handle window resize - update canvas and scrollbar visibility."""
@@ -1181,6 +1209,8 @@ class SettingsDialog:
             self._config.engine.translate_to_english = (
                 self._translate_var.get() if self._translate_var else False
             )
+
+        self._config.engine.live_typing = bool(self._live_var and self._live_var.get())
 
         # GPU settings (Whisper-only, but harmless to persist for Nemotron).
         self._config.engine.force_cpu = bool(self._force_cpu_var and self._force_cpu_var.get())

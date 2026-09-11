@@ -16,9 +16,13 @@ except Exception as exc:
     _PYNPUT_IMPORT_ERROR = exc
 
 from cld.errors import HotkeyError
+from cld.keyboard import CLD_INPUT_TAG
 
 # Toggle mode debounce time in seconds (prevents rapid key presses from triggering multiple start/stop cycles)
 TOGGLE_DEBOUNCE_SECONDS = 0.3
+
+_WM_KEYUP = 0x0101
+_WM_SYSKEYUP = 0x0105
 
 
 class HotkeyListener:
@@ -59,6 +63,9 @@ class HotkeyListener:
         )
         self._worker_thread: Optional[threading.Thread] = None
         self._worker_stop = threading.Event()
+        # Set by the daemon while live typing types under a held push-to-talk key.
+        self.suppress_repeats = False
+        self._held_vks: set = set()
 
         # Track if hotkey uses specific modifier variants (not generic)
         # This affects key normalization during matching
@@ -375,6 +382,24 @@ class HotkeyListener:
 
         return key
 
+    def _win32_filter(self, msg, data) -> bool:
+        """Low-level hook filter; runs on the hook thread for every key event.
+
+        CLD's own typing never reaches _on_press/_on_release. While live typing runs,
+        the auto-repeat of a held key is swallowed system-wide: each repeat would press
+        the key again for the target window, and a held Alt would turn the typed text
+        back into Alt shortcuts.
+        """
+        if data.dwExtraInfo == CLD_INPUT_TAG:
+            return False
+        if msg in (_WM_KEYUP, _WM_SYSKEYUP):
+            self._held_vks.discard(data.vkCode)
+        elif data.vkCode not in self._held_vks:
+            self._held_vks.add(data.vkCode)
+        elif self.suppress_repeats:
+            self._listener.suppress_event()
+        return True
+
     def _on_press(self, key):
         """Handle key press event.
 
@@ -469,6 +494,7 @@ class HotkeyListener:
             self._listener = keyboard.Listener(
                 on_press=self._on_press,
                 on_release=self._on_release,
+                win32_event_filter=self._win32_filter,
             )
             self._listener.start()
             self._ensure_worker()
@@ -488,6 +514,7 @@ class HotkeyListener:
             self._listener.stop()
             self._listener = None
             self._pressed_keys.clear()
+            self._held_vks.clear()
             self._is_recording = False
 
         # Stop worker thread

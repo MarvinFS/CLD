@@ -3,6 +3,7 @@
 import ctypes
 import json
 import logging
+import os
 import time
 from typing import Optional
 
@@ -33,8 +34,22 @@ _pynput_warned = False
 # virtual key, and the target window maps that key through its layout: with
 # Russian active, "." arrives as "ю" and "," as "б".
 _INPUT_KEYBOARD = 1
+_KEYEVENTF_EXTENDEDKEY = 0x0001
 _KEYEVENTF_KEYUP = 0x0002
 _KEYEVENTF_UNICODE = 0x0004
+_VK_BACK = 0x08
+# dwExtraInfo on every key event CLD sends, so CLD's hotkey listener can tell them from the user's.
+CLD_INPUT_TAG = 0x434C44  # "CLD"
+# Live typing types while the hotkey (right Alt by default) is down: held for push-to-talk,
+# pressed to start or stop in toggle mode. A held Alt turns typed characters into Alt
+# shortcuts. release_modifiers() lifts the modifiers for the target window. Before an Alt
+# or Win key-up it taps a mask key, as AutoHotkey does, so Windows doesn't take the release
+# for a lone tap that opens the menu bar or the Start menu. vkE8 is unassigned, and
+# AutoHotkey's A_MenuMaskKey docs suggest it as a mask key with few side effects.
+_VK_MASK = 0xE8
+_MODIFIER_VKS = (0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C)  # L/R Shift, Ctrl, Alt, Win
+_ALT_WIN_VKS = {0xA4, 0xA5, 0x5B, 0x5C}
+_EXTENDED_VKS = {0xA3, 0xA5, 0x5B, 0x5C}  # right Ctrl, right Alt, Win keys
 
 
 class _KEYBDINPUT(ctypes.Structure):
@@ -59,20 +74,68 @@ def _send_input(events) -> int:
     return ctypes.windll.user32.SendInput(len(events), events, ctypes.sizeof(_INPUT))
 
 
-def _type_unicode(text: str) -> None:
-    """Type text as Unicode key events, so the target's keyboard layout can't change it."""
-    units = memoryview(text.encode("utf-16-le")).cast("H")
-    events = (_INPUT * (2 * len(units)))()
-    for i, unit in enumerate(units):
-        for j, up in enumerate((0, _KEYEVENTF_KEYUP)):
-            event = events[2 * i + j]
-            event.type = _INPUT_KEYBOARD
-            event.ki.wScan = unit
-            event.ki.dwFlags = _KEYEVENTF_UNICODE | up
+def _send_keys(keys) -> None:
+    """Send (vk, scan, flags) key events in one SendInput call, tagged as CLD's own."""
+    events = (_INPUT * len(keys))()
+    for event, (vk, scan, flags) in zip(events, keys):
+        event.type = _INPUT_KEYBOARD
+        event.ki.wVk, event.ki.wScan, event.ki.dwFlags = vk, scan, flags
+        event.ki.dwExtraInfo = CLD_INPUT_TAG
     sent = _send_input(events)
     if sent != len(events):
         # Windows blocked the input (e.g. an elevated target window).
         raise OSError(f"SendInput delivered {sent} of {len(events)} key events")
+
+
+def _unicode_keys(text: str) -> list:
+    """Key events that type text as Unicode, so the target's keyboard layout can't change it."""
+    units = memoryview(text.encode("utf-16-le")).cast("H")
+    return [(0, unit, _KEYEVENTF_UNICODE | up) for unit in units for up in (0, _KEYEVENTF_KEYUP)]
+
+
+def _vk_key(vk: int, flags: int = 0) -> tuple:
+    extended = _KEYEVENTF_EXTENDEDKEY if vk in _EXTENDED_VKS else 0
+    return (vk, ctypes.windll.user32.MapVirtualKeyW(vk, 0), flags | extended)
+
+
+def _type_unicode(text: str) -> None:
+    """Type text as Unicode key events."""
+    _send_keys(_unicode_keys(text))
+
+
+def release_modifiers() -> None:
+    """Release the modifier keys the user holds, for the focused window (see _VK_MASK)."""
+    user32 = ctypes.windll.user32
+    held = [vk for vk in _MODIFIER_VKS if user32.GetAsyncKeyState(vk) & 0x8000]
+    keys = [_vk_key(_VK_MASK), _vk_key(_VK_MASK, _KEYEVENTF_KEYUP)] if _ALT_WIN_VKS & set(held) else []
+    keys += [_vk_key(vk, _KEYEVENTF_KEYUP) for vk in held]
+    if keys:
+        _send_keys(keys)
+
+
+class LiveTyper:
+    """Keeps the text typed into one window equal to a hypothesis that changes as the user speaks.
+
+    update() backspaces over the part that changed and types the new tail in one SendInput
+    call. It raises OSError when Windows blocks the input or another window has the focus,
+    so a click elsewhere never gets the backspaces.
+    """
+
+    def __init__(self, hwnd: int):
+        self.hwnd = hwnd
+        self.typed = ""
+
+    def update(self, text: str) -> None:
+        if text == self.typed:
+            return
+        if ctypes.windll.user32.GetForegroundWindow() != self.hwnd:
+            raise OSError("the target window lost the focus")
+        # ponytail: one backspace per code point; fine for dictated text, an emoji sequence
+        # or a combining mark may need another count in some editors.
+        keep = len(os.path.commonprefix([self.typed, text]))
+        back = [_vk_key(_VK_BACK, up) for _ in range(len(self.typed) - keep) for up in (0, _KEYEVENTF_KEYUP)]
+        _send_keys(back + _unicode_keys(text[keep:]))
+        self.typed = text
 
 
 def get_keyboard() -> Controller:
@@ -166,6 +229,17 @@ def test_injection() -> bool:
         _injection_capable = False
         _injection_checked_at = now
         return _injection_capable
+
+
+def live_typer(window_info: Optional[WindowInfo]) -> Optional[LiveTyper]:
+    """Focus the window output goes to, picked as _output_via_injection picks it, and
+    return a LiveTyper bound to it; None when there is no window to type into."""
+    hwnd = _read_claude_code_window()
+    if hwnd and focus_window_by_hwnd(hwnd):
+        return LiveTyper(hwnd)
+    if restore_focus(window_info):
+        return LiveTyper(int(window_info.window_id))
+    return None
 
 
 def output_text(

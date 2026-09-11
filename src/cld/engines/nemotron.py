@@ -331,6 +331,10 @@ class NemotronEngine:
         text = "".join(s for s in (m.symbols[t] for t in tokens) if not _LANG_TAG.fullmatch(s))
         return " ".join(text.replace("▁", " ").split())
 
+    def open_stream(self, sample_rate: int = 16000) -> None:
+        """No live typing (see STTEngine): its text while the user spoke was too rough to type."""
+        return None
+
     def transcribe(self, audio: np.ndarray, sample_rate: int = 16000) -> str:
         with self._transcribe_lock:
             if not self.load_model():

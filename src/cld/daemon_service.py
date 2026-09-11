@@ -16,12 +16,13 @@ from cld.engine_factory import build_engine
 from cld.engines import STTEngine
 from cld.errors import EngineError, HotkeyError, RecorderError
 from cld.hotkey import HotkeyListener
-from cld.keyboard import output_text
+from cld.keyboard import _output_via_clipboard, live_typer, output_text, release_modifiers
 from cld.recorder import AudioRecorder, RecorderConfig
 from cld.sounds import play_sound
 from cld.window import get_active_window, WindowInfo
 from cld.model_manager import ModelManager
 
+import numpy as np
 import tkinter as tk
 
 # Optional UI imports
@@ -49,6 +50,26 @@ try:
     _MODEL_DIALOG_AVAILABLE = True
 except ImportError:
     _MODEL_DIALOG_AVAILABLE = False
+
+
+# Whisper's own tokens for non-speech audio.
+_WHISPER_ARTIFACTS = {
+    "[BLANK_AUDIO]", "[MUSIC]", "[APPLAUSE]", "[LAUGHTER]",
+    "(BLANK_AUDIO)", "(MUSIC)", "(APPLAUSE)", "(LAUGHTER)",
+    "[inaudible]", "(inaudible)", "[silence]", "(silence)",
+}
+
+
+# Shorter recordings are accidental taps and give no text.
+_MIN_RECORDING_S = 0.2
+
+
+def _speech_only(text: str) -> str:
+    """The transcription, or "" when it is only one of Whisper's non-speech tokens."""
+    text = text.strip()
+    if text in _WHISPER_ARTIFACTS or (text.startswith("[") and text.endswith("]")):
+        return ""
+    return text
 
 
 class STTDaemon:
@@ -85,6 +106,8 @@ class STTDaemon:
         # Recording state
         self._record_start_time: float = 0
         self._original_window: Optional[WindowInfo] = None
+        # Type while speaking: the queue the recording in progress feeds its live thread.
+        self._live_queue: Optional[queue.Queue] = None
 
         # Threading - use RLock to avoid deadlocks in nested callbacks
         self._lock = threading.RLock()
@@ -238,16 +261,132 @@ class STTDaemon:
             # Capture the active window
             self._original_window = get_active_window()
 
-            # Start recording
-            if self._recorder and self._recorder.start():
+            # Start recording; with live typing the recording also feeds a live thread.
+            self._live_queue = self._start_live() if self.config.engine.live_typing else None
+            if self._recorder and self._recorder.start(live_queue=self._live_queue):
                 self._print_status("● Recording...")
                 if self.config.sound_effects:
                     play_sound("start")
             else:
                 self._logger.error("Audio recorder failed to start")
                 self._recording = False
+                self._end_live(None)
                 if self.config.sound_effects:
                     play_sound("error")
+
+    def _start_live(self) -> Optional[queue.Queue]:
+        """Start typing while the user speaks. None means transcribe after the recording as
+        usual: output goes to the clipboard, the engine can't stream in its configuration,
+        or no window takes the text."""
+        if self.config.output_mode == "clipboard" or self._engine is None:
+            return None
+        stream = self._engine.open_stream(self.config.sample_rate)
+        if stream is None:
+            return None
+        typer = live_typer(self._original_window)
+        if typer is None:
+            # Nothing to type into; let the stream wind down off the hotkey thread.
+            threading.Thread(target=stream.finish, daemon=True).start()
+            return None
+        # The hotkey is still down: held for push-to-talk, or just pressed in toggle mode. Its
+        # modifiers must not turn the typed text into shortcuts (keyboard._VK_MASK).
+        if self._hotkey and self.config.activation.mode == "push_to_talk":
+            self._hotkey.suppress_repeats = True
+        self._release_modifiers()
+        live: queue.Queue = queue.Queue()
+        threading.Thread(target=self._live_loop, args=(live, stream, typer, self._original_window),
+                         name="cld-live", daemon=True).start()
+        return live
+
+    def _release_modifiers(self) -> None:
+        try:
+            release_modifiers()
+        except OSError:
+            self._logger.warning("Could not release the held keys", exc_info=True)
+
+    def _end_live(self, audio: Optional[np.ndarray]) -> None:
+        """End the live thread of the recording that just stopped. With the recording's
+        audio it types the final text; with None (suspend, shutdown, failed start) it just
+        stops. The recorder is already stopped, so no chunk follows this."""
+        live, self._live_queue = self._live_queue, None
+        if self._hotkey:
+            self._hotkey.suppress_repeats = False
+        if live is None:
+            return
+        if audio is not None:
+            # In toggle mode the key that stopped the recording is still down.
+            self._release_modifiers()
+            with self._transcription_lock:
+                self._is_transcribing = True
+            self._print_status("◐ Transcribing...")
+        live.put(("end", audio))
+
+    def _live_loop(self, live: queue.Queue, stream, typer, window_info: Optional[WindowInfo]) -> None:
+        """Feed the recording to the stream as it arrives and keep the typed text in step."""
+        typing = True
+        try:
+            while True:
+                items = [live.get()]
+                while not live.empty():
+                    items.append(live.get_nowait())
+                chunks = [c for c in items if not isinstance(c, tuple)]
+                if chunks and stream is not None:
+                    try:
+                        committed, tentative = stream.feed(np.concatenate(chunks))
+                    except Exception:
+                        self._logger.exception("Live transcription failed; transcribing after the recording")
+                        stream = None
+                    else:
+                        if typing:
+                            try:
+                                typer.update(" ".join(p for p in (committed, tentative) if p))
+                            except OSError as e:
+                                self._logger.warning("Live typing stopped: %s", e)
+                                typing = False
+                if isinstance(items[-1], tuple):
+                    break
+            audio = items[-1][1]
+            if audio is None:
+                # ponytail: an abandoned Whisper stream leaves its worker parked; the model
+                # reload after resume resets the params it set.
+                return
+            # finish() runs even for a tap too short to keep, since it also winds the stream down.
+            too_short = len(audio) < int(_MIN_RECORDING_S * self.config.sample_rate)
+            if stream is not None:
+                text = stream.finish()
+            else:
+                text = "" if too_short else self._engine.transcribe(audio, self.config.sample_rate)
+            text = "" if too_short else _speech_only(text)
+            self._logger.info("Live typing final text: %r", text)
+            if typing:
+                try:
+                    typer.update(text)
+                except OSError as e:
+                    self._logger.warning("Final live typing failed: %s", e)
+                    typing = False
+            if not text:
+                self._print_status("○ Too short" if too_short else "○ No speech detected")
+                if self.config.sound_effects:
+                    play_sound("warning")
+            elif typing:
+                self._print_status("✓ Ready")
+                if self.config.sound_effects:
+                    play_sound("complete")
+            elif typer.typed:
+                # Part of the text is in a window that lost the focus; don't type the rest elsewhere.
+                _output_via_clipboard(text, self.config, paste=False)
+                self._notify("The window lost the focus while CLD typed; the text is on the clipboard.")
+                self._print_status("✓ Ready")
+            elif output_text(text, window_info, self.config):
+                self._print_status("✓ Ready")
+            else:
+                self._print_status("✗ Output failed")
+        except Exception:
+            self._logger.exception("Live typing failed")
+            self._print_status(clear=True)
+        finally:
+            with self._transcription_lock:
+                self._is_transcribing = False
 
     def _on_recording_stop(self):
         """Called when recording should stop."""
@@ -267,9 +406,13 @@ class STTDaemon:
             if self.config.sound_effects:
                 play_sound("stop")
 
+            if self._live_queue is not None:
+                self._end_live(audio if audio is not None else np.zeros(0, np.float32))
+                return
+
         # Check if we have audio to transcribe
         # Minimum 200ms recording to filter accidental taps (but allow short words)
-        min_samples = int(0.2 * self.config.sample_rate)  # 200ms at 16kHz = 3200 samples
+        min_samples = int(_MIN_RECORDING_S * self.config.sample_rate)
 
         if audio is not None and len(audio) >= min_samples:
             with self._transcription_lock:
@@ -301,19 +444,8 @@ class STTDaemon:
             if not self._engine:
                 return
 
-            text = self._engine.transcribe(audio, self.config.sample_rate)
-            text = text.strip()
-            self._logger.debug("Raw transcription result: %r", text)
-
-            # Filter out whisper artifacts that aren't real transcription
-            # These are special tokens that whisper outputs for non-speech audio
-            whisper_artifacts = [
-                "[BLANK_AUDIO]", "[MUSIC]", "[APPLAUSE]", "[LAUGHTER]",
-                "(BLANK_AUDIO)", "(MUSIC)", "(APPLAUSE)", "(LAUGHTER)",
-                "[inaudible]", "(inaudible)", "[silence]", "(silence)",
-            ]
-            if text in whisper_artifacts or text.startswith("[") and text.endswith("]"):
-                text = ""  # Treat as no speech detected
+            text = _speech_only(self._engine.transcribe(audio, self.config.sample_rate))
+            self._logger.debug("Transcription result: %r", text)
 
             if text:
                 self._logger.info("Outputting text: %r to window: %s", text, window_info)
@@ -798,6 +930,7 @@ class STTDaemon:
                 self._recording = False
                 if self._recorder:
                     self._recorder.stop()
+                self._end_live(None)
 
         # Shut down audio stream cleanly before sleep
         if self._recorder:
@@ -1332,6 +1465,7 @@ class STTDaemon:
         if self._recorder:
             if self._recording:
                 self._recorder.stop()
+                self._end_live(None)
             self._recorder.shutdown()  # Fully stop the primed audio stream
 
         if self._hotkey:

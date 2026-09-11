@@ -47,6 +47,7 @@ class EngineConfig:
     translate_to_english: bool = False  # Translate to English [whisper only]
     nemotron_model: str = DEFAULT_NEMOTRON_MODEL  # Nemotron model name
     nemotron_language: str = "auto"  # Per-stream language for Nemotron
+    live_typing: bool = True  # Type while speaking; Whisper on a GPU only, Nemotron types after
 
 
 @dataclass
@@ -261,6 +262,7 @@ class Config:
                 nemotron_language=eng.get(
                     "nemotron_language", config.engine.nemotron_language
                 ),
+                live_typing=eng.get("live_typing", config.engine.live_typing),
             )
         elif eng is not None:
             logger.warning("Invalid 'engine' section (type %s); using defaults", type(eng).__name__)
@@ -473,6 +475,7 @@ class Config:
         # Engine booleans + gpu_device range.
         self.engine.force_cpu = bool(self.engine.force_cpu)
         self.engine.translate_to_english = bool(self.engine.translate_to_english)
+        self.engine.live_typing = bool(self.engine.live_typing)
         try:
             gpu_device = int(self.engine.gpu_device)
         except (TypeError, ValueError):
