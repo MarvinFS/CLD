@@ -15,11 +15,3 @@ class EngineError(STTError):
 
 class RecorderError(STTError):
     """Audio recorder initialization or runtime error."""
-
-
-class ConfigError(STTError):
-    """Configuration error."""
-
-
-class DaemonError(STTError):
-    """Daemon lifecycle error."""

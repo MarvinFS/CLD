@@ -18,6 +18,7 @@ from cld.errors import EngineError, HotkeyError, RecorderError
 from cld.hotkey import HotkeyListener
 from cld.keyboard import _output_via_clipboard, live_typer, output_text, release_modifiers
 from cld.recorder import AudioRecorder, RecorderConfig
+from cld.runtime import apply_dark_title_bar
 from cld.sounds import play_sound
 from cld.window import get_active_window, WindowInfo
 from cld.model_manager import ModelManager
@@ -104,14 +105,14 @@ class STTDaemon:
         self._settings_dialog: Optional[SettingsDialog] = None
 
         # Recording state
-        self._record_start_time: float = 0
+        self._record_start_time: float = 0.0
+        self._warned_max_recording: bool = False
         self._original_window: Optional[WindowInfo] = None
         # Type while speaking: the queue the recording in progress feeds its live thread.
         self._live_queue: Optional[queue.Queue] = None
 
         # Threading - use RLock to avoid deadlocks in nested callbacks
         self._lock = threading.RLock()
-        self._stop_event = threading.Event()
         # Transcription state protected by dedicated lock for thread-safety
         self._transcription_lock = threading.Lock()
         self._is_transcribing: bool = False
@@ -169,12 +170,6 @@ class STTDaemon:
             return False
 
         return True
-
-    def get_audio_level(self) -> float:
-        """Get current audio level (0.0-1.0) for visualization."""
-        if self._recorder and self._recording:
-            return self._recorder.get_current_level()
-        return 0.0
 
     def get_audio_spectrum(self) -> list[float]:
         """Get current spectrum bands (32 floats, 0.0-1.0) for visualization."""
@@ -256,7 +251,8 @@ class STTDaemon:
                 return
 
             self._recording = True
-            self._record_start_time = time.time()
+            self._record_start_time = time.monotonic()
+            self._warned_max_recording = False
 
             # Capture the active window
             self._original_window = get_active_window()
@@ -285,8 +281,11 @@ class STTDaemon:
             return None
         typer = live_typer(self._original_window)
         if typer is None:
-            # Nothing to type into; let the stream wind down off the hotkey thread.
-            threading.Thread(target=stream.finish, daemon=True).start()
+            # Nothing to type into; close the stream cleanly off the hotkey thread.
+            if hasattr(stream, "close"):
+                stream.close()
+            else:
+                threading.Thread(target=stream.finish, daemon=True).start()
             return None
         # The hotkey is still down: held for push-to-talk, or just pressed in toggle mode. Its
         # modifiers must not turn the typed text into shortcuts (keyboard._VK_MASK).
@@ -335,6 +334,8 @@ class STTDaemon:
                         committed, tentative = stream.feed(np.concatenate(chunks))
                     except Exception:
                         self._logger.exception("Live transcription failed; transcribing after the recording")
+                        if hasattr(stream, "close"):
+                            stream.close()
                         stream = None
                     else:
                         if typing:
@@ -347,8 +348,8 @@ class STTDaemon:
                     break
             audio = items[-1][1]
             if audio is None:
-                # ponytail: an abandoned Whisper stream leaves its worker parked; the model
-                # reload after resume resets the params it set.
+                if stream is not None and hasattr(stream, "close"):
+                    stream.close()
                 return
             # finish() runs even for a tap too short to keep, since it also winds the stream down.
             too_short = len(audio) < int(_MIN_RECORDING_S * self.config.sample_rate)
@@ -477,14 +478,13 @@ class STTDaemon:
         if not self._recording:
             return
 
-        elapsed = time.time() - self._record_start_time
+        elapsed = time.monotonic() - self._record_start_time
         max_seconds = self.config.max_recording_seconds
 
-        if max_seconds > 30:
-            # Warning at 30 seconds before max
-            if elapsed >= max_seconds - 30 and elapsed < max_seconds - 29:
-                if self.config.sound_effects:
-                    play_sound("warning")
+        if max_seconds > 30 and not self._warned_max_recording and elapsed >= max_seconds - 30:
+            self._warned_max_recording = True
+            if self.config.sound_effects:
+                play_sound("warning")
 
         # Auto-stop at max
         if elapsed >= max_seconds:
@@ -598,24 +598,32 @@ class STTDaemon:
                 self._notify("Engine switch failed - kept the previous engine.", "CLD")
                 self._restart_hotkey()
                 return
-            # _switch_engine set self._engine, self.config, and persisted.
+            # _switch_engine set self._engine, self.config, updated overlay, and persisted.
         else:
             self.config = new_config
+            if self._overlay:
+                self._overlay.set_config(self.config)
             new_config.save()
 
-        if self._recorder and self.config.recording.input_device != old_device:
-            # Move the pre-roll stream, and a recording in progress, to the new
-            # microphone. prime() only opens a stream if none is running.
-            self._recorder.switch_device(self.config.recording.input_device or None)
-            if not self._recorder.prime():
-                self._logger.warning("Failed to prime audio on the new input device")
+        if self._recorder:
+            self._recorder.set_max_recording_seconds(self.config.max_recording_seconds)
+            if self.config.recording.input_device != old_device:
+                # Move the pre-roll stream, and a recording in progress, to the new
+                # microphone. prime() only opens a stream if none is running.
+                self._recorder.switch_device(self.config.recording.input_device or None)
+                if not self._recorder.prime():
+                    self._logger.warning("Failed to prime audio on the new input device")
 
         self._restart_hotkey()
 
     @staticmethod
     def _engine_config_differs(old: Config, new: Config) -> bool:
         """True if any engine-affecting field changed (requires rebuild)."""
-        return asdict(old.engine) != asdict(new.engine)
+        old_d = asdict(old.engine)
+        new_d = asdict(new.engine)
+        old_d.pop("live_typing", None)
+        new_d.pop("live_typing", None)
+        return old_d != new_d
 
     def _restart_hotkey(self) -> None:
         """Recreate the hotkey listener from the active config."""
@@ -694,6 +702,8 @@ class STTDaemon:
         old_engine = self._engine
         self._engine = new_engine
         self.config = new_config
+        if self._overlay:
+            self._overlay.set_config(self.config)
         if old_engine is not None and hasattr(old_engine, "unload_model"):
             try:
                 old_engine.unload_model()
@@ -738,31 +748,6 @@ class STTDaemon:
         self._logger.info("Tray About clicked, queueing about dialog")
         self._main_thread_queue.put(self._show_about_dialog)
 
-    def _set_dark_title_bar(self, window) -> None:
-        """Set dark title bar on Windows 10/11."""
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            window.update()  # Ensure HWND exists
-
-            # Get the correct HWND (use GetAncestor for top-level window)
-            GA_ROOT = 2
-            GetAncestor = ctypes.windll.user32.GetAncestor
-            GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
-            GetAncestor.restype = wintypes.HWND
-            hwnd = GetAncestor(window.winfo_id(), GA_ROOT)
-
-            # DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-            value = ctypes.c_int(1)
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
-                ctypes.byref(value), ctypes.sizeof(value)
-            )
-        except Exception:
-            pass  # Silently fail on non-Windows or older Windows
-
     def _show_about_dialog(self):
         """Show the about dialog (must run in main thread)."""
         self._logger.info("_show_about_dialog called")
@@ -805,7 +790,7 @@ class STTDaemon:
             dialog.attributes("-topmost", True)
 
             # Set dark title bar on Windows 10/11
-            self._set_dark_title_bar(dialog)
+            apply_dark_title_bar(dialog)
 
             # Set window icon
             icon_path = get_app_icon_path()
@@ -972,13 +957,31 @@ class STTDaemon:
             PIPE_WAIT = 0x00000000
             PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
             PIPE_UNLIMITED_INSTANCES = 255
-            INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+            INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
 
-            CreateNamedPipeW = ctypes.windll.kernel32.CreateNamedPipeW
-            ConnectNamedPipe = ctypes.windll.kernel32.ConnectNamedPipe
-            DisconnectNamedPipe = ctypes.windll.kernel32.DisconnectNamedPipe
-            ReadFile = ctypes.windll.kernel32.ReadFile
-            CloseHandle = ctypes.windll.kernel32.CloseHandle
+            kernel32 = ctypes.windll.kernel32
+            CreateNamedPipeW = kernel32.CreateNamedPipeW
+            CreateNamedPipeW.argtypes = [
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                wintypes.DWORD, wintypes.LPVOID,
+            ]
+            CreateNamedPipeW.restype = wintypes.HANDLE
+            ConnectNamedPipe = kernel32.ConnectNamedPipe
+            ConnectNamedPipe.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
+            ConnectNamedPipe.restype = wintypes.BOOL
+            DisconnectNamedPipe = kernel32.DisconnectNamedPipe
+            DisconnectNamedPipe.argtypes = [wintypes.HANDLE]
+            DisconnectNamedPipe.restype = wintypes.BOOL
+            ReadFile = kernel32.ReadFile
+            ReadFile.argtypes = [
+                wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID,
+            ]
+            ReadFile.restype = wintypes.BOOL
+            CloseHandle = kernel32.CloseHandle
+            CloseHandle.argtypes = [wintypes.HANDLE]
+            CloseHandle.restype = wintypes.BOOL
 
             while self._running:
                 handle = CreateNamedPipeW(
@@ -1252,7 +1255,6 @@ class STTDaemon:
             self._overlay = STTOverlay(
                 on_close=self._on_overlay_close,
                 on_settings=self._on_settings_click,
-                get_audio_level=self.get_audio_level,
                 get_audio_spectrum=self.get_audio_spectrum,
                 config=self.config,
                 on_power_resume=self._on_power_resume,
@@ -1355,7 +1357,6 @@ class STTDaemon:
                 self._overlay = STTOverlay(
                     on_close=self._on_overlay_close,
                     on_settings=self._on_settings_click,
-                    get_audio_level=self.get_audio_level,
                     get_audio_spectrum=self.get_audio_spectrum,
                     config=self.config,
                     on_power_resume=self._on_power_resume,
@@ -1460,7 +1461,6 @@ class STTDaemon:
     def stop(self):
         """Stop the daemon."""
         self._running = False
-        self._stop_event.set()
 
         if self._recorder:
             if self._recording:
@@ -1471,7 +1471,25 @@ class STTDaemon:
         if self._hotkey:
             self._hotkey.stop()
 
+        if self._overlay:
+            try:
+                self._overlay.destroy()
+            except Exception:
+                self._logger.debug("Overlay destroy failed during stop", exc_info=True)
+            self._overlay = None
+
         if self._tray:
             self._tray.stop()
+
+        if self._engine and hasattr(self._engine, "unload_model"):
+            try:
+                self._engine.unload_model(wait_timeout=2.0)
+            except TypeError:
+                try:
+                    self._engine.unload_model()
+                except Exception:
+                    self._logger.debug("Engine unload failed during stop", exc_info=True)
+            except Exception:
+                self._logger.debug("Engine unload failed during stop", exc_info=True)
 
         self._logger.info("CLD daemon stopped.")

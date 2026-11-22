@@ -12,52 +12,63 @@ from typing import List, Optional
 import numpy as np
 
 from cld.engines._timeout import TimeoutRunner, FuturesTimeoutError
-from cld.model_manager import WHISPER_MODELS
+from cld.model_manager import WHISPER_MODELS, get_models_dir
 
 _whisper_available = False
 _Model = None
 _import_error = None
 _cuda_supported = False
 _vulkan_supported = False
+_vulkan_devices: list[tuple[int, str]] = []
 _system_info = ""
 _has_gpu_init_params = False  # Whether whisper_init_from_file_with_params exists
+
+_VULKAN_HEADER_RE = re.compile(r"ggml_vulkan:\s*(?:Found\s+\d+\s+Vulkan\s+devices|No\s+Vulkan\s+devices)")
+_VULKAN_DEVICE_RE = re.compile(r"ggml_vulkan:\s*(\d+)\s*=\s*([^|]+)")
 
 try:
     from pywhispercpp.model import Model as _Model
     _whisper_available = True
-    # Check GPU backends via system info and DLL presence
-    # Vulkan is preferred (universal), CUDA is NVIDIA-only fallback
+    # Check GPU backends via system info and Vulkan init log capture.
+    # ggml_vulkan prints its device list once on first backend init; capturing it
+    # via whisper_log_set avoids fd-2 redirection and tells a GPU-less PC apart
+    # from one with a Vulkan GPU even when ggml-vulkan.dll is bundled.
     try:
         import _pywhispercpp as _pw
-        _system_info = _pw.whisper_print_system_info()
+        _captured_logs: list[str] = []
+        _log_hooked = hasattr(_pw, "whisper_log_set")
+        if _log_hooked:
+            try:
+                _pw.whisper_log_set(lambda _level, text: _captured_logs.append(text))
+                _system_info = _pw.whisper_print_system_info()
+            finally:
+                _pw.whisper_log_set(None)
+        else:
+            _system_info = _pw.whisper_print_system_info()
+
         _cuda_supported = "CUDA" in _system_info
-        # Check Vulkan support: system_info or DLL presence
-        # Note: whisper_print_system_info() doesn't report Vulkan even when available,
-        # so we primarily check for the DLL
-        _vulkan_supported = "Vulkan" in _system_info
-        if not _vulkan_supported:
-            # Check for ggml-vulkan*.dll (with or without hash suffix from delvewheel)
-            import importlib.util
-            spec = importlib.util.find_spec("_pywhispercpp")
-            if spec and spec.origin:
-                site_packages = Path(spec.origin).parent
-                # Check both plain name and hash-suffixed name (from delvewheel)
-                vulkan_dlls = list(site_packages.glob("ggml-vulkan*.dll"))
-                _vulkan_supported = len(vulkan_dlls) > 0
-        # Check if GPU device selection function exists (custom build)
-        _has_gpu_init_params = hasattr(_pw, 'whisper_init_from_file_with_params')
+        _log_blob = "".join(_captured_logs)
+        _vulkan_header_seen = bool(_VULKAN_HEADER_RE.search(_log_blob))
+        for _m in _VULKAN_DEVICE_RE.finditer(_log_blob):
+            _idx = int(_m.group(1))
+            _name = _m.group(2).strip().split("(")[0].strip()
+            _vulkan_devices.append((_idx, _name))
+
+        if _vulkan_header_seen:
+            _vulkan_supported = bool(_vulkan_devices)
+        else:
+            _vulkan_supported = "Vulkan" in _system_info
+            if not _vulkan_supported:
+                import importlib.util
+                spec = importlib.util.find_spec("_pywhispercpp")
+                if spec and spec.origin:
+                    site_packages = Path(spec.origin).parent
+                    _vulkan_supported = len(list(site_packages.glob("ggml-vulkan*.dll"))) > 0
+        _has_gpu_init_params = hasattr(_pw, "whisper_init_from_file_with_params")
     except Exception:
         pass
 except Exception as e:
     _import_error = f"{type(e).__name__}: {e}"
-
-
-def get_models_dir() -> Path:
-    """Get CLD models directory."""
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    if local_app_data:
-        return Path(local_app_data) / "CLD" / "models"
-    return Path.home() / ".cld" / "models"
 
 
 def is_cuda_supported() -> bool:
@@ -66,8 +77,13 @@ def is_cuda_supported() -> bool:
 
 
 def is_vulkan_supported() -> bool:
-    """Check if pywhispercpp was built with Vulkan support."""
+    """Check if Vulkan GPU acceleration is available on this machine."""
     return _vulkan_supported
+
+
+def get_vulkan_devices() -> list[tuple[int, str]]:
+    """Return cached (index, name) tuples for Vulkan devices reported by ggml_vulkan."""
+    return list(_vulkan_devices)
 
 
 def is_gpu_supported() -> bool:
@@ -86,11 +102,6 @@ def get_gpu_backend() -> Optional[str]:
     if _cuda_supported:
         return "CUDA"
     return None
-
-
-def get_system_info() -> str:
-    """Get the pywhispercpp system info string."""
-    return _system_info
 
 
 def has_gpu_device_selection() -> bool:
@@ -157,6 +168,7 @@ class WhisperEngine:
         self._runner = TimeoutRunner(thread_name_prefix="cld-transcribe")
         self._logger = logging.getLogger(__name__)
         self._last_error: Optional[str] = None
+        self._saved_affinity: Optional[list[int]] = None
 
         # GPU support: auto-detect or use explicit setting
         # Vulkan is preferred (universal), CUDA is fallback (NVIDIA-only)
@@ -222,6 +234,7 @@ class WhisperEngine:
                     except Exception:
                         pass
                     self._model = None
+            self._restore_cpu_affinity()
         finally:
             if clean:
                 self._transcribe_lock.release()
@@ -232,32 +245,35 @@ class WhisperEngine:
         return self._last_error
 
     def _set_cpu_affinity_exclude_core0(self) -> None:
-        """Set CPU affinity to all cores except core 0 for system responsiveness.
-
-        On systems with SMT/HyperThreading, core 0 has logical processors 0 and 1.
-        We exclude both to leave the first physical core free.
-        """
+        """Set CPU affinity once to exclude core 0 for system responsiveness."""
+        if self._saved_affinity is not None:
+            return
         try:
             import psutil
             process = psutil.Process()
-            # Get all available CPUs
+            original = process.cpu_affinity()
             all_cpus = list(range(self._cpu_count))
-            # Exclude logical processors 0 and 1 (physical core 0 on SMT systems)
-            # On non-SMT systems, just exclude CPU 0
-            if self._cpu_count > 4:
-                # SMT system: exclude CPUs 0 and 1 (first physical core)
-                allowed_cpus = [cpu for cpu in all_cpus if cpu >= 2]
-            else:
-                # Small system: just exclude CPU 0
-                allowed_cpus = [cpu for cpu in all_cpus if cpu >= 1]
-
+            allowed_cpus = [c for c in all_cpus if c >= (2 if self._cpu_count > 4 else 1)]
             if allowed_cpus:
                 process.cpu_affinity(allowed_cpus)
+                self._saved_affinity = original
                 self._logger.debug("CPU affinity set to cores: %s (excluded core 0)", allowed_cpus)
         except ImportError:
             self._logger.debug("psutil not available, skipping CPU affinity")
         except Exception as e:
             self._logger.debug("Failed to set CPU affinity: %s", e)
+
+    def _restore_cpu_affinity(self) -> None:
+        """Restore original process CPU affinity if previously narrowed."""
+        if self._saved_affinity is None:
+            return
+        try:
+            import psutil
+            psutil.Process().cpu_affinity(self._saved_affinity)
+        except Exception as e:
+            self._logger.debug("Failed to restore CPU affinity: %s", e)
+        finally:
+            self._saved_affinity = None
 
     def _get_model_path(self) -> Path:
         """Get path to GGML model file."""
@@ -290,23 +306,15 @@ class WhisperEngine:
                 return False
 
             try:
-                # GPU backend is used automatically when available
-                # Vulkan: universal (NVIDIA/AMD/Intel), CUDA: NVIDIA-only fallback
-                # gpu_device: -1 = auto, 0 = first GPU (usually discrete), 1 = second GPU
-                #
-                # use_gpu and gpu_device are named params on the custom Vulkan build
-                # of pywhispercpp (not passed via **params to _set_params).
-                # If stock PyPI version is installed (missing these params), fall back
-                # to n_threads only to avoid AttributeError + native segfault.
-                import inspect
-                model_sig = inspect.signature(_Model.__init__)
-                model_kwargs = {"n_threads": self.n_threads}
-                if "use_gpu" in model_sig.parameters:
-                    model_kwargs["use_gpu"] = self.use_gpu
-                    if "gpu_device" in model_sig.parameters:
-                        model_kwargs["gpu_device"] = self.gpu_device
-
-                self._model = _Model(str(model_path), **model_kwargs)
+                # Upstream pywhispercpp >= 1.5 passes GPU selection via context_params.
+                ctx_params: dict = {"use_gpu": self.use_gpu}
+                if self.gpu_device >= 0:
+                    ctx_params["gpu_device"] = self.gpu_device
+                self._model = _Model(
+                    str(model_path),
+                    n_threads=self.n_threads,
+                    context_params=ctx_params,
+                )
                 self._last_error = None
 
                 # Verify actual backend from system_info (not just config)
@@ -582,10 +590,14 @@ class _Stream:
         self._grew.set()
         return self._hypothesis()
 
-    def finish(self) -> str:
-        """Stop the passes and transcribe the whole recording as the batch path does."""
+    def close(self) -> None:
+        """Stop the live worker without running a final batch transcription."""
         self._closed = True
         self._grew.set()
+
+    def finish(self) -> str:
+        """Stop the passes and transcribe the whole recording as the batch path does."""
+        self.close()
         self._worker.join(self._engine.transcription_timeout)
         with self._lock:
             audio = np.concatenate(self._recording) if self._recording else None

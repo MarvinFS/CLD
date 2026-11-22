@@ -1,8 +1,6 @@
 """Model setup dialog for CLD - download and configure Whisper models."""
 
-import ctypes
 import logging
-import platform
 import queue
 import threading
 import tkinter as tk
@@ -16,57 +14,9 @@ from cld.model_manager import (
     get_spec,
     has_spec,
 )
+from cld.runtime import apply_dark_title_bar
 
 logger = logging.getLogger(__name__)
-
-
-def set_dark_title_bar(window) -> None:
-    """Set dark title bar on Windows 10/11."""
-    if platform.system() != "Windows":
-        return
-    try:
-        # Ensure window is realized
-        window.update_idletasks()
-        window.update()
-
-        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-        DWMWA_USE_IMMERSIVE_DARK_MODE_OLD = 19  # For older Windows 10 builds
-        value = ctypes.c_int(1)
-
-        # Get HWND - try multiple methods
-        hwnd = None
-
-        # Method 1: GetAncestor with GA_ROOT
-        GA_ROOT = 2
-        hwnd = ctypes.windll.user32.GetAncestor(window.winfo_id(), GA_ROOT)
-
-        # Method 2: GetParent (fallback)
-        if not hwnd:
-            hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
-
-        if hwnd:
-            # Try attribute 20 first (newer Windows), then 19 (older builds)
-            result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
-                ctypes.byref(value), ctypes.sizeof(value)
-            )
-            if result != 0:
-                ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                    hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_OLD,
-                    ctypes.byref(value), ctypes.sizeof(value)
-                )
-
-            # Force redraw of title bar
-            SWP_FRAMECHANGED = 0x0020
-            SWP_NOMOVE = 0x0002
-            SWP_NOSIZE = 0x0001
-            SWP_NOZORDER = 0x0004
-            ctypes.windll.user32.SetWindowPos(
-                hwnd, None, 0, 0, 0, 0,
-                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
-            )
-    except Exception:
-        pass
 
 
 class ModelSetupDialog:
@@ -187,7 +137,7 @@ class ModelSetupDialog:
         y = (screen_h - height) // 2
         self._window.geometry(f"{width}x{height}+{x}+{y}")
 
-        set_dark_title_bar(self._window)
+        apply_dark_title_bar(self._window)
         self._set_window_icon()
         self._configure_styles()
         self._build_ui()
@@ -228,10 +178,8 @@ class ModelSetupDialog:
         try:
             from cld.ui.hardware import detect_hardware
             hw = detect_hardware()
-            # Only adopt the hardware recommendation for Whisper. Nemotron has
-            # a single pinned model; never overwrite the requested name with a
-            # Whisper GGML recommendation.
-            if self._engine == "whisper":
+            # Only adopt the hardware recommendation when no Whisper model was requested.
+            if not self._model_name and self._engine == "whisper":
                 self._model_name = hw.recommended_model
             self._hw_info = {
                 "has_cuda": hw.has_cuda,
@@ -243,7 +191,8 @@ class ModelSetupDialog:
             }
         except Exception as e:
             logger.warning("Hardware detection failed: %s", e)
-            self._model_name = "medium-q5_0"
+            if not self._model_name and self._engine == "whisper":
+                self._model_name = "medium-q5_0"
             import os
             self._hw_info = {
                 "has_cuda": False,
@@ -537,11 +486,6 @@ class ModelSetupDialog:
         self._model_name = model_name
         self._update_model_info()
 
-    def _on_model_change(self, event=None):
-        """Handle model selection change."""
-        self._model_name = self._model_var.get()
-        self._update_model_info()
-
     def _on_download_click(self):
         """Handle download button click."""
         if self._is_downloading:
@@ -639,14 +583,14 @@ class ModelSetupDialog:
         y = parent_y + 30
         manual_win.geometry(f"{width}x{height}+{x}+{y}")
 
-        set_dark_title_bar(manual_win)
+        apply_dark_title_bar(manual_win)
 
         # Make modal
         manual_win.transient(self._window)
         manual_win.grab_set()
 
         # Re-apply dark title bar after modal setup
-        manual_win.after(50, lambda: set_dark_title_bar(manual_win))
+        manual_win.after(50, lambda: apply_dark_title_bar(manual_win))
 
         container = tk.Frame(manual_win, bg=self._bg)
         container.pack(fill=tk.BOTH, expand=True, padx=24, pady=24)
@@ -665,9 +609,10 @@ class ModelSetupDialog:
         step1_inner = tk.Frame(step1_frame, bg=self._surface)
         step1_inner.pack(fill=tk.X, padx=16, pady=12)
 
+        source_name = "GitHub" if self._engine == "nemotron" else "HuggingFace"
         tk.Label(
             step1_inner,
-            text="Step 1: Download from HuggingFace",
+            text=f"Step 1: Download from {source_name}",
             font=("Segoe UI Semibold", 10),
             fg=self._accent,
             bg=self._surface,
@@ -924,324 +869,3 @@ class ModelSetupDialog:
 
         if self._result is True and self._on_success:
             self._on_success()
-
-
-def show_model_setup(model_manager: ModelManager, model_name: str, parent: Optional[tk.Tk] = None) -> bool:
-    """Show the model setup dialog."""
-    return ModelSetupDialog(model_manager, model_name, parent).show()
-
-
-class ModelUpdateDialog:
-    """Dialog to prompt user for model update."""
-
-    def __init__(
-        self,
-        model_manager: ModelManager,
-        model_name: str,
-        local_version: str,
-        remote_version: str,
-    ):
-        self._manager = model_manager
-        self._model_name = model_name
-        self._local_version = local_version
-        self._remote_version = remote_version
-
-        self._window: Optional[tk.Tk] = None
-        self._root: Optional[tk.Tk] = None
-        self._result: Optional[bool] = None
-        self._download_thread: Optional[threading.Thread] = None
-
-        # Cross-thread UI hand-off (see ModelSetupDialog for rationale).
-        self._ui_queue: "queue.Queue" = queue.Queue()
-        self._ui_pump_id: Optional[str] = None
-
-        # Colors (dark theme)
-        self._bg = "#1a1a1a"
-        self._surface = "#242424"
-        self._border = "#333333"
-        self._text = "#ffffff"
-        self._text_dim = "#888888"
-        self._accent = "#4a9eff"
-        self._green = "#66ff66"
-        self._red = "#ff6666"
-        self._yellow = "#ffcc00"
-
-        # UI elements
-        self._progress_frame: Optional[tk.Frame] = None
-        self._progress_bar: Optional[ttk.Progressbar] = None
-        self._progress_label: Optional[tk.Label] = None
-        self._update_btn: Optional[tk.Button] = None
-        self._skip_btn: Optional[tk.Button] = None
-        self._is_downloading: bool = False
-
-    def _post_to_ui(self, callback) -> None:
-        """Thread-safe: schedule ``callback`` for the Tk main thread."""
-        self._ui_queue.put(callback)
-
-    def _drain_ui_queue(self) -> None:
-        """Main-thread Tk tick. Runs queued callbacks then re-arms itself."""
-        while True:
-            try:
-                cb = self._ui_queue.get_nowait()
-            except queue.Empty:
-                break
-            try:
-                cb()
-            except Exception:
-                logger.exception("Queued UI callback failed")
-        if self._window is not None:
-            try:
-                self._ui_pump_id = self._window.after(30, self._drain_ui_queue)
-            except tk.TclError:
-                self._ui_pump_id = None
-
-    def show(self) -> bool:
-        """Show the update prompt dialog.
-
-        Returns:
-            True if update was successful, False if skipped/cancelled.
-        """
-        self._root = tk.Tk()
-        self._window = self._root
-        self._window.title("Model Update Available")
-        self._window.configure(bg=self._bg)
-        self._window.resizable(False, False)
-        self._window.attributes("-toolwindow", True)
-
-        # Start the main-thread tick that drains _ui_queue.
-        self._ui_pump_id = self._window.after(30, self._drain_ui_queue)
-
-        # Size and center
-        width, height = 450, 320
-        screen_w = self._window.winfo_screenwidth()
-        screen_h = self._window.winfo_screenheight()
-        x = (screen_w - width) // 2
-        y = (screen_h - height) // 2
-        self._window.geometry(f"{width}x{height}+{x}+{y}")
-
-        set_dark_title_bar(self._window)
-        self._configure_styles()
-        self._build_ui()
-
-        # Close = skip update
-        self._window.protocol("WM_DELETE_WINDOW", self._on_skip)
-        self._window.bind("<Escape>", lambda e: self._on_skip())
-
-        self._window.deiconify()
-        self._window.lift()
-        self._window.attributes("-topmost", True)
-        self._window.update()
-        self._window.attributes("-topmost", False)
-        self._window.grab_set()
-        self._window.focus_force()
-
-        self._root.mainloop()
-        return self._result is True
-
-    def _configure_styles(self):
-        """Configure ttk styles."""
-        style = ttk.Style()
-        style.configure(
-            "Dark.Horizontal.TProgressbar",
-            troughcolor=self._surface,
-            background=self._accent,
-            bordercolor=self._border,
-            thickness=8,
-        )
-
-    def _build_ui(self):
-        """Build the dialog UI."""
-        container = tk.Frame(self._window, bg=self._bg)
-        container.pack(fill=tk.BOTH, expand=True, padx=24, pady=24)
-
-        # Title
-        tk.Label(
-            container,
-            text="Model Update Available",
-            font=("Segoe UI Semibold", 14),
-            fg=self._text,
-            bg=self._bg,
-        ).pack(anchor="w", pady=(0, 16))
-
-        # Info
-        model_info = WHISPER_MODELS.get(self._model_name, {})
-        tk.Label(
-            container,
-            text=f"A new version of the {self._model_name} model is available.",
-            font=("Segoe UI", 10),
-            fg=self._text_dim,
-            bg=self._bg,
-        ).pack(anchor="w", pady=(0, 8))
-
-        # Version info
-        version_frame = tk.Frame(container, bg=self._surface)
-        version_frame.pack(fill=tk.X, pady=(0, 16))
-        version_inner = tk.Frame(version_frame, bg=self._surface)
-        version_inner.pack(fill=tk.X, padx=16, pady=12)
-
-        tk.Label(
-            version_inner,
-            text=f"Current: {self._local_version}  →  New: {self._remote_version}",
-            font=("Consolas", 10),
-            fg=self._yellow,
-            bg=self._surface,
-        ).pack(anchor="w")
-
-        tk.Label(
-            version_inner,
-            text=f"Size: ~{model_info.get('size', 'unknown')}",
-            font=("Segoe UI", 9),
-            fg=self._text_dim,
-            bg=self._surface,
-        ).pack(anchor="w", pady=(4, 0))
-
-        # Progress (hidden initially)
-        self._progress_frame = tk.Frame(container, bg=self._bg)
-
-        self._progress_bar = ttk.Progressbar(
-            self._progress_frame,
-            mode="indeterminate",
-            style="Dark.Horizontal.TProgressbar",
-            length=400,
-        )
-        self._progress_bar.pack(fill=tk.X, pady=(0, 4))
-
-        self._progress_label = tk.Label(
-            self._progress_frame,
-            text="",
-            font=("Consolas", 9),
-            fg=self._text_dim,
-            bg=self._bg,
-        )
-        self._progress_label.pack(anchor="w")
-
-        # Spacer
-        tk.Frame(container, bg=self._bg).pack(fill=tk.BOTH, expand=True)
-
-        # Buttons
-        btn_frame = tk.Frame(container, bg=self._bg)
-        btn_frame.pack(fill=tk.X, pady=(16, 0))
-
-        self._skip_btn = tk.Button(
-            btn_frame,
-            text="Skip",
-            font=("Segoe UI", 10),
-            bg=self._surface,
-            fg=self._text,
-            activebackground=self._border,
-            activeforeground=self._text,
-            bd=0,
-            padx=20,
-            pady=10,
-            cursor="hand2",
-            command=self._on_skip,
-        )
-        self._skip_btn.pack(side=tk.RIGHT, padx=(8, 0))
-
-        self._update_btn = tk.Button(
-            btn_frame,
-            text="Update Now",
-            font=("Segoe UI Semibold", 10),
-            bg=self._accent,
-            fg=self._text,
-            activebackground="#3a8eef",
-            activeforeground=self._text,
-            bd=0,
-            padx=20,
-            pady=10,
-            cursor="hand2",
-            command=self._on_update,
-        )
-        self._update_btn.pack(side=tk.RIGHT)
-
-    def _on_update(self):
-        """Handle update button click."""
-        if self._is_downloading:
-            return
-
-        self._is_downloading = True
-        self._progress_frame.pack(fill=tk.X, pady=(0, 16))
-        self._progress_bar.config(mode="indeterminate")
-        self._progress_bar.start(10)
-        self._progress_label.config(text="Downloading update...", fg=self._text_dim)
-
-        self._update_btn.config(state=tk.DISABLED, text="Updating...")
-        self._skip_btn.config(state=tk.DISABLED)
-
-        def download():
-            def progress_callback(downloaded, total, speed):
-                if total > 0:
-                    pct = (downloaded / total) * 100
-                    text = f"{downloaded / (1024*1024):.1f} / {total / (1024*1024):.1f} MB ({pct:.0f}%)"
-                else:
-                    pct = -1
-                    text = f"{downloaded / (1024*1024):.1f} MB downloaded"
-                self._post_to_ui(lambda p=pct, t=text: self._update_progress(p, t))
-
-            success, error = self._manager.download_engine_model(
-                self._engine, self._model_name, progress_callback
-            )
-            self._post_to_ui(lambda s=success, e=error: self._on_download_complete(s, e))
-
-        self._download_thread = threading.Thread(target=download, daemon=True)
-        self._download_thread.start()
-
-    def _update_progress(self, percent: float, text: str):
-        """Update progress display."""
-        if percent >= 0:
-            self._progress_bar.stop()
-            self._progress_bar.config(mode="determinate", value=percent)
-        self._progress_label.config(text=text)
-
-    def _on_download_complete(self, success: bool, error: str):
-        """Handle download completion."""
-        self._is_downloading = False
-        self._progress_bar.stop()
-
-        if success:
-            self._progress_bar.config(mode="determinate", value=100)
-            self._progress_label.config(text="Update complete!", fg=self._green)
-            self._result = True
-            self._window.after(500, self._close)
-        else:
-            self._progress_label.config(text=f"Error: {error}", fg=self._red)
-            self._update_btn.config(state=tk.NORMAL, text="Retry")
-            self._skip_btn.config(state=tk.NORMAL)
-
-    def _on_skip(self):
-        """Handle skip button click."""
-        if self._is_downloading:
-            return
-        self._result = False
-        self._close()
-
-    def _close(self):
-        """Close dialog."""
-        if self._window:
-            try:
-                self._window.grab_release()
-                self._window.destroy()
-            except Exception:
-                pass
-            self._window = None
-
-        if self._root:
-            try:
-                self._root.quit()
-            except Exception:
-                pass
-            self._root = None
-
-
-def show_model_update(
-    model_manager: ModelManager,
-    model_name: str,
-    local_version: str,
-    remote_version: str,
-) -> bool:
-    """Show the model update dialog.
-
-    Returns:
-        True if update was applied, False if skipped.
-    """
-    return ModelUpdateDialog(model_manager, model_name, local_version, remote_version).show()

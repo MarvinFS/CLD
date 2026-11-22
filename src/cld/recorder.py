@@ -53,15 +53,6 @@ class RecorderConfig:
     device: Optional[str] = None  # Input device name from get_devices(); None = system default
 
 
-@dataclass
-class AudioChunk:
-    """A chunk of recorded audio."""
-
-    data: np.ndarray
-    sample_rate: int
-    timestamp: float
-
-
 class AudioRecorder:
     """Records audio from the microphone.
 
@@ -90,6 +81,10 @@ class AudioRecorder:
         self._lock = threading.Lock()
         self._logger = logging.getLogger(__name__)
 
+        # Precompute log-spaced voice frequency (200-4000 Hz) FFT bins once
+        self._spectrum_n_bins = self.config.blocksize // 2 + 1
+        self._spectrum_bins = self._compute_spectrum_bins(self._spectrum_n_bins)
+
         # Pre-roll buffer: circular buffer to capture audio before start() is called
         preroll_samples = int(self.config.preroll_ms * self.config.sample_rate / 1000)
         preroll_chunks = max(1, math.ceil(preroll_samples / self.config.blocksize))
@@ -102,6 +97,27 @@ class AudioRecorder:
         max_seconds = max(1, int(self.config.max_recording_seconds))
         chunks = max_seconds * self.config.sample_rate / self.config.blocksize
         return max(1, math.ceil(chunks))
+
+    def set_max_recording_seconds(self, max_seconds: Optional[int]) -> None:
+        """Update the maximum recording duration for subsequent recordings."""
+        with self._lock:
+            self.config.max_recording_seconds = max_seconds
+            self._max_chunks = self._compute_max_chunks()
+
+    def _compute_spectrum_bins(self, n_bins: int) -> list[tuple[int, int]]:
+        """Precompute 32 log-spaced FFT bin ranges covering 200-4000 Hz."""
+        min_freq, max_freq = 200, 4000
+        num_bands = 32
+        bins: list[tuple[int, int]] = []
+        for i in range(num_bands):
+            f_low = min_freq * (max_freq / min_freq) ** (i / num_bands)
+            f_high = min_freq * (max_freq / min_freq) ** ((i + 1) / num_bands)
+            bin_low = int(f_low * n_bins * 2 / self.config.sample_rate)
+            bin_high = int(f_high * n_bins * 2 / self.config.sample_rate)
+            bin_low = max(0, min(bin_low, n_bins - 1))
+            bin_high = max(bin_low + 1, min(bin_high, n_bins))
+            bins.append((bin_low, bin_high))
+        return bins
 
     def is_available(self) -> bool:
         """Check if audio recording is available."""
@@ -195,37 +211,43 @@ class AudioRecorder:
         if status:
             self._logger.debug("Audio callback status: %s", status)
 
+        # Store chunk based on recording state first
+        chunk = indata.copy()
+        with self._lock:
+            is_recording = self._state is _RecorderState.RECORDING
+            if is_recording:
+                # Store chunks for transcription
+                self._recorded_chunks.append(chunk)
+                if self._live_queue is not None:
+                    self._live_queue.put_nowait(chunk)
+            else:
+                # Not recording - fill pre-roll buffer (circular)
+                self._preroll_buffer.append(chunk)
+
+        # Skip visualization DSP during idle pre-roll
+        if not is_recording:
+            return
+
         audio = indata.flatten()
 
         # Calculate overall RMS level
-        rms = np.sqrt(np.mean(audio ** 2))
+        rms = float(np.sqrt(np.mean(audio ** 2)))
         level = min(1.0, rms * 80)
         with _level_lock:
             _current_level = level
 
-        # Compute FFT spectrum for visualization (32 bands)
-        # Focus on actual voice frequency range: 200-4000 Hz
-        # This is where speech formants and consonants live
-        fft = np.fft.rfft(audio)
-        magnitudes = np.abs(fft)
-
+        # Compute FFT spectrum for visualization (32 voice bands: 200-4000 Hz)
+        magnitudes = np.abs(np.fft.rfft(audio))
         n_bins = len(magnitudes)
-        bands = []
-        # Voice-focused frequency range (200 Hz to 4000 Hz)
-        min_freq, max_freq = 200, 4000
-        num_bands = 32
-        for i in range(num_bands):
-            # Log-spaced frequency boundaries within voice range
-            f_low = min_freq * (max_freq / min_freq) ** (i / num_bands)
-            f_high = min_freq * (max_freq / min_freq) ** ((i + 1) / num_bands)
-            # Convert to FFT bin indices
-            bin_low = int(f_low * n_bins * 2 / self.config.sample_rate)
-            bin_high = int(f_high * n_bins * 2 / self.config.sample_rate)
-            bin_low = max(0, min(bin_low, n_bins - 1))
-            bin_high = max(bin_low + 1, min(bin_high, n_bins))
-            # Average magnitude in this band
-            band_mag = np.mean(magnitudes[bin_low:bin_high]) if bin_high > bin_low else 0
-            bands.append(band_mag)
+        bin_ranges = (
+            self._spectrum_bins
+            if n_bins == self._spectrum_n_bins
+            else self._compute_spectrum_bins(n_bins)
+        )
+        bands = [
+            float(np.mean(magnitudes[bin_low:bin_high])) if bin_high > bin_low else 0.0
+            for bin_low, bin_high in bin_ranges
+        ]
 
         # Normalize bands - pure FFT, no fake bass
         max_mag = max(bands) if bands else 1.0
@@ -236,18 +258,6 @@ class AudioRecorder:
 
         with _spectrum_lock:
             _spectrum_bands = bands
-
-        # Store chunk based on recording state
-        chunk = indata.copy()
-        with self._lock:
-            if self._recording:
-                # Store chunks for transcription
-                self._recorded_chunks.append(chunk)
-                if self._live_queue is not None:
-                    self._live_queue.put_nowait(chunk)
-            else:
-                # Not recording - fill pre-roll buffer (circular)
-                self._preroll_buffer.append(chunk)
 
     def prime(self) -> bool:
         """Start the audio stream for pre-roll buffering.

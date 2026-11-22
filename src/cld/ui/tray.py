@@ -5,7 +5,6 @@ import logging
 import re
 import sys
 import threading
-import time
 from ctypes import wintypes
 from typing import Callable, Optional, Set
 
@@ -79,7 +78,10 @@ def _force_delete_shell_icon(hwnd: int) -> bool:
     nid.hWnd = hwnd
     nid.uID = 0
     try:
-        ok = bool(ctypes.windll.shell32.Shell_NotifyIconW(_NIM_DELETE, ctypes.byref(nid)))
+        shell_notify = ctypes.windll.shell32.Shell_NotifyIconW
+        shell_notify.argtypes = [wintypes.DWORD, ctypes.POINTER(_NIDW)]
+        shell_notify.restype = wintypes.BOOL
+        ok = bool(shell_notify(_NIM_DELETE, ctypes.byref(nid)))
         logger.debug("NIM_DELETE hwnd=0x%X result=%s", hwnd, ok)
         return ok
     except OSError as e:
@@ -92,7 +94,10 @@ def _post_close_to_window(hwnd: int) -> None:
     if not _IS_WIN32 or not hwnd:
         return
     try:
-        ctypes.windll.user32.PostMessageW(wintypes.HWND(hwnd), _WM_CLOSE, 0, 0)
+        post_msg = ctypes.windll.user32.PostMessageW
+        post_msg.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        post_msg.restype = wintypes.BOOL
+        post_msg(wintypes.HWND(hwnd), _WM_CLOSE, 0, 0)
     except OSError:
         pass
 
@@ -109,11 +114,20 @@ def _sweep_stale_tray_windows() -> int:
 
     discovered: Set[int] = set()
     try:
-        EnumWindows = ctypes.windll.user32.EnumWindows
-        GetWindowThreadProcessId = ctypes.windll.user32.GetWindowThreadProcessId
-        GetClassNameW = ctypes.windll.user32.GetClassNameW
         WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-        own_pid = ctypes.windll.kernel32.GetCurrentProcessId()
+        EnumWindows = ctypes.windll.user32.EnumWindows
+        EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+        EnumWindows.restype = wintypes.BOOL
+        GetWindowThreadProcessId = ctypes.windll.user32.GetWindowThreadProcessId
+        GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        GetWindowThreadProcessId.restype = wintypes.DWORD
+        GetClassNameW = ctypes.windll.user32.GetClassNameW
+        GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        GetClassNameW.restype = ctypes.c_int
+        GetCurrentProcessId = ctypes.windll.kernel32.GetCurrentProcessId
+        GetCurrentProcessId.argtypes = []
+        GetCurrentProcessId.restype = wintypes.DWORD
+        own_pid = GetCurrentProcessId()
         pattern = re.compile(r"^CLD\d+SystemTrayIcon$")
 
         def _cb(hwnd, _lparam):
@@ -448,10 +462,7 @@ class TrayIcon:
         if not self._icon:
             return
 
-        # Update icon
-        self._icon.icon = self._get_icon(state)
-
-        # Update tooltip
+        # Icon image is static across states; only update tooltip text
         titles = {
             self.STATE_READY: "CLD - Ready",
             self.STATE_RECORDING: "CLD - Recording...",

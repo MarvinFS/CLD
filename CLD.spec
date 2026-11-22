@@ -42,7 +42,9 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # Keep UPX off in PyInstaller so CLD.exe stays uncompressed (CFG/GUARD_CF)
+    # and compress_upx.ps1 is the single compression path for safe DLLs only.
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -56,7 +58,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     # UPX must NOT touch the whisper.cpp / ggml-vulkan binaries:
     # ggml-vulkan.dll embeds precompiled SPIR-V shader blobs whose
     # internal layout UPX rewrites, producing 0xC0000005 access

@@ -1,9 +1,11 @@
 """Keyboard output: direct injection or clipboard fallback."""
 
 import ctypes
+from ctypes import wintypes
 import json
 import logging
 import os
+import sys
 import time
 from typing import Optional
 
@@ -68,6 +70,26 @@ class _INPUT(ctypes.Structure):
 
     _anonymous_ = ("u",)
     _fields_ = [("type", ctypes.c_ulong), ("u", _U)]
+
+
+if sys.platform == "win32":
+    ctypes.windll.user32.GetForegroundWindow.argtypes = []
+    ctypes.windll.user32.GetForegroundWindow.restype = wintypes.HWND
+    ctypes.windll.user32.SendInput.argtypes = [wintypes.UINT, ctypes.c_void_p, ctypes.c_int]
+    ctypes.windll.user32.SendInput.restype = wintypes.UINT
+    ctypes.windll.user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+    ctypes.windll.user32.MapVirtualKeyW.restype = wintypes.UINT
+    ctypes.windll.user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    ctypes.windll.user32.GetAsyncKeyState.restype = ctypes.c_short
+
+_ALT_WIN_KEY_NAMES = {"alt", "alt_l", "alt_r", "alt_gr", "cmd", "cmd_l", "cmd_r", "win", "meta"}
+
+
+def _hotkey_has_alt_or_win(config: Config) -> bool:
+    """True when the configured hotkey involves Alt or Win (which can activate app menus)."""
+    key = (config.activation.key or "").lower()
+    mods = {m.lower() for m in (config.activation.modifiers or [])}
+    return key in _ALT_WIN_KEY_NAMES or bool(mods & _ALT_WIN_KEY_NAMES)
 
 
 def _send_input(events) -> int:
@@ -316,13 +338,12 @@ def _output_via_injection(
             _logger.warning("Focus restore failed; falling back to clipboard")
             return _output_via_clipboard(text, config, window_info)
 
-        kb = get_keyboard()
-
-        # Dismiss any menus that may have opened due to Alt key release
-        # (Alt Gr releases as Ctrl+Alt, which can activate menu bars in some apps)
-        kb.press(Key.esc)
-        kb.release(Key.esc)
-        time.sleep(0.05)
+        # Dismiss any menu bar that an Alt/Win hotkey release may have activated.
+        if _hotkey_has_alt_or_win(config):
+            kb = get_keyboard()
+            kb.press(Key.esc)
+            kb.release(Key.esc)
+            time.sleep(0.05)
 
         # Type the text
         _type_unicode(text)
@@ -332,9 +353,11 @@ def _output_via_injection(
 
         return True
     except Exception:
-        # Fall back to clipboard on any error
+        # Fall back to copy-only clipboard: when SendInput failed due to UIPI
+        # (elevated target window), sending Ctrl+V would also be silently
+        # blocked and the clipboard-restore timer would then wipe the text.
         _logger.warning("Injection failed; falling back to clipboard", exc_info=True)
-        return _output_via_clipboard(text, config)
+        return _output_via_clipboard(text, config, paste=False)
 
 
 def _output_via_clipboard(
@@ -393,11 +416,11 @@ def _output_via_clipboard(
             if focused:
                 try:
                     kb = get_keyboard()
-                    # Dismiss any menus that may have opened due to Alt release
-                    # while we were the foreground (see _output_via_injection).
-                    kb.press(Key.esc)
-                    kb.release(Key.esc)
-                    time.sleep(0.05)
+                    # Dismiss any menu bar an Alt/Win hotkey release may have activated.
+                    if _hotkey_has_alt_or_win(config):
+                        kb.press(Key.esc)
+                        kb.release(Key.esc)
+                        time.sleep(0.05)
                     with kb.pressed(Key.ctrl):
                         kb.press("v")
                         kb.release("v")

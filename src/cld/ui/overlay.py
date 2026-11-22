@@ -14,6 +14,8 @@ from typing import Callable, Optional, TYPE_CHECKING
 
 from PIL import Image, ImageTk
 
+from cld.runtime import is_frozen as _is_frozen
+
 if TYPE_CHECKING:
     from cld.config import Config
 
@@ -47,14 +49,42 @@ PBT_APMRESUMESUSPEND = 0x07   # System woke from user action
 ANIMATION_FRAME_MS = 33
 
 
-def _is_frozen() -> bool:
-    """Check if running as frozen exe (PyInstaller or Nuitka)."""
-    # PyInstaller sets sys.frozen
-    if getattr(sys, "frozen", False):
-        return True
-    # Nuitka sets __compiled__ on __main__
-    main_mod = sys.modules.get("__main__", object())
-    return "__compiled__" in dir(main_mod)
+def _get_top_hwnd(widget_id: int) -> int:
+    """Return the top-level Win32 HWND for a Tk widget id (64-bit safe)."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    get_parent = user32.GetParent
+    get_parent.argtypes = [wintypes.HWND]
+    get_parent.restype = wintypes.HWND
+    hwnd = get_parent(widget_id)
+    if not hwnd:
+        get_ancestor = user32.GetAncestor
+        get_ancestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        get_ancestor.restype = wintypes.HWND
+        hwnd = get_ancestor(widget_id, 2)  # GA_ROOT
+    return int(hwnd) if hwnd else 0
+
+
+def _get_virtual_screen_bounds(root: tk.Tk) -> tuple[int, int, int, int]:
+    """Return (left, top, right, bottom) across all monitors."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            get_metric = ctypes.windll.user32.GetSystemMetrics
+            get_metric.argtypes = [ctypes.c_int]
+            get_metric.restype = ctypes.c_int
+            left = get_metric(76)   # SM_XVIRTUALSCREEN
+            top = get_metric(77)    # SM_YVIRTUALSCREEN
+            width = get_metric(78)  # SM_CXVIRTUALSCREEN
+            height = get_metric(79) # SM_CYVIRTUALSCREEN
+            if width > 0 and height > 0:
+                return (left, top, left + width, top + height)
+        except Exception:
+            pass
+    return (0, 0, root.winfo_screenwidth(), root.winfo_screenheight())
 
 
 def _get_mic_icon_path() -> Path:
@@ -97,7 +127,6 @@ class STTOverlay:
         self,
         on_close: Optional[Callable] = None,
         on_settings: Optional[Callable] = None,
-        get_audio_level: Optional[Callable[[], float]] = None,
         get_audio_spectrum: Optional[Callable[[], list[float]]] = None,
         config: Optional["Config"] = None,
         on_power_resume: Optional[Callable] = None,
@@ -108,15 +137,13 @@ class STTOverlay:
         Args:
             on_close: Callback when overlay is closed.
             on_settings: Callback when gear button is clicked.
-            get_audio_level: Callback to get current audio level (0.0-1.0).
-            get_audio_spectrum: Callback to get 16-band spectrum (list of 0.0-1.0).
+            get_audio_spectrum: Callback to get 32-band spectrum (list of 0.0-1.0).
             config: Configuration for position persistence.
             on_power_resume: Callback when system resumes from sleep/hibernate.
             on_power_suspend: Callback when system is about to suspend.
         """
         self.on_close = on_close
         self.on_settings = on_settings
-        self._get_audio_level = get_audio_level
         self._get_audio_spectrum = get_audio_spectrum
         self._config = config
         self.on_power_resume = on_power_resume
@@ -125,20 +152,23 @@ class STTOverlay:
         self._root: Optional[tk.Tk] = None
         self._canvas: Optional[tk.Canvas] = None
         self._drag_canvas: Optional[tk.Canvas] = None
-        self._tiny_canvas: Optional[tk.Canvas] = None
         self._separator_canvas: Optional[tk.Canvas] = None
         self._timer_label: Optional[tk.Label] = None
         self._status_label: Optional[tk.Label] = None
         self._gear_btn: Optional[tk.Label] = None
         self._tiny_gear: Optional[tk.Label] = None
         self._main_container: Optional[tk.Frame] = None
-        self._mic_photo: Optional[ImageTk.PhotoImage] = None  # Keep reference to prevent GC
-        self._mic_base_image: Optional[Image.Image] = None  # Base white mic icon
+        self._mic_base_image: Optional[Image.Image] = None  # Pre-resized 24x24 base mic icon
+        self._mic_photos: dict[str, ImageTk.PhotoImage] = {}  # Cached tinted PhotoImages by color
+        self._wave_bars: list[int] = []
+        self._idle_line: Optional[int] = None
 
         self._state = "ready"
         self._mode = self.MODE_NORMAL
         self._animation_id: Optional[str] = None
+        self._collapse_id: Optional[str] = None
         self._running = False
+        self._hidden = False
         self._record_start_time: float = 0
         self._audio_levels: list[float] = [0.3] * 32  # 32 frequency bands
         self._state_queue: queue.Queue = queue.Queue()  # Thread-safe state updates
@@ -146,11 +176,11 @@ class STTOverlay:
         # Dragging state
         self._drag_x = 0
         self._drag_y = 0
+        self._drag_moved = False
 
         # Mode switch protection
         self._mode_switching = False  # Prevent concurrent mode switches
         self._last_gear_click = 0.0   # Debounce gear clicks
-        self._last_position_save = 0.0  # Debounce position saves
 
         # Power event handling (Windows)
         self._wndproc = None  # Keep reference to prevent GC
@@ -187,6 +217,10 @@ class STTOverlay:
         self._mic_active = "#66ff66"  # Green when recording
         self._mic_busy = "#ffaa00"  # Amber when processing
 
+    def set_config(self, config: "Config") -> None:
+        """Replace the cached Config reference after a live config update."""
+        self._config = config
+
     def destroy(self):
         """Destroy the overlay window and clean up all resources.
 
@@ -204,9 +238,14 @@ class STTOverlay:
                 pass
         self._animation_id = None
 
-        # Save the final drag position once, instead of relying on the
-        # debounced in-flight save (which is intentionally throttled to
-        # 1Hz to avoid disk churn during continuous drags).
+        if self._collapse_id and self._root:
+            try:
+                self._root.after_cancel(self._collapse_id)
+            except Exception:
+                pass
+        self._collapse_id = None
+
+        # Save the final drag position once (skipped if currently hidden).
         self._save_overlay_position_now()
 
         # Unhook the subclassed wndproc before destroying the window.
@@ -220,7 +259,7 @@ class STTOverlay:
                     wintypes.HWND, ctypes.c_int, ctypes.c_void_p,
                 ]
                 SetWindowLongPtrW.restype = ctypes.c_void_p
-                hwnd = ctypes.windll.user32.GetParent(self._root.winfo_id())
+                hwnd = _get_top_hwnd(self._root.winfo_id())
                 if hwnd:
                     SetWindowLongPtrW(
                         hwnd, GWL_WNDPROC, ctypes.c_void_p(self._original_wndproc)
@@ -237,28 +276,31 @@ class STTOverlay:
         self._root = None
         self._canvas = None
         self._drag_canvas = None
-        self._tiny_canvas = None
         self._separator_canvas = None
         self._timer_label = None
         self._status_label = None
         self._gear_btn = None
         self._tiny_gear = None
         self._main_container = None
-        self._mic_photo = None
+        self._mic_photos.clear()
+        self._wave_bars = []
+        self._idle_line = None
         self._wndproc = None
         self._original_wndproc = None
 
     def _save_overlay_position_now(self) -> None:
         """Persist current overlay position once. Safe to call repeatedly."""
-        if not self._config or not self._root:
+        if not self._config or not self._root or self._hidden:
             return
         try:
             x = self._root.winfo_x()
             y = self._root.winfo_y()
+            if x >= 30000 or y >= 30000:
+                return
             self._config.ui.overlay_position = [x, y]
             self._config.save()
         except Exception:
-            logger.debug("Failed to save overlay position on destroy", exc_info=True)
+            logger.debug("Failed to save overlay position", exc_info=True)
 
     def _apply_rounded_corners(self, radius: int = 8):
         """Apply rounded corners to window using Win32 API."""
@@ -266,17 +308,19 @@ class STTOverlay:
             return
         try:
             import ctypes
-            # Get the HWND
-            hwnd = ctypes.windll.user32.GetParent(self._root.winfo_id())
-            if not hwnd:
-                hwnd = ctypes.windll.user32.GetAncestor(self._root.winfo_id(), 2)  # GA_ROOT
+            from ctypes import wintypes
+
+            hwnd = _get_top_hwnd(self._root.winfo_id())
             if hwnd:
                 # DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUND = 2
                 DWMWA_WINDOW_CORNER_PREFERENCE = 33
                 value = ctypes.c_int(2)  # DWMWCP_ROUND
-                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                dwm_set = ctypes.windll.dwmapi.DwmSetWindowAttribute
+                dwm_set.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+                dwm_set.restype = ctypes.c_long
+                dwm_set(
                     hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
-                    ctypes.byref(value), ctypes.sizeof(value)
+                    ctypes.byref(value), ctypes.sizeof(value),
                 )
         except Exception:
             pass
@@ -287,16 +331,19 @@ class STTOverlay:
             return
         try:
             import ctypes
-            hwnd = ctypes.windll.user32.GetParent(self._root.winfo_id())
-            if not hwnd:
-                hwnd = ctypes.windll.user32.GetAncestor(self._root.winfo_id(), 2)  # GA_ROOT
+            from ctypes import wintypes
+
+            hwnd = _get_top_hwnd(self._root.winfo_id())
             if hwnd:
                 # Enable non-client rendering for shadow
                 DWMWA_NCRENDERING_POLICY = 2
                 value = ctypes.c_int(2)  # DWMNCRP_ENABLED
-                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                dwm_set = ctypes.windll.dwmapi.DwmSetWindowAttribute
+                dwm_set.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+                dwm_set.restype = ctypes.c_long
+                dwm_set(
                     hwnd, DWMWA_NCRENDERING_POLICY,
-                    ctypes.byref(value), ctypes.sizeof(value)
+                    ctypes.byref(value), ctypes.sizeof(value),
                 )
         except Exception:
             pass
@@ -316,9 +363,7 @@ class STTOverlay:
             from ctypes import wintypes
 
             # Get window handle
-            hwnd = ctypes.windll.user32.GetParent(self._root.winfo_id())
-            if not hwnd:
-                hwnd = ctypes.windll.user32.GetAncestor(self._root.winfo_id(), 2)  # GA_ROOT
+            hwnd = _get_top_hwnd(self._root.winfo_id())
 
             if not hwnd:
                 logger.warning("Could not get HWND for power event hook")
@@ -428,13 +473,14 @@ class STTOverlay:
             from ctypes import wintypes
 
             # Get HWND
-            hwnd = ctypes.windll.user32.GetParent(self._root.winfo_id())
-            if not hwnd:
-                hwnd = ctypes.windll.user32.GetAncestor(self._root.winfo_id(), 2)  # GA_ROOT
+            hwnd = _get_top_hwnd(self._root.winfo_id())
 
             # Get monitor from window
             MONITOR_DEFAULTTONEAREST = 2
-            hmonitor = ctypes.windll.user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+            monitor_from_window = ctypes.windll.user32.MonitorFromWindow
+            monitor_from_window.argtypes = [wintypes.HWND, wintypes.DWORD]
+            monitor_from_window.restype = wintypes.HMONITOR
+            hmonitor = monitor_from_window(hwnd, MONITOR_DEFAULTTONEAREST)
 
             # Get monitor info
             class MONITORINFO(ctypes.Structure):
@@ -447,7 +493,10 @@ class STTOverlay:
 
             mi = MONITORINFO()
             mi.cbSize = ctypes.sizeof(MONITORINFO)
-            ctypes.windll.user32.GetMonitorInfoW(hmonitor, ctypes.byref(mi))
+            get_monitor_info = ctypes.windll.user32.GetMonitorInfoW
+            get_monitor_info.argtypes = [wintypes.HMONITOR, ctypes.POINTER(MONITORINFO)]
+            get_monitor_info.restype = wintypes.BOOL
+            get_monitor_info(hmonitor, ctypes.byref(mi))
 
             # Return work area (excludes taskbar)
             return (mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom)
@@ -509,10 +558,15 @@ class STTOverlay:
         x = (screen_w - self._normal_width) // 2
         y = screen_h - self._normal_height - 100
 
-        # Try to restore saved position if valid
+        # Try to restore saved position if valid across any attached monitor
         if self._config and self._config.ui.overlay_position:
             saved_x, saved_y = self._config.ui.overlay_position
-            if -50 < saved_x < screen_w and -50 < saved_y < screen_h:
+            v_left, v_top, v_right, v_bottom = _get_virtual_screen_bounds(self._root)
+            if (
+                saved_x < 30000 and saved_y < 30000
+                and v_left - 50 <= saved_x <= v_right - 50
+                and v_top - 50 <= saved_y <= v_bottom - 50
+            ):
                 x, y = saved_x, saved_y
 
         self._root.geometry(f"{self._normal_width}x{self._normal_height}+{x}+{y}")
@@ -624,7 +678,8 @@ class STTOverlay:
         self._canvas.bind("<B1-Motion>", self._on_drag)
         self._canvas.bind("<ButtonRelease-1>", self._on_drag_release)
 
-        # Draw initial idle bars
+        # Create waveform canvas items once and draw initial idle bars
+        self._init_waveform_items()
         self._draw_waveform(idle=True)
 
     def _build_tiny_ui(self):
@@ -706,19 +761,33 @@ class STTOverlay:
         self._main_container.bind("<Button-3>", lambda e: self._close())
 
     def _load_mic_icon(self):
-        """Load the base mic icon image."""
+        """Load and pre-resize the base 24x24 mic icon image."""
         if self._mic_base_image is not None:
             return
 
         try:
             icon_path = _get_mic_icon_path()
             if icon_path.exists():
-                self._mic_base_image = Image.open(icon_path).convert("RGBA")
+                img = Image.open(icon_path).convert("RGBA")
+                self._mic_base_image = img.resize((24, 24), Image.Resampling.LANCZOS)
                 logger.debug("Loaded mic icon from %s", icon_path)
             else:
                 logger.warning("Mic icon not found at %s", icon_path)
         except Exception as e:
             logger.warning("Failed to load mic icon: %s", e)
+
+    def _get_tinted_mic_photo(self, color: str) -> Optional[ImageTk.PhotoImage]:
+        """Return cached 24x24 tinted PhotoImage for ``color``."""
+        photo = self._mic_photos.get(color)
+        if photo is not None:
+            return photo
+        self._load_mic_icon()
+        if self._mic_base_image is None:
+            return None
+        tinted = self._tint_image(self._mic_base_image, color)
+        photo = ImageTk.PhotoImage(tinted)
+        self._mic_photos[color] = photo
+        return photo
 
     def _tint_image(self, image: Image.Image, color: str) -> Image.Image:
         """Tint a white image to the specified color."""
@@ -748,7 +817,7 @@ class STTOverlay:
         return tinted
 
     def _draw_tiny_mic(self):
-        """Draw microphone icon using PNG with color tinting."""
+        """Draw microphone icon using cached tinted PNG."""
         if not self._canvas:
             return
 
@@ -769,22 +838,11 @@ class STTOverlay:
         }
         color = colors.get(self._state, self._mic_idle)
 
-        # Try to use PNG icon
-        self._load_mic_icon()
-        if self._mic_base_image is not None:
-            try:
-                # Resize to fit canvas (24x24 looks good)
-                icon_size = 24
-                resized = self._mic_base_image.resize((icon_size, icon_size), Image.Resampling.LANCZOS)
-
-                # Tint to current state color
-                tinted = self._tint_image(resized, color)
-
-                # Convert to PhotoImage
-                self._mic_photo = ImageTk.PhotoImage(tinted)
-
-                # Draw centered
-                self._canvas.create_image(cx, cy, image=self._mic_photo, anchor=tk.CENTER)
+        # Try to use cached tinted PNG icon
+        try:
+            photo = self._get_tinted_mic_photo(color)
+            if photo is not None:
+                self._canvas.create_image(cx, cy, image=photo, anchor=tk.CENTER)
 
                 # Pulsing glow effect for recording
                 if self._state == "recording":
@@ -796,8 +854,8 @@ class STTOverlay:
                         outline="#66ff66", width=2
                     )
                 return
-            except Exception as e:
-                logger.warning("Failed to draw PNG mic: %s", e)
+        except Exception as e:
+            logger.warning("Failed to draw PNG mic: %s", e)
 
         # Fallback: draw mic using canvas primitives
         mic_w = 8
@@ -876,12 +934,13 @@ class STTOverlay:
             self._main_container = None
         self._canvas = None
         self._drag_canvas = None
-        self._tiny_canvas = None
         self._tiny_gear = None
         self._timer_label = None
         self._status_label = None
         self._gear_btn = None
         self._separator_canvas = None
+        self._wave_bars = []
+        self._idle_line = None
 
     def _animate_to_size(self, target_w: int, target_h: int, steps: int = 8, duration_ms: int = 120, callback=None):
         """Animate window resize from current size to target size.
@@ -995,69 +1054,77 @@ class STTOverlay:
         """Start dragging the window."""
         self._drag_x = event.x
         self._drag_y = event.y
+        self._drag_moved = False
 
     def _on_drag(self, event):
-        """Move the window during drag; persistence happens on release.
-
-        Previously this saved config every 1 s during the drag, which burned
-        disk writes and raced with the settings dialog's own ``save()``.
-        We now only update geometry here; ``_on_drag_release`` does a single
-        save at the end. A safety net in ``destroy()`` also flushes the
-        last-known position in case the user never released the button (e.g.
-        process killed mid-drag).
-        """
+        """Move the window during drag; persistence happens on release."""
         x = self._root.winfo_x() + event.x - self._drag_x
         y = self._root.winfo_y() + event.y - self._drag_y
         self._root.geometry(f"+{x}+{y}")
-        self._last_position_save = time.time()  # used by release to debounce no-op clicks
+        self._drag_moved = True
 
     def _on_drag_release(self, _event=None):
-        """Persist overlay position on mouse-up."""
-        self._save_overlay_position_now()
+        """Persist overlay position on mouse-up if the overlay moved."""
+        if self._drag_moved:
+            self._drag_moved = False
+            self._save_overlay_position_now()
+
+    def _init_waveform_items(self) -> None:
+        """Create the 32 waveform bar items and idle center line once."""
+        if not self._canvas:
+            return
+        self._canvas.delete("all")
+        num_bars = 32
+        bar_width = 4
+        bar_gap = 2
+        total_width = num_bars * bar_width + (num_bars - 1) * bar_gap
+        start_x = (270 - total_width) // 2
+        center_y = 16
+
+        self._idle_line = self._canvas.create_line(
+            start_x, center_y, start_x + total_width, center_y,
+            fill="#333333", width=1,
+        )
+        self._wave_bars = []
+        for i in range(num_bars):
+            x = start_x + i * (bar_width + bar_gap)
+            bar_id = self._canvas.create_rectangle(
+                x, center_y - 1, x + bar_width, center_y + 2,
+                fill=self._bar_color_idle, outline="",
+            )
+            self._wave_bars.append(bar_id)
 
     def _draw_waveform(self, idle: bool = False):
-        """Draw audio waveform bars with bi-directional expansion from center.
-
-        Uses 32 unique frequency bands. Each bar has vertical gradient
-        (darker at center, lighter at edges).
-        """
+        """Update audio waveform bars in place (32 frequency bands)."""
         if not self._canvas or self._mode == self.MODE_TINY:
             return
 
-        self._canvas.delete("all")
+        if len(self._wave_bars) != 32:
+            self._init_waveform_items()
 
         num_bars = 32
-        bar_width = 4  # Narrower bars
-        bar_gap = 2    # Smaller gap
+        bar_width = 4
+        bar_gap = 2
         total_width = num_bars * bar_width + (num_bars - 1) * bar_gap
         start_x = (270 - total_width) // 2
-
-        canvas_height = 30
         center_y = 16  # Shifted down to compensate for visual cropping at bottom
         max_height = 12  # Max extension in each direction
 
-        # Draw faint center line hint when idle
-        if idle:
-            self._canvas.create_line(
-                start_x, center_y, start_x + total_width, center_y,
-                fill="#333333", width=1
-            )
+        if self._idle_line is not None:
+            self._canvas.itemconfig(self._idle_line, state="normal" if idle else "hidden")
 
         for i in range(num_bars):
             x = start_x + i * (bar_width + bar_gap)
+            bar_id = self._wave_bars[i]
 
             if idle:
-                height = 1  # Minimal height when idle
-                self._canvas.create_rectangle(
-                    x, center_y - height, x + bar_width, center_y + height + 1,
-                    fill=self._bar_color_idle, outline=""
-                )
+                height = 1
+                color = self._bar_color_idle
             else:
                 level = self._audio_levels[i]
                 height = max(1, int(level * max_height))
 
                 if self._state == "recording":
-                    # Calculate color based on level (brighter = louder)
                     intensity = min(1.0, level * 1.5)
                     r = int(0x33 + (0x88 - 0x33) * intensity)
                     g = int(0x88 + (0xff - 0x88) * intensity)
@@ -1066,12 +1133,12 @@ class STTOverlay:
                 else:
                     color = self._bar_color_active
 
-                # Draw symmetric bar: height pixels above AND height pixels below center
-                self._canvas.create_rectangle(
-                    x, center_y - height,
-                    x + bar_width, center_y + height + 1,  # +1 to include center pixel
-                    fill=color, outline=""
-                )
+            self._canvas.coords(
+                bar_id,
+                x, center_y - height,
+                x + bar_width, center_y + height + 1,
+            )
+            self._canvas.itemconfig(bar_id, fill=color)
 
     def _update_timer(self):
         """Update the recording timer display."""
@@ -1168,10 +1235,13 @@ class STTOverlay:
         prev_state = self._state
         self._state = state
 
-        # Cancel any running animation
+        # Cancel any running animation and pending auto-collapse timer
         if self._animation_id:
             self._root.after_cancel(self._animation_id)
             self._animation_id = None
+        if self._collapse_id:
+            self._root.after_cancel(self._collapse_id)
+            self._collapse_id = None
 
         # Auto-expand from tiny mode when recording starts
         if state == "recording" and self._mode == self.MODE_TINY:
@@ -1218,10 +1288,11 @@ class STTOverlay:
             self._update_timer()
             # Auto-collapse to tiny mode after 2 seconds in ready state
             if prev_state in ("recording", "transcribing") and self._mode == self.MODE_NORMAL:
-                self._root.after(2000, self._auto_collapse_to_tiny)
+                self._collapse_id = self._root.after(2000, self._auto_collapse_to_tiny)
 
     def _auto_collapse_to_tiny(self):
         """Auto-collapse to tiny mode if still in ready state."""
+        self._collapse_id = None
         if self._state == "ready" and self._mode == self.MODE_NORMAL:
             self._switch_to_tiny()
 
@@ -1229,6 +1300,7 @@ class STTOverlay:
         """Show and start the overlay (must be called from main thread)."""
         logger.info("Overlay.show() called")
         self._running = True
+        self._hidden = False
         self._create_window()
         logger.info("Overlay window created, root=%s", self._root)
         self.set_state("ready")
@@ -1239,11 +1311,12 @@ class STTOverlay:
     def unhide(self):
         """Unhide a hidden overlay."""
         if self._root:
+            self._hidden = False
             self._root.deiconify()
-            # Restore position on screen
-            screen_w = self._root.winfo_screenwidth()
-            x = max(0, min(self._pos_x, screen_w - 50))
-            y = self._pos_y
+            # Restore position within virtual multi-monitor bounds
+            v_left, v_top, v_right, v_bottom = _get_virtual_screen_bounds(self._root)
+            x = max(v_left, min(self._pos_x, v_right - 50))
+            y = max(v_top, min(self._pos_y, v_bottom - 50))
             if self._mode == self.MODE_TINY:
                 self._root.geometry(f"{self._tiny_width}x{self._tiny_height}+{x}+{y}")
             else:
@@ -1285,9 +1358,13 @@ class STTOverlay:
         so it continues to process messages for dialogs.
         """
         if self._root:
-            # Save current position before hiding
-            self._pos_x = self._root.winfo_x()
-            self._pos_y = self._root.winfo_y()
+            # Save current on-screen position before hiding
+            curr_x = self._root.winfo_x()
+            curr_y = self._root.winfo_y()
+            if curr_x < 30000 and curr_y < 30000:
+                self._pos_x = curr_x
+                self._pos_y = curr_y
+            self._hidden = True
             # Move off-screen instead of withdraw (keeps message pump active)
             self._root.geometry("+32000+32000")
 
@@ -1309,16 +1386,6 @@ class STTOverlay:
         """Run the tkinter main loop."""
         if self._root:
             self._root.mainloop()
-
-    def get_position(self) -> tuple[int, int]:
-        """Get current window position."""
-        if self._root:
-            return (self._root.winfo_x(), self._root.winfo_y())
-        return (0, 0)
-
-    def is_tiny(self) -> bool:
-        """Check if in tiny mode."""
-        return self._mode == self.MODE_TINY
 
 
 # For testing

@@ -170,15 +170,10 @@ def _check_platform_requirements() -> None:
     _print_info("Windows may prompt for microphone permissions.")
 
 
-def _dependency_hint(extra: str | None = None) -> str:
-    plugin_root = "$CLAUDE_PLUGIN_ROOT"
+def _dependency_hint() -> str:
     if shutil.which("uv"):
-        cmd = f"uv sync --directory {plugin_root}"
-        if extra:
-            cmd = f"{cmd} --extra {extra}"
-        return cmd
-    suffix = f".[{extra}]" if extra else "."
-    return f"python {plugin_root}/scripts/exec.py -m pip install {suffix}"
+        return "uv sync"
+    return "pip install -e ."
 
 
 def _audio_backend_hint() -> str | None:
@@ -203,8 +198,8 @@ def _ensure_engine_ready(config: Config, skip_model_download: bool) -> bool:
     if not engine.is_available():
         if config.engine.type == "whisper":
             _print_error(
-                "Whisper dependencies missing. Run: "
-                f"{_dependency_hint('whisper')}"
+                "Whisper dependencies missing (pywhispercpp). Run: "
+                f"{_dependency_hint()} (or build-scripts\\build_vulkan.bat for Vulkan GPU support)"
             )
         elif config.engine.type == "nemotron":
             _print_error(
@@ -245,14 +240,15 @@ def _spawn_daemon(plugin_root: Path) -> bool:
         else:
             # PyInstaller: sys.executable is the exe
             exe_path = sys.executable
-        cmd = [exe_path, "daemon", "run"]
+        cmd = [exe_path, "daemon", "run", "--overlay"]
     else:
-        cmd = [sys.executable, "-m", "cld.daemon", "run"]
+        cmd = [sys.executable, "-m", "cld.daemon", "run", "--overlay"]
 
     creationflags = 0
     if os.name == "nt":
         creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+        # Keep window station intact for pynput hooks and Tkinter overlay
+        creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
     try:
         with open(log_file, "a", encoding="utf-8") as log_handle:
@@ -317,7 +313,7 @@ def run_setup(args: argparse.Namespace) -> int:
         _print_info(f"Press {config.hotkey} to start, press again to stop.")
     else:
         _print_info(f"Hold {config.hotkey} to record, release to stop.")
-    _print_info("Use 'cld config' to customize settings.")
+    _print_info("Open Settings from the system tray icon or overlay to customize settings.")
     return 0
 
 

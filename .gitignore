@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.py[cod]
+!prebuilt/vulkan-win64/*.pyd
 *.so
 build/
 dist/

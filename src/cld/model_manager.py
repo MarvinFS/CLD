@@ -11,12 +11,16 @@ is the single resolver every caller uses.
   validated against the pinned manifest before the pointer flips.
 """
 
+import ctypes
 import hashlib
 import json
 import logging
 import os
 import shutil
+import sys
 import tarfile
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path, PurePosixPath
 from typing import Callable, Optional
@@ -171,11 +175,9 @@ METADATA_FILE = "models.json"
 
 
 def get_models_dir() -> Path:
-    """Get CLD models directory in LOCALAPPDATA."""
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    if local_app_data:
-        return Path(local_app_data) / "CLD" / "models"
-    return Path.home() / ".cld" / "models"
+    """Get CLD models directory (honors CLD_CONFIG_DIR via Config.get_config_dir)."""
+    from cld.config import Config
+    return Config.get_config_dir() / "models"
 
 
 def setup_model_cache() -> None:
@@ -206,12 +208,56 @@ class ModelManager:
         return {}
 
     def _save_metadata(self) -> None:
-        """Save verification cache to local file."""
+        """Save verification cache to local file atomically."""
+        tmp = self._metadata_path.with_suffix(self._metadata_path.suffix + ".tmp")
         try:
-            with open(self._metadata_path, "w", encoding="utf-8") as f:
+            self._models_dir.mkdir(parents=True, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self._metadata, f, indent=2)
+            os.replace(tmp, self._metadata_path)
         except Exception as e:
             logger.warning("Failed to save model metadata: %s", e)
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _download_file(
+        url: str,
+        dest: Path,
+        progress_callback: Optional[Callable[[int, int, float], None]] = None,
+        timeout: float = 30.0,
+    ) -> None:
+        """Stream a URL to ``dest`` in 1 MB chunks with a socket timeout."""
+        chunk_size = 1024 * 1024
+        downloaded = 0
+        last_time = time.monotonic()
+        last_downloaded = 0
+
+        req = urllib.request.Request(url, headers={"User-Agent": "CLD"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as out:
+            content_length = resp.headers.get("Content-Length")
+            total_size = int(content_length) if content_length and content_length.isdigit() else -1
+            while True:
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                out.write(chunk)
+                downloaded += len(chunk)
+                now = time.monotonic()
+                if now - last_time >= 0.5:
+                    dt = now - last_time
+                    speed_mbps = ((downloaded - last_downloaded) / dt) / (1024 * 1024) if dt > 0 else 0.0
+                    if progress_callback:
+                        progress_callback(downloaded, total_size, speed_mbps)
+                    last_time = now
+                    last_downloaded = downloaded
+            if progress_callback and downloaded > last_downloaded:
+                dt = max(time.monotonic() - last_time, 1e-6)
+                speed_mbps = ((downloaded - last_downloaded) / dt) / (1024 * 1024)
+                progress_callback(downloaded, total_size, speed_mbps)
 
     @staticmethod
     def _compute_sha256(file_path: Path) -> str:
@@ -318,30 +364,6 @@ class ModelManager:
 
         return True
 
-    def is_model_up_to_date(self, model_name: str) -> tuple[bool, str]:
-        """Check if a model exists and has the correct hash.
-
-        Args:
-            model_name: Model name to check.
-
-        Returns:
-            Tuple of (up_to_date, message).
-            - (True, "Model is up to date") if hash matches
-            - (False, "Model not found") if file doesn't exist
-            - (False, "Hash mismatch...") if hash doesn't match
-        """
-        if not has_spec("whisper", model_name):
-            return False, f"Unknown model: {model_name}"
-
-        model_path = self._get_model_path(model_name)
-        if not model_path.exists():
-            return False, "Model not found"
-
-        is_valid, error_msg = self._verify_hash(model_path, model_name)
-        if is_valid:
-            return True, "Model is up to date"
-        return False, error_msg
-
     def get_model_path(self, model_name: str) -> Optional[Path]:
         """Get path to downloaded model.
 
@@ -399,25 +421,7 @@ class ModelManager:
 
         try:
             logger.info("Downloading model: %s from %s", model_name, url)
-
-            import time
-
-            last_time = [time.time()]
-            last_downloaded = [0]
-
-            def reporthook(block_num, block_size, total_size):
-                downloaded = block_num * block_size
-                now = time.time()
-                if now - last_time[0] >= 0.5:
-                    bytes_delta = downloaded - last_downloaded[0]
-                    time_delta = now - last_time[0]
-                    speed_mbps = (bytes_delta / time_delta) / (1024 * 1024) if time_delta > 0 else 0
-                    if progress_callback:
-                        progress_callback(downloaded, total_size, speed_mbps)
-                    last_time[0] = now
-                    last_downloaded[0] = downloaded
-
-            urllib.request.urlretrieve(url, temp_path, reporthook)
+            self._download_file(url, temp_path, progress_callback)
 
             # Verify SHA-256 of the downloaded temp file BEFORE making it
             # visible at the final path. If verification fails the working
@@ -501,43 +505,43 @@ class ModelManager:
     def check_cpu_capabilities(self) -> tuple[bool, list[str], list[str]]:
         """Check CPU instruction set capabilities for whisper.cpp.
 
-        whisper.cpp requires certain CPU features:
-        - SSE4.1: Minimum requirement
-        - AVX: Recommended for performance
-        - AVX2: Optimal for larger models
+        Uses Windows ``IsProcessorFeaturePresent`` so no third-party ``cpuinfo``
+        package is required. CLD's prebuilt Whisper CPU binary is compiled with
+        AVX2 (portable x64, no AVX-512).
 
         Returns:
             Tuple of (can_run, supported_features, missing_features).
         """
-        supported = []
-        missing = []
+        supported: list[str] = []
+        missing: list[str] = []
 
-        try:
+        if sys.platform == "win32":
             try:
-                import cpuinfo
+                from ctypes import wintypes
 
-                info = cpuinfo.get_cpu_info()
-                flags = info.get("flags", [])
+                is_present = ctypes.windll.kernel32.IsProcessorFeaturePresent
+                is_present.argtypes = [wintypes.DWORD]
+                is_present.restype = wintypes.BOOL
 
-                features_to_check = ["sse4_1", "avx", "avx2", "avx512f"]
-                for feature in features_to_check:
-                    if feature in flags:
-                        supported.append(feature.upper().replace("_", "."))
+                features = (
+                    ("SSE4.1", 37),
+                    ("AVX", 39),
+                    ("AVX2", 40),
+                    ("AVX512F", 41),
+                )
+                for label, feat_id in features:
+                    if is_present(feat_id):
+                        supported.append(label)
                     else:
-                        missing.append(feature.upper().replace("_", "."))
-
-            except ImportError:
+                        missing.append(label)
+            except Exception as e:
+                logger.debug("CPU capability detection failed: %s", e)
                 supported = ["SSE4.1", "AVX", "AVX2"]
                 missing = []
-                logger.debug("cpuinfo not available, assuming modern CPU with AVX2")
-
-        except Exception as e:
-            logger.debug("CPU capability detection failed: %s", e)
+        else:
             supported = ["SSE4.1", "AVX", "AVX2"]
-            missing = []
 
         can_run = "SSE4.1" in supported or len(supported) > 0
-
         return can_run, supported, missing
 
     def check_hardware_compatibility(self, model_name: str) -> tuple[bool, str]:
@@ -561,9 +565,12 @@ class ModelManager:
         if not can_run:
             return False, "CPU doesn't support required instruction sets (need SSE4.1 minimum)"
 
-        # Without AVX2 Whisper runs slowly on the CPU
+        # CLD's prebuilt Whisper CPU binary requires AVX2
         if "AVX2" not in supported:
-            warnings.append(f"AVX2 not detected - {model_name} model may be slow on the CPU.")
+            warnings.append(
+                f"AVX2 not detected - CLD's prebuilt Whisper CPU binary requires AVX2 "
+                f"(use a Vulkan GPU or Nemotron instead of {model_name} on CPU)."
+            )
 
         # Check CPU cores
         try:
@@ -885,43 +892,26 @@ class ModelManager:
                 pass
 
         try:
-            import time
-            last_time = [time.time()]
-            last_dl = [0]
+            try:
+                logger.info("Downloading Nemotron model: %s", spec["url"])
+                self._download_file(spec["url"], tmp, progress_callback)
+            except urllib.error.HTTPError as e:
+                return False, f"HTTP error {e.code}: {e.reason}"
+            except urllib.error.URLError as e:
+                return False, f"Network error: {e.reason}"
+            except OSError as e:
+                return False, f"Disk error: {e}"
+            except Exception as e:
+                logger.exception("Nemotron download failed")
+                return False, f"Download failed: {e}"
 
-            def reporthook(block_num, block_size, total_size):
-                dl = block_num * block_size
-                now = time.time()
-                if now - last_time[0] >= 0.5:
-                    d = dl - last_dl[0]
-                    dt = now - last_time[0]
-                    spd = (d / dt) / (1024 * 1024) if dt > 0 else 0
-                    if progress_callback:
-                        progress_callback(dl, total_size, spd)
-                    last_time[0] = now
-                    last_dl[0] = dl
-
-            logger.info("Downloading Nemotron model: %s", spec["url"])
-            urllib.request.urlretrieve(spec["url"], tmp, reporthook)
-        except urllib.error.HTTPError as e:
-            return False, f"HTTP error {e.code}: {e.reason}"
-        except urllib.error.URLError as e:
-            return False, f"Network error: {e.reason}"
-        except OSError as e:
-            return False, f"Disk error: {e}"
-        except Exception as e:
-            logger.exception("Nemotron download failed")
-            return False, f"Download failed: {e}"
-
-        try:
-            ok, err = self.install_nemotron_from_archive(tmp, model_name, progress_callback)
+            return self.install_nemotron_from_archive(tmp, model_name, progress_callback)
         finally:
             if tmp.exists():
                 try:
                     tmp.unlink()
                 except OSError:
                     pass
-        return ok, err
 
     def get_nemotron_download_url(self, model_name: str) -> Optional[str]:
         if not has_spec("nemotron", model_name):
@@ -1005,6 +995,3 @@ class ModelManager:
         if engine == "nemotron":
             return self.get_nemotron_download_url(model_name)
         return self.get_download_url(model_name)
-
-    def get_engine_model_info(self, engine: str, model_name: str) -> Optional[dict]:
-        return get_spec(engine, model_name) if has_spec(engine, model_name) else None

@@ -11,14 +11,7 @@ from cld.ui.settings_dialog import SettingsDialog, show_settings
 from cld.ui.tray import TrayIcon, is_tray_available
 
 
-def _is_frozen() -> bool:
-    """Check if running as frozen exe (PyInstaller or Nuitka)."""
-    # PyInstaller sets sys.frozen
-    if getattr(sys, "frozen", False):
-        return True
-    # Nuitka sets __compiled__ on __main__
-    main_mod = sys.modules.get("__main__", object())
-    return "__compiled__" in dir(main_mod)
+from cld.runtime import is_frozen as _is_frozen
 
 
 def get_app_icon_path() -> Path:

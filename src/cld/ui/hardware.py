@@ -1,7 +1,7 @@
 """Hardware detection for STT model recommendations."""
 
 import logging
-import subprocess
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -56,282 +56,51 @@ class HardwareInfo:
         return f"CPU ({self.cpu_cores} cores)"
 
 
-def _detect_gpu_wmi() -> tuple[bool, Optional[str]]:
-    """Detect GPU via Windows WMI.
-
-    Returns:
-        Tuple of (has_gpu, gpu_name).
-    """
-    try:
-        creationflags = 0
-        if hasattr(subprocess, "CREATE_NO_WINDOW"):
-            creationflags = subprocess.CREATE_NO_WINDOW
-
-        result = subprocess.run(
-            ["wmic", "path", "win32_VideoController", "get", "Name"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            creationflags=creationflags,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            lines = [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
-            # Skip header "Name", return first real GPU
-            for line in lines[1:]:
-                if line and line != "Name":
-                    return True, line
-    except FileNotFoundError:
-        pass
-    except subprocess.TimeoutExpired:
-        logger.debug("wmic timed out")
-    except Exception as e:
-        logger.debug("wmic failed: %s", e)
-    return False, None
-
-
 def enumerate_gpus() -> List[GPUDeviceInfo]:
-    """Enumerate GPUs as seen by whisper.cpp's Vulkan backend.
-
-    IMPORTANT: Uses Vulkan enumeration, not Windows WMI, because whisper.cpp
-    uses Vulkan device indices. WMI may include virtual GPUs (like Parsec)
-    that Vulkan doesn't see, causing index mismatches.
-
-    Returns:
-        List of GPUDeviceInfo matching whisper.cpp's Vulkan device order.
-    """
-    devices = []
-
-    # Try to get Vulkan device list from pywhispercpp by capturing C-level output
+    """Return Vulkan GPUs captured when pywhispercpp initialized."""
     try:
-        import _pywhispercpp as pw
-        import os
-        import sys
-        import tempfile
-        import re
-
-        # Capture C-level stderr by duplicating fd 2 to a temp file. The
-        # restore MUST live in a `finally` so any exception in the middle
-        # (model probe, file IO) doesn't leave the process with a closed or
-        # redirected stderr, which would silently break every later log call.
-        old_stderr_fd = os.dup(2)
-        tmp_path: Optional[str] = None
-        output = ""
-        try:
-            with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt") as tmp:
-                tmp_path = tmp.name
-            with open(tmp_path, "w") as tmp_file:
-                os.dup2(tmp_file.fileno(), 2)
-                _ = pw.whisper_print_system_info()
-                if sys.stderr is not None:
-                    sys.stderr.flush()
-        finally:
-            os.dup2(old_stderr_fd, 2)
-            os.close(old_stderr_fd)
-
-        if tmp_path is not None:
-            try:
-                with open(tmp_path, "r") as f:
-                    output = f.read()
-            except OSError as e:
-                logger.debug("Failed to read captured stderr: %s", e)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
-        # Parse "ggml_vulkan: X = GPU_NAME (vendor)" lines
-        pattern = r'ggml_vulkan:\s*(\d+)\s*=\s*([^|]+)'
-        for match in re.finditer(pattern, output):
-            index = int(match.group(1))
-            # Extract just the GPU name (before the parenthetical vendor info)
-            name_full = match.group(2).strip()
-            # Clean up: "NVIDIA GeForce RTX 4090 (NVIDIA)" -> "RTX 4090"
-            name = name_full.split('(')[0].strip()
-            # Simplify common prefixes
-            name = name.replace("NVIDIA GeForce ", "").replace("AMD ", "")
-            devices.append(GPUDeviceInfo(index=index, name=name))
-
-        if devices:
-            logger.debug("Enumerated %d Vulkan GPUs: %s", len(devices),
-                        [(d.index, d.name) for d in devices])
-            return devices
-
+        from cld.engines.whisper import get_vulkan_devices
+        return [GPUDeviceInfo(index=idx, name=name) for idx, name in get_vulkan_devices()]
     except Exception as e:
         logger.debug("Vulkan GPU enumeration failed: %s", e)
-
-    # Fallback to WMI if Vulkan enumeration fails, filtering virtual adapters
-    logger.debug("Falling back to WMI GPU enumeration")
-    try:
-        creationflags = 0
-        if hasattr(subprocess, "CREATE_NO_WINDOW"):
-            creationflags = subprocess.CREATE_NO_WINDOW
-
-        result = subprocess.run(
-            ["wmic", "path", "win32_VideoController", "get", "Name"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            creationflags=creationflags,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            lines = [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
-            # Collect GPUs in categories matching Vulkan enumeration order:
-            # Vulkan typically enumerates: discrete NVIDIA, discrete AMD, then integrated
-            nvidia_discrete = []
-            amd_discrete = []
-            integrated = []
-            for line in lines[1:]:  # Skip header "Name"
-                if line and line != "Name":
-                    lower = line.lower()
-                    # Skip known virtual display adapters
-                    if "parsec" in lower or "virtual" in lower or "microsoft" in lower:
-                        continue
-                    # Categorize to match Vulkan enumeration order
-                    if "radeon graphics" in lower or "uhd graphics" in lower or "iris" in lower:
-                        integrated.append(line)
-                    elif "nvidia" in lower or "geforce" in lower or "rtx" in lower or "gtx" in lower:
-                        nvidia_discrete.append(line)
-                    elif "radeon" in lower or "amd" in lower:
-                        amd_discrete.append(line)
-                    else:
-                        # Unknown - treat as discrete
-                        nvidia_discrete.append(line)
-            # Build device list matching Vulkan order: NVIDIA first, then AMD discrete, then integrated
-            for name in nvidia_discrete + amd_discrete + integrated:
-                devices.append(GPUDeviceInfo(index=len(devices), name=name))
-    except FileNotFoundError:
-        pass
-    except subprocess.TimeoutExpired:
-        logger.debug("wmic timed out during GPU enumeration")
-    except Exception as e:
-        logger.debug("GPU enumeration failed: %s", e)
-    return devices
-
-
-def _check_pywhispercpp_cuda() -> bool:
-    """Check if pywhispercpp was built with CUDA support.
-
-    CUDA builds include ggml-cuda backend which is used automatically.
-    Detection via whisper_print_system_info() which shows "CUDA" if available.
-    """
-    try:
-        import _pywhispercpp as pw
-        info = pw.whisper_print_system_info()
-        # System info contains "CUDA" if built with CUDA support
-        return "CUDA" in info
-    except Exception:
-        pass
-    return False
-
-
-def _check_pywhispercpp_vulkan() -> bool:
-    """Check if pywhispercpp was built with Vulkan support.
-
-    Vulkan builds include ggml-vulkan backend for cross-vendor GPU acceleration.
-    Works with NVIDIA, AMD, and Intel GPUs (both discrete and integrated).
-    Detection via whisper_print_system_info() or presence of ggml-vulkan.dll.
-    """
-    try:
-        import _pywhispercpp as pw
-        info = pw.whisper_print_system_info()
-        if "Vulkan" in info:
-            return True
-        # Also check for ggml-vulkan.dll in site-packages (pre-built binaries)
-        import importlib.util
-        from pathlib import Path
-        spec = importlib.util.find_spec("_pywhispercpp")
-        if spec and spec.origin:
-            vulkan_dll = Path(spec.origin).parent / "ggml-vulkan.dll"
-            return vulkan_dll.exists()
-    except Exception:
-        pass
-    return False
-
-
-def get_gpu_backend_info() -> str:
-    """Get detailed GPU backend information from pywhispercpp.
-
-    Returns:
-        Backend information string from whisper_print_system_info().
-    """
-    try:
-        import _pywhispercpp as pw
-        return pw.whisper_print_system_info()
-    except Exception as e:
-        return f"Error getting backend info: {e}"
+        return []
 
 
 def detect_hardware() -> HardwareInfo:
-    """Detect hardware capabilities and recommend STT configuration.
-
-    Returns:
-        HardwareInfo with detection results and recommendations.
-    """
+    """Detect hardware capabilities and recommend STT configuration."""
     info = HardwareInfo()
 
-    # Detect CPU cores
     try:
-        import os
         info.cpu_cores = os.cpu_count() or 1
     except Exception:
         pass
 
-    # Detect system RAM
     try:
         import psutil
-        mem = psutil.virtual_memory()
-        info.ram_gb = mem.total / (1024**3)
-    except ImportError:
-        # Fallback for Windows without psutil
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            c_ulonglong = ctypes.c_ulonglong
-
-            class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", c_ulonglong),
-                    ("ullAvailPhys", c_ulonglong),
-                    ("ullTotalPageFile", c_ulonglong),
-                    ("ullAvailPageFile", c_ulonglong),
-                    ("ullTotalVirtual", c_ulonglong),
-                    ("ullAvailVirtual", c_ulonglong),
-                    ("ullAvailExtendedVirtual", c_ulonglong),
-                ]
-
-            stat = MEMORYSTATUSEX()
-            stat.dwLength = ctypes.sizeof(stat)
-            kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
-            info.ram_gb = stat.ullTotalPhys / (1024**3)
-        except Exception:
-            pass
+        info.ram_gb = psutil.virtual_memory().total / (1024**3)
     except Exception:
         pass
 
-    # Detect GPU via WMI (works with NVIDIA, AMD, Intel)
-    has_gpu, gpu_name = _detect_gpu_wmi()
-    if has_gpu:
-        info.gpu_name = gpu_name
-
-    # Check GPU backends in pywhispercpp
-    # Vulkan is preferred (universal support: NVIDIA, AMD, Intel discrete and integrated)
-    # CUDA is fallback (NVIDIA-only, specific architecture builds)
-    info.has_vulkan = _check_pywhispercpp_vulkan()
-    info.has_cuda = _check_pywhispercpp_cuda()
+    try:
+        from cld.engines.whisper import (
+            get_vulkan_devices,
+            is_cuda_supported,
+            is_vulkan_supported,
+        )
+        info.has_vulkan = is_vulkan_supported()
+        info.has_cuda = is_cuda_supported()
+        vulkan_devices = get_vulkan_devices()
+        if vulkan_devices:
+            info.gpu_name = vulkan_devices[0][1]
+    except Exception as e:
+        logger.debug("Whisper backend detection failed: %s", e)
 
     if info.has_vulkan:
         logger.info("Vulkan GPU backend available (universal GPU support)")
     elif info.has_cuda:
         logger.info("CUDA GPU backend available (NVIDIA-only)")
-    elif has_gpu:
-        logger.info("GPU detected but pywhispercpp has no GPU backend. "
-                   "Rebuild with GGML_VULKAN=1 for universal GPU acceleration.")
 
-    # Determine recommendations based on hardware
     info.recommended_engine, info.recommended_model = _get_recommendations(info)
-
     return info
 
 
@@ -341,58 +110,21 @@ def _get_recommendations(info: HardwareInfo) -> tuple[str, str]:
     - GPU: Whisper large-v3-turbo-q5_0 (most accurate, fastest on a GPU)
     - No GPU: Nemotron. The Whisper model to preselect there is medium-q5_0,
       since turbo takes about 1.7x as long on the CPU.
-
-    Args:
-        info: Hardware detection results.
-
-    Returns:
-        Tuple of (engine, Whisper model) recommendations.
     """
     if info.has_gpu:
         return ("whisper", "large-v3-turbo-q5_0")
     return ("nemotron", "medium-q5_0")
 
 
-def get_max_supported_model(info: Optional[HardwareInfo] = None) -> str:
-    """Get the maximum supported model based on hardware.
-
-    Args:
-        info: Hardware info (detects if None).
-
-    Returns:
-        Maximum supported model name.
-    """
-    if info is None:
-        info = detect_hardware()
-
-    _, model = _get_recommendations(info)
-    return model
-
-
 def get_available_models(engine: str = "whisper") -> list[tuple[str, str]]:
     """Get available models for an engine as (value, display_name) tuples."""
     if engine == "nemotron":
         from cld.model_manager import get_models
-        out = []
-        for name, spec in get_models("nemotron").items():
-            out.append((name, f"{name} ({spec.get('size', '?')})"))
-        return out
+        return [
+            (name, f"{name} ({spec.get('size', '?')})")
+            for name, spec in get_models("nemotron").items()
+        ]
     return [
         ("large-v3-turbo-q5_0", "Large v3 Turbo Q5 (~574MB) - Recommended with a GPU"),
         ("medium-q5_0", "Medium Q5 (~539MB) - Translates to English"),
     ]
-
-
-def auto_select_gpu() -> int:
-    """Auto-select the best GPU device index.
-
-    Vulkan typically lists discrete GPUs before integrated GPUs.
-    Returns device index 0 (first GPU, usually discrete) for auto-selection,
-    or -1 to let whisper.cpp decide.
-
-    Returns:
-        GPU device index (0 for first/discrete GPU).
-    """
-    # Return 0 (first GPU) which is usually discrete
-    # whisper.cpp Vulkan backend lists discrete GPUs before iGPUs
-    return 0

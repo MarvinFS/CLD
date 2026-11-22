@@ -171,6 +171,7 @@ class NemotronEngine:
         self._runner = TimeoutRunner(thread_name_prefix="cld-nemotron")
         self._logger = logging.getLogger(__name__)
         self._last_error: Optional[str] = None
+        self._saved_affinity: Optional[list[int]] = None
 
     def is_available(self) -> bool:
         return _ort_available
@@ -179,22 +180,32 @@ class NemotronEngine:
         return self._last_error
 
     def _set_cpu_affinity_exclude_core0(self) -> None:
-        # ponytail: mirrors WhisperEngine's affinity (15 lines); not worth a
-        # shared module, both engines are CPU-bound and want core 0 free.
+        if self._saved_affinity is not None:
+            return
         try:
             import psutil
             process = psutil.Process()
+            original = process.cpu_affinity()
             all_cpus = list(range(self._cpu_count))
-            if self._cpu_count > 4:
-                allowed = [c for c in all_cpus if c >= 2]
-            else:
-                allowed = [c for c in all_cpus if c >= 1]
+            allowed = [c for c in all_cpus if c >= (2 if self._cpu_count > 4 else 1)]
             if allowed:
                 process.cpu_affinity(allowed)
+                self._saved_affinity = original
         except ImportError:
             pass
         except Exception as e:
             self._logger.debug("Failed to set CPU affinity: %s", e)
+
+    def _restore_cpu_affinity(self) -> None:
+        if self._saved_affinity is None:
+            return
+        try:
+            import psutil
+            psutil.Process().cpu_affinity(self._saved_affinity)
+        except Exception as e:
+            self._logger.debug("Failed to restore CPU affinity: %s", e)
+        finally:
+            self._saved_affinity = None
 
     def _resolve_files(self):
         """Resolve (tokens, encoder, decoder, joiner) absolute paths.
@@ -275,6 +286,7 @@ class NemotronEngine:
                 if self._model is not None:
                     self._logger.info("Unloading Nemotron model")
                     self._model = None
+            self._restore_cpu_affinity()
         finally:
             if clean:
                 self._transcribe_lock.release()

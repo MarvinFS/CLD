@@ -2,6 +2,16 @@
 
 All notable changes to CLD are documented here, newest first.
 
+## [0.9.1] - 2026-11-22
+
+### Changed
+- Whisper now runs on pywhispercpp 1.5.1 (whisper.cpp 1.8.5) with a portable AVX2 CPU build (no AVX-512).
+- Launching CLD no longer kills a running copy. Use tray Exit or `cld stop`.
+
+### Fixed
+- Dragging or closing the overlay no longer overwrites saved settings, and positions restore across multiple monitors.
+- Clipboard fallback for elevated windows keeps the copied text, and CLD sends Escape only for Alt or Win hotkeys.
+
 ## [0.9.0] - 2026-09-11
 
 ### Added

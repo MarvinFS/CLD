@@ -35,6 +35,8 @@ def apply_dark_title_bar(window: Any) -> None:
     if sys.platform != "win32" or window is None:
         return
     try:
+        from ctypes import wintypes
+
         window.update_idletasks()
         window.update()
         DWMWA_USE_IMMERSIVE_DARK_MODE = 20
@@ -42,18 +44,44 @@ def apply_dark_title_bar(window: Any) -> None:
         GA_ROOT = 2
         value = ctypes.c_int(1)
 
-        hwnd = ctypes.windll.user32.GetAncestor(window.winfo_id(), GA_ROOT)
+        user32 = ctypes.windll.user32
+        dwmapi = ctypes.windll.dwmapi
+
+        GetAncestor = user32.GetAncestor
+        GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+        GetAncestor.restype = wintypes.HWND
+
+        GetParent = user32.GetParent
+        GetParent.argtypes = [wintypes.HWND]
+        GetParent.restype = wintypes.HWND
+
+        DwmSetWindowAttribute = dwmapi.DwmSetWindowAttribute
+        DwmSetWindowAttribute.argtypes = [
+            wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+        ]
+        DwmSetWindowAttribute.restype = ctypes.c_long
+
+        SetWindowPos = user32.SetWindowPos
+        SetWindowPos.argtypes = [
+            wintypes.HWND, wintypes.HWND,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_uint,
+        ]
+        SetWindowPos.restype = wintypes.BOOL
+
+        win_id = wintypes.HWND(window.winfo_id())
+        hwnd = GetAncestor(win_id, GA_ROOT)
         if not hwnd:
-            hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+            hwnd = GetParent(win_id)
         if not hwnd:
             return
 
-        result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+        result = DwmSetWindowAttribute(
             hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
             ctypes.byref(value), ctypes.sizeof(value),
         )
         if result != 0:
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            DwmSetWindowAttribute(
                 hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_OLD,
                 ctypes.byref(value), ctypes.sizeof(value),
             )
@@ -62,7 +90,7 @@ def apply_dark_title_bar(window: Any) -> None:
         SWP_NOMOVE = 0x0002
         SWP_NOSIZE = 0x0001
         SWP_NOZORDER = 0x0004
-        ctypes.windll.user32.SetWindowPos(
+        SetWindowPos(
             hwnd, None, 0, 0, 0, 0,
             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
         )

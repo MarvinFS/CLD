@@ -1,5 +1,6 @@
 """Quick settings popup for CLD overlay."""
 
+import copy
 import logging
 import tkinter as tk
 from typing import Callable, Optional
@@ -82,15 +83,6 @@ class ToggleSwitch(tk.Canvas):
         self._draw()
         if self._on_change:
             self._on_change(self._value)
-
-    def get(self) -> bool:
-        """Get current value."""
-        return self._value
-
-    def set(self, value: bool):
-        """Set value without triggering callback."""
-        self._value = value
-        self._draw()
 
 
 class SettingsPopup:
@@ -229,7 +221,7 @@ class SettingsPopup:
         )
         link.pack(pady=(0, 12))
         link.bind("<Button-1>", self._on_all_settings_click)
-        link.bind("<Enter>", lambda e: link.config(font=("Segoe UI Underline", 10)))
+        link.bind("<Enter>", lambda e: link.config(font=("Segoe UI", 10, "underline")))
         link.bind("<Leave>", lambda e: link.config(font=("Segoe UI", 10)))
 
         # Bind escape
@@ -244,7 +236,6 @@ class SettingsPopup:
         label: str,
         initial: bool,
         on_change: Callable[[bool], None],
-        disabled: bool = False,
     ):
         """Add a toggle setting row."""
         row = tk.Frame(parent, bg=self._bg)
@@ -254,7 +245,7 @@ class SettingsPopup:
             row,
             text=label,
             font=("Segoe UI", 10),
-            fg=self._text_dim if disabled else self._text,
+            fg=self._text,
             bg=self._bg,
             anchor="w",
         )
@@ -263,24 +254,24 @@ class SettingsPopup:
         toggle = ToggleSwitch(
             row,
             initial=initial,
-            on_change=None if disabled else on_change,
+            on_change=on_change,
             bg=self._bg,
         )
         toggle.pack(side=tk.RIGHT)
-        if disabled:
-            toggle.unbind("<Button-1>")  # Disable click
 
         self._toggles[label] = toggle
 
     def _on_hotkey_enabled_change(self, value: bool):
         """Handle hotkey enabled toggle."""
-        self._config.activation.enabled = value
-        self._save_and_notify()
+        updated = copy.deepcopy(self._config)
+        updated.activation.enabled = value
+        self._apply_change(updated)
 
     def _on_sound_effects_change(self, value: bool):
         """Handle sound effects toggle."""
-        self._config.output.sound_effects = value
-        self._save_and_notify()
+        updated = copy.deepcopy(self._config)
+        updated.output.sound_effects = value
+        self._apply_change(updated)
 
     def _on_hide_overlay_change(self, value: bool):
         """Handle hide overlay toggle."""
@@ -288,11 +279,13 @@ class SettingsPopup:
             self.hide()  # Close popup first
             self._on_hide_overlay()
 
-    def _save_and_notify(self):
-        """Save config and notify listener."""
-        self._config.save()
+    def _apply_change(self, updated: Config):
+        """Notify listener (which persists) or save directly when standalone."""
+        self._config = updated
         if self._on_change:
-            self._on_change(self._config)
+            self._on_change(updated)
+        else:
+            updated.save()
 
     def _on_all_settings_click(self, event=None):
         """Handle click on All Settings link."""
@@ -312,14 +305,3 @@ class SettingsPopup:
     def is_visible(self) -> bool:
         """Check if popup is visible."""
         return self._window is not None
-
-    def update_config(self, config: Config):
-        """Update displayed values from config."""
-        self._config = config
-        if self._window and self._toggles:
-            # Update toggle states
-            for name, toggle in self._toggles.items():
-                if "Hotkey Enabled" in name:
-                    toggle.set(config.activation.enabled)
-                elif "Sound Effects" in name:
-                    toggle.set(config.output.sound_effects)

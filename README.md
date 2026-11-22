@@ -2,7 +2,7 @@
 
 # CLD - ClaudeCli-Dictate
 
-Version 0.9.0 | Voice dictation that stays on your machine
+Version 0.9.1 | Voice dictation that stays on your machine
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Windows](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6?logo=windows)](https://github.com/MarvinFS/CLD)
@@ -39,7 +39,7 @@ CLD runs on Windows 10 and 11. You pick the engine and the model in Settings. CL
 
 The times are approximate and come from a Ryzen 7 7800X3D with 8 cores and an RTX 4090. Whisper works on 30-second windows, so a short dictation takes about as long as a 30-second one. The first time Whisper runs on a GPU, the dictation takes about 10 seconds longer while the graphics driver compiles its shaders. The driver saves them on disk, so later dictations and restarts don't wait. It compiles them again only after a driver update or if its shader cache gets cleared.
 
-Every model also needs 2 GB of free RAM. Whisper needs a CPU with SSE4.1, which most processors from 2013 on have, and runs much faster with AVX2. The model setup dialog shows the RAM and CPU cores each model needs. For Whisper, it warns you when your PC has less or the CPU lacks AVX2.
+Every model also needs 2 GB of free RAM. CLD's prebuilt Whisper CPU binary requires a CPU with AVX2 (most processors from 2013 on); without AVX2, use Nemotron or a Vulkan GPU. The model setup dialog shows the RAM and CPU cores each model needs, and for Whisper it warns you when your PC has less or the CPU lacks AVX2.
 
 Only Whisper uses a GPU, through Vulkan. Vulkan comes with current drivers for NVIDIA GeForce GTX 10-series and newer, AMD Radeon RX 5000, 6000, and 7000 series, Radeon graphics in Ryzen processors, and Intel Arc, UHD, and Iris graphics.
 
@@ -66,7 +66,7 @@ Open Settings from the tray icon's menu or the gear icon on the overlay. Most ch
 | Language | Nemotron only. The language you speak, or Auto. |
 | Translate to English | Whisper Medium Q5 only. Types English whatever language you speak. |
 | Type while speaking | On by default, for Whisper on a GPU. CLD types while you speak and fixes words as more speech makes them clear. When you stop, CLD replaces it with a transcription of the whole recording. Nemotron, and Whisper on the CPU, still type after you stop. Output Mode Clipboard turns it off. |
-| Force CPU Only, GPU Device | Whisper only, and both take effect after a restart. Force CPU Only keeps Whisper on the CPU even when you have a GPU. GPU Device picks the GPU when you have several, and Auto-select uses the first one Vulkan reports. |
+| Force CPU Only, GPU Device | Whisper only, and both reload on Save without a restart. Force CPU Only keeps Whisper on the CPU even when you have a GPU. GPU Device picks the GPU when you have several, and Auto-select uses the first one Vulkan reports. |
 | Output Mode | Auto, the default, types the text and copies it to the clipboard when a window blocks typing. Injection types it, and Clipboard pastes it with Ctrl+V. |
 | Sound Effects | Plays short sounds when recording starts and stops and when something goes wrong. |
 | Input Device | The microphone. System default follows Windows. CLD lists the microphones at startup, so restart it after you connect a new one. |
@@ -102,7 +102,7 @@ Open Settings from the tray icon's menu or the gear icon on the overlay. Most ch
 
 ## Building from source
 
-Running or building CLD from source needs Python 3.12 and a Vulkan build of pywhispercpp, because the PyPI package lacks GPU support. [build.md](build.md) covers the setup and the PyInstaller build. `prebuilt/` holds ready-made Vulkan binaries for Python 3.12. `pywhispercpp-src/` holds CLD's modified pywhispercpp, which adds the `use_gpu` and `gpu_device` parameters so CLD can pick a GPU or stay on the CPU.
+Running or building CLD from source needs Python 3.12 and a Vulkan build of pywhispercpp, because the PyPI package lacks GPU support. [build.md](build.md) covers the setup and the PyInstaller build. `prebuilt/vulkan-win64/` holds ready-made Vulkan binaries for Python 3.12, and `build-scripts/build_vulkan.bat` builds them directly from upstream `pywhispercpp` v1.5.1 with Vulkan and portable AVX2 support.
 
 ## License
 

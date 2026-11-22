@@ -264,6 +264,7 @@ def _run_transcribe(args: Sequence[str]) -> int:
             if w.getsampwidth() != 2:
                 _emit(f"ERROR: expected 16-bit PCM, got {w.getsampwidth()*8}-bit", out_path)
                 return 1
+            channels = w.getnchannels()
             sr = w.getframerate()
             raw = w.readframes(w.getnframes())
     except (OSError, wave.Error) as e:
@@ -271,6 +272,8 @@ def _run_transcribe(args: Sequence[str]) -> int:
         return 1
 
     audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1)
     if sr != 16000:
         # ponytail: linear interpolation, no anti-alias filter; good enough for
         # this smoke test, and both engines take 16 kHz only.
@@ -296,6 +299,7 @@ def _run_transcribe(args: Sequence[str]) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ClaudeCli-Dictate (CLD)")
     parser.add_argument(
+        "-V",
         "--version",
         action="store_true",
         help="Print the CLD version and exit.",

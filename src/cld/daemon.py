@@ -2,6 +2,7 @@
 
 import argparse
 import ctypes
+from ctypes import wintypes
 import getpass
 import hashlib
 import logging
@@ -18,6 +19,7 @@ from cld.errors import EngineError, HotkeyError
 from cld.hotkey import HotkeyListener
 from cld.keyboard import test_injection
 from cld.daemon_service import STTDaemon
+from cld.runtime import is_frozen as _is_frozen
 
 # Stable app GUID for namespacing kernel objects across CLD releases.
 _CLD_APP_GUID = "{8B9E2A4D-3F12-4C7C-9F1A-2F3D9F0B0001}"
@@ -26,46 +28,10 @@ _CLD_APP_GUID = "{8B9E2A4D-3F12-4C7C-9F1A-2F3D9F0B0001}"
 def _user_scope() -> str:
     """Return a stable per-user scope tag for kernel-object names.
 
-    Uses the SID hash when available (uniqueness even with same username on
-    different machines), otherwise falls back to a hash of the username.
-    Two different local users cannot accidentally fight over the same
-    mutex / pipe, and a hostile process cannot guess the name without
-    knowing the SID/username.
+    Hashes the current username so two different local users cannot fight
+    over the same mutex or shutdown pipe.
     """
-    sid: Optional[str] = None
-    try:
-        import ctypes.wintypes as wintypes
-        OpenProcessToken = ctypes.windll.advapi32.OpenProcessToken
-        GetTokenInformation = ctypes.windll.advapi32.GetTokenInformation
-        ConvertSidToStringSidW = ctypes.windll.advapi32.ConvertSidToStringSidW
-        LocalFree = ctypes.windll.kernel32.LocalFree
-        TOKEN_QUERY = 0x0008
-        TokenUser = 1
-
-        h_proc = ctypes.windll.kernel32.GetCurrentProcess()
-        h_token = wintypes.HANDLE()
-        if OpenProcessToken(h_proc, TOKEN_QUERY, ctypes.byref(h_token)):
-            try:
-                size = wintypes.DWORD(0)
-                GetTokenInformation(h_token, TokenUser, None, 0, ctypes.byref(size))
-                if size.value > 0:
-                    buf = (ctypes.c_byte * size.value)()
-                    if GetTokenInformation(
-                        h_token, TokenUser, buf, size.value, ctypes.byref(size)
-                    ):
-                        # TOKEN_USER starts with SID_AND_ATTRIBUTES whose first
-                        # field is a PSID pointer.
-                        psid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
-                        str_sid_ptr = ctypes.c_wchar_p()
-                        if ConvertSidToStringSidW(psid, ctypes.byref(str_sid_ptr)):
-                            sid = str_sid_ptr.value
-                            LocalFree(ctypes.cast(str_sid_ptr, ctypes.c_void_p))
-            finally:
-                ctypes.windll.kernel32.CloseHandle(h_token)
-    except Exception:
-        sid = None
-
-    seed = sid or getpass.getuser() or "default"
+    seed = getpass.getuser() or "default"
     return hashlib.sha1(seed.encode("utf-8", "replace")).hexdigest()[:16]
 
 
@@ -80,9 +46,26 @@ SHUTDOWN_PIPE_NAME = f"\\\\.\\pipe\\CLD-{_USER_SCOPE}-shutdown"
 
 # Global mutex handle (kept alive while running)
 _mutex_handle = None
+_kernel32_dll = None
 
 
-from cld.runtime import is_frozen as _is_frozen  # noqa: E402
+def _get_kernel32():
+    """Return a kernel32 WinDLL configured with 64-bit-safe signatures."""
+    global _kernel32_dll
+    if _kernel32_dll is None:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        k32.CreateMutexW.restype = wintypes.HANDLE
+        k32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+        k32.ReleaseMutex.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k32.GetExitCodeProcess.restype = wintypes.BOOL
+        _kernel32_dll = k32
+    return _kernel32_dll
 
 
 def _get_plugin_root() -> Path:
@@ -101,22 +84,23 @@ def _acquire_mutex() -> bool:
     """
     global _mutex_handle
 
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = _get_kernel32()
 
     # Create or open the mutex
-    _mutex_handle = kernel32.CreateMutexW(None, True, MUTEX_NAME)
-
-    if _mutex_handle is None:
-        return False
-
-    # Check if we created it or if it already existed
-    last_error = kernel32.GetLastError()
-    if last_error == ERROR_ALREADY_EXISTS:
-        # Another instance owns the mutex
-        kernel32.CloseHandle(_mutex_handle)
+    handle = kernel32.CreateMutexW(None, True, MUTEX_NAME)
+    if not handle:
         _mutex_handle = None
         return False
 
+    # Check if we created it or if it already existed
+    last_error = ctypes.get_last_error()
+    if last_error == ERROR_ALREADY_EXISTS:
+        # Another instance owns the mutex
+        kernel32.CloseHandle(handle)
+        _mutex_handle = None
+        return False
+
+    _mutex_handle = handle
     return True
 
 
@@ -124,21 +108,22 @@ def _release_mutex() -> None:
     """Release the single-instance mutex."""
     global _mutex_handle
     if _mutex_handle:
-        ctypes.windll.kernel32.ReleaseMutex(_mutex_handle)
-        ctypes.windll.kernel32.CloseHandle(_mutex_handle)
+        kernel32 = _get_kernel32()
+        kernel32.ReleaseMutex(_mutex_handle)
+        kernel32.CloseHandle(_mutex_handle)
         _mutex_handle = None
 
 
 def is_daemon_running() -> bool:
     """Check if daemon is running using mutex."""
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = _get_kernel32()
 
     # Try to create the mutex
     handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
-    if handle is None:
+    if not handle:
         return False
 
-    last_error = kernel32.GetLastError()
+    last_error = ctypes.get_last_error()
     kernel32.CloseHandle(handle)
 
     # If ERROR_ALREADY_EXISTS, another instance holds it
@@ -153,9 +138,7 @@ _SHUTDOWN_FLAG_NAME = "daemon.shutdown"
 
 def get_shutdown_flag_path() -> Path:
     """Path of the on-disk shutdown sentinel."""
-    localappdata = os.environ.get("LOCALAPPDATA", "")
-    base = Path(localappdata) / "CLD" if localappdata else Path.home() / ".cld"
-    return base / _SHUTDOWN_FLAG_NAME
+    return Config.get_config_dir() / _SHUTDOWN_FLAG_NAME
 
 
 def request_shutdown_via_ipc(timeout: float = 3.0) -> bool:
@@ -207,10 +190,7 @@ def request_shutdown_via_ipc(timeout: float = 3.0) -> bool:
 
 def _get_pid_file_path() -> Path:
     """Get the path to the daemon PID file."""
-    localappdata = os.environ.get("LOCALAPPDATA", "")
-    if localappdata:
-        return Path(localappdata) / "CLD" / "daemon.pid"
-    return Path.home() / ".cld" / "daemon.pid"
+    return Config.get_config_dir() / "daemon.pid"
 
 
 def _write_pid_file() -> None:
@@ -238,12 +218,12 @@ def _pid_alive(pid: int) -> bool:
     if os.name == "nt":
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         STILL_ACTIVE = 259
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = _get_kernel32()
         handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
             return False
         try:
-            code = ctypes.c_ulong()
+            code = wintypes.DWORD()
             if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
                 return False
             return code.value == STILL_ACTIVE
@@ -287,40 +267,34 @@ def _find_cld_processes() -> list[int]:
     """Find all CLD daemon processes by command line.
 
     Searches for both Python-based (running from source) and frozen exe processes.
-    Falls back to PID file when PowerShell finds nothing.
+    Falls back to PID file when process inspection finds nothing.
     """
-    pids = []
+    pids: list[int] = []
+    own_pid = os.getpid()
     try:
-        # Use PowerShell to find CLD processes - both source and frozen exe
-        result = subprocess.run(
-            [
-                "powershell", "-NoProfile", "-Command",
-                "Get-CimInstance Win32_Process | "
-                "Where-Object { "
-                "($_.CommandLine -like '*cld.daemon*' -and $_.CommandLine -like '*python*') -or "
-                "($_.Name -eq 'CLD.exe' -and $_.CommandLine -like '*daemon*')"
-                " } | "
-                "Select-Object -ExpandProperty ProcessId"
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            for line in result.stdout.strip().split('\n'):
-                line = line.strip()
-                if line.isdigit():
-                    pid = int(line)
-                    # Don't include ourselves
-                    if pid != os.getpid():
-                        pids.append(pid)
-    except Exception:
-        logging.getLogger(__name__).debug("Failed to find CLD processes via PowerShell", exc_info=True)
+        import psutil
 
-    # Fallback: check PID file if PowerShell found nothing
+        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                info = proc.info
+                pid = info.get("pid")
+                if not pid or pid == own_pid:
+                    continue
+                name = (info.get("name") or "").lower()
+                cmdline = " ".join(info.get("cmdline") or []).lower()
+                is_python_daemon = "cld.daemon" in cmdline and "python" in cmdline
+                is_frozen_daemon = name == "cld.exe" and "daemon" in cmdline
+                if is_python_daemon or is_frozen_daemon:
+                    pids.append(int(pid))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+    except Exception:
+        logging.getLogger(__name__).debug("Failed to find CLD processes via psutil", exc_info=True)
+
+    # Fallback: check PID file if process inspection found nothing
     if not pids:
         pid = _read_pid_file()
-        if pid and pid != os.getpid():
+        if pid and pid != own_pid:
             pids.append(pid)
 
     return pids
@@ -439,8 +413,7 @@ def _cleanup_stale_state() -> None:
     process is provably dead, so a live daemon's files are never touched.
     """
     logger = logging.getLogger(__name__)
-    localappdata = os.environ.get("LOCALAPPDATA", "")
-    base = Path(localappdata) / "CLD" if localappdata else Path.home() / ".cld"
+    base = Config.get_config_dir()
     if not base.exists():
         return
 
@@ -481,45 +454,8 @@ def start_daemon(background: bool = False, enable_overlay: bool = False):
     """
     _cleanup_stale_state()
     if is_daemon_running():
-        logger = logging.getLogger(__name__)
-        # Check if the existing instance might be a zombie (e.g., survived sleep/wake
-        # but is unresponsive). If PID file is stale (>30s old) and processes exist,
-        # kill them and retry.
-        pid_path = _get_pid_file_path()
-        try:
-            if pid_path.exists():
-                age = time.time() - pid_path.stat().st_mtime
-                if age > 30:
-                    pids = _find_cld_processes()
-                    if pids:
-                        logger.info("Found potentially zombie daemon (PID file age: %.0fs), killing processes %s", age, pids)
-                        for pid in pids:
-                            try:
-                                subprocess.run(
-                                    ["taskkill", "/PID", str(pid), "/T", "/F"],
-                                    capture_output=True, timeout=5,
-                                )
-                            except Exception:
-                                pass
-                        _remove_pid_file()
-                        time.sleep(1)
-                        if not is_daemon_running():
-                            logger.info("Zombie cleaned up, proceeding with startup")
-                        else:
-                            logger.info("Daemon is still running after cleanup attempt.")
-                            return
-                    else:
-                        logger.info("Daemon is already running.")
-                        return
-                else:
-                    logger.info("Daemon is already running.")
-                    return
-            else:
-                logger.info("Daemon is already running.")
-                return
-        except Exception:
-            logger.info("Daemon is already running.")
-            return
+        logging.getLogger(__name__).info("Daemon is already running.")
+        return
 
     if background:
         if _spawn_background(enable_overlay=enable_overlay):

@@ -1,6 +1,7 @@
 """Windows window focus tracking and restoration."""
 
 import ctypes
+from ctypes import wintypes
 import logging
 from dataclasses import dataclass
 from typing import Optional
@@ -10,6 +11,21 @@ _logger = logging.getLogger(__name__)
 # Window class names that should be excluded from capture
 # (desktop/shell windows that can't accept text, or our own overlay)
 _EXCLUDED_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "TkTopLevel"}
+
+
+def _user32():
+    user32 = ctypes.windll.user32
+    user32.GetForegroundWindow.argtypes = []
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+    user32.IsWindow.argtypes = [wintypes.HWND]
+    user32.IsWindow.restype = wintypes.BOOL
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    return user32
 
 
 @dataclass
@@ -24,7 +40,7 @@ class WindowInfo:
 def _get_window_class(hwnd: int) -> Optional[str]:
     """Get the window class name."""
     try:
-        user32 = ctypes.windll.user32
+        user32 = _user32()
         buffer = ctypes.create_unicode_buffer(256)
         length = user32.GetClassNameW(hwnd, buffer, 256)
         if length > 0:
@@ -50,7 +66,7 @@ def get_active_window() -> Optional[WindowInfo]:
         WindowInfo with the window handle, or None if desktop/shell is active.
     """
     try:
-        user32 = ctypes.windll.user32
+        user32 = _user32()
         hwnd = user32.GetForegroundWindow()
         if hwnd:
             # Don't capture excluded windows (desktop, shell, or our overlay)
@@ -85,7 +101,7 @@ def restore_focus(window_info: Optional[WindowInfo]) -> bool:
 def _set_foreground(hwnd: int) -> bool:
     """Set a window to foreground by handle."""
     try:
-        user32 = ctypes.windll.user32
+        user32 = _user32()
         if not user32.IsWindow(hwnd):
             return False
         user32.ShowWindow(hwnd, 9)  # SW_RESTORE

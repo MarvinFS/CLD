@@ -8,9 +8,9 @@ from typing import Callable, Optional
 from cld.config import Config, NEMOTRON_LANGUAGES
 from cld.model_manager import WHISPER_MODELS
 from cld.recorder import AudioRecorder
+from cld.runtime import apply_dark_title_bar
 from cld.ui.hardware import get_available_models, detect_hardware, enumerate_gpus, GPUDeviceInfo
 from cld.ui.key_scanner import KeyScanner, KeyCapture, KEY_DISPLAY_NAMES
-from cld.ui.model_dialog import set_dark_title_bar
 
 logger = logging.getLogger(__name__)
 
@@ -83,14 +83,11 @@ class SettingsDialog:
         self._gpu_device_var: Optional[tk.StringVar] = None
         self._gpu_combo: Optional[ttk.Combobox] = None
         self._gpu_devices: list[GPUDeviceInfo] = []
-        self._restart_label: Optional[tk.Label] = None
-        self._original_force_cpu: bool = False
 
         # Engine section state
         self._translate_var: Optional[tk.BooleanVar] = None
         self._live_var: Optional[tk.BooleanVar] = None
         self._live_cb: Optional[tk.Checkbutton] = None
-        self._original_gpu_device: int = -1
         self._hw_info: Optional[object] = None  # Cached hardware info
 
     def show(self):
@@ -132,7 +129,7 @@ class SettingsDialog:
         self._window.geometry(f"{width}x{height}+{x}+{y}")
 
         # Apply dark title bar
-        set_dark_title_bar(self._window)
+        apply_dark_title_bar(self._window)
 
         # Set window icon for taskbar thumbnail
         self._set_window_icon()
@@ -234,7 +231,7 @@ class SettingsDialog:
         self._window.focus_force()
 
         # Apply dark title bar again after window is fully shown
-        self._window.after(50, lambda: set_dark_title_bar(self._window))
+        self._window.after(50, lambda: apply_dark_title_bar(self._window))
 
         # Initial scrollbar visibility check
         self._window.after(100, self._on_window_resize)
@@ -614,7 +611,15 @@ class SettingsDialog:
         try:
             if self._hw_info is None:
                 self._hw_info = detect_hardware()
-            hw_text = f"CPU: {self._hw_info.cpu_cores} cores | RAM: {self._hw_info.ram_gb:.1f} GB | Recommended: {self._hw_info.recommendation}"
+            ram_part = (
+                f" | RAM: {self._hw_info.ram_gb:.1f} GB"
+                if self._hw_info.ram_gb is not None
+                else ""
+            )
+            hw_text = (
+                f"CPU: {self._hw_info.cpu_cores} cores{ram_part}"
+                f" | Recommended: {self._hw_info.recommendation}"
+            )
         except Exception:
             hw_text = ""
 
@@ -750,10 +755,6 @@ class SettingsDialog:
         hw_info = self._hw_info
         self._gpu_devices = enumerate_gpus()
 
-        # Store originals for restart detection
-        self._original_force_cpu = self._config.engine.force_cpu
-        self._original_gpu_device = self._config.engine.gpu_device
-
         # Force CPU Only checkbox
         cpu_row = tk.Frame(section, bg=self._surface)
         cpu_row.pack(fill=tk.X, padx=12, pady=8)
@@ -839,16 +840,6 @@ class SettingsDialog:
         )
         self._backend_info_label.pack(side=tk.LEFT)
 
-        # Restart warning (hidden initially)
-        self._restart_label = tk.Label(
-            section,
-            text="Restart required for GPU changes",
-            font=("Segoe UI", 9),
-            fg="#ffcc00",
-            bg=self._surface,
-        )
-        # Don't pack initially - will be shown when settings change
-
     def _shorten_gpu_name(self, name: str) -> str:
         """Create a shortened GPU name for dropdown display.
 
@@ -899,12 +890,10 @@ class SettingsDialog:
             state = "disabled" if self._force_cpu_var.get() else "readonly"
             self._gpu_combo.config(state=state)
         self._update_backend_info()
-        self._check_restart_needed()
 
     def _on_gpu_change(self, event=None):
         """Handle GPU device dropdown change."""
         self._update_backend_info()
-        self._check_restart_needed()
 
     def _update_backend_info(self):
         """Update the backend info label based on current selection."""
@@ -913,19 +902,6 @@ class SettingsDialog:
         # Use cached hardware info - don't call detect_hardware() on every dropdown change
         backend = self._hw_info.gpu_backend if self._hw_info else "CPU"
         self._backend_info_label.config(text=self._get_backend_info_text(backend))
-
-    def _check_restart_needed(self):
-        """Check if GPU settings changed and show/hide restart warning."""
-        new_force_cpu = self._force_cpu_var.get()
-        new_gpu_device = self._get_selected_gpu_index()
-
-        changed = (new_force_cpu != self._original_force_cpu or
-                   new_gpu_device != self._original_gpu_device)
-
-        if changed and self._restart_label:
-            self._restart_label.pack(fill=tk.X, padx=12, pady=(0, 8))
-        elif self._restart_label:
-            self._restart_label.pack_forget()
 
     def _get_selected_gpu_index(self) -> int:
         """Get the selected GPU index from dropdown (-1 for auto)."""

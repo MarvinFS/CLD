@@ -1,6 +1,6 @@
 [project]
 name = "claudecli-dictate"
-version = "0.9.0"
+version = "0.9.1"
 description = "ClaudeCli-Dictate (CLD) - Windows GUI speech-to-text with Whisper + Nemotron engines, overlay UI and system tray integration"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -24,16 +24,17 @@ dependencies = [
     # those attributes and silently break ghost-icon cleanup.
     "pystray==0.19.5",
     "pillow>=9.0",
-    "pywhispercpp>=1.4",
-    # Exact pin: the Nemotron engine drives the ONNX model directly through
-    # onnxruntime, and CLD.spec excludes its native files from UPX by exact
-    # filename. A bump can rename them, so re-check CLD.spec's upx_exclude list.
+    "pywhispercpp>=1.5",
+    # Exact pin: (1) CLD.spec excludes onnxruntime's native files from UPX by
+    # exact filename; (2) onnxruntime 1.30.0-1.32.0 CPU kernel changes regress
+    # Nemotron int8 outputs (drops closing "." on de.wav / fails test_nemotron,
+    # degrades es.wav "hacer tu" -> "hacerte"). Re-verify test_nemotron before bumping.
     "onnxruntime==1.29.0",
     "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff", "pyinstaller>=6.0"]
+dev = ["pytest>=9.0", "ruff>=0.17.6", "pyinstaller>=6.0"]
 
 [project.scripts]
 cld = "cld.cli:main"
@@ -49,11 +50,11 @@ packages = ["src/cld"]
 line-length = 100
 target-version = "py310"
 
+[tool.ruff.lint]
+# Preserve pre-0.16 default rule set after upgrading to ruff 0.17.x
+# (ruff 0.16 expanded defaults from 59 to 413 rules).
+select = ["E4", "E7", "E9", "F"]
+
 [tool.ruff.lint.per-file-ignores]
 # cli.py has intentional late imports (after early debug check)
 "src/cld/cli.py" = ["E402"]
-
-[dependency-groups]
-dev = [
-    "ruff>=0.14.14",
-]
